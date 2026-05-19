@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Optional
 from lethe.actor import Actor, ActorConfig, ActorMessage, ActorRegistry, ActorState
 from lethe.actor.tools import create_actor_tools
 from lethe.prompts import load_prompt_template
+from lethe.tools.policy import SUBAGENT_DEFAULT_TOOL_NAMES
 
 from lethe.paths import workspace_dir as _workspace_dir
 WORKSPACE_DIR = str(_workspace_dir())
@@ -87,19 +88,47 @@ class ActorRunner:
         await asyncio.sleep(PROGRESS_NOTIFY_INTERVAL)  # First update after 2 min
         while actor.state != ActorState.TERMINATED:
             elapsed = int(time.monotonic() - start_time)
-            turn = actor._turns
-            last_response = getattr(actor, '_last_response', '') or ''
-            await self._notify_parent(
+            turn = actor.turn_count
+            checkpoint = actor.task_state_note
+            last_response = " ".join(str(getattr(actor, "_last_response", "") or "").split())
+            if len(last_response) > 180:
+                last_response = last_response[:180] + "..."
+
+            progress_parts = [
                 (
-                    f"{actor.config.name} still working (turn {turn}/{actor.config.max_turns}, "
-                    f"{elapsed}s elapsed). Last: {last_response[:100] if last_response else 'working...'}"
-                ),
-                metadata={"channel": "task_update", "kind": "progress"},
+                    f"{actor.config.name} progress: state={actor.task_state.value}, "
+                    f"turn {turn}/{actor.config.max_turns}, {elapsed}s elapsed."
+                )
+            ]
+            if checkpoint:
+                progress_parts.append(f"Checkpoint: {checkpoint[:240]}")
+            elif last_response:
+                progress_parts.append(f"Last output: {last_response}")
+            else:
+                progress_parts.append("Checkpoint: no explicit checkpoint reported yet.")
+
+            await self._notify_parent(
+                " ".join(progress_parts),
+                metadata={
+                    "channel": "task_update",
+                    "kind": "progress",
+                    "turn": turn,
+                    "max_turns": actor.config.max_turns,
+                    "elapsed_seconds": elapsed,
+                    "task_state": actor.task_state.value,
+                    "checkpoint": checkpoint,
+                },
             )
             actor.registry.emit_event(
                 "actor_progress",
                 actor,
-                {"turn": turn, "max_turns": actor.config.max_turns, "elapsed_seconds": elapsed},
+                {
+                    "turn": turn,
+                    "max_turns": actor.config.max_turns,
+                    "elapsed_seconds": elapsed,
+                    "task_state": actor.task_state.value,
+                    "checkpoint": checkpoint,
+                },
             )
             logger.info(f"Actor {actor.id} progress: turn {turn}, {elapsed}s elapsed")
             await asyncio.sleep(PROGRESS_NOTIFY_INTERVAL)
@@ -121,9 +150,8 @@ class ActorRunner:
                 llm.add_tool(func)
             
             # Register default tools (CLI + file — always available)
-            from lethe.actor.integration import SUBAGENT_DEFAULT_TOOLS
             registered_tools = []
-            for tool_name in SUBAGENT_DEFAULT_TOOLS:
+            for tool_name in SUBAGENT_DEFAULT_TOOL_NAMES:
                 if tool_name in self.available_tools:
                     func, schema = self.available_tools[tool_name]
                     llm.add_tool(func, schema)
@@ -131,7 +159,7 @@ class ActorRunner:
             
             # Register additional requested tools
             for tool_name in actor.config.tools:
-                if tool_name in SUBAGENT_DEFAULT_TOOLS:
+                if tool_name in SUBAGENT_DEFAULT_TOOL_NAMES:
                     continue  # Already registered
                 if tool_name in self.available_tools:
                     func, schema = self.available_tools[tool_name]
@@ -164,7 +192,7 @@ class ActorRunner:
                 workspace_ctx=workspace_ctx,
             )
             
-            logger.info(f"Actor {actor.id} ({actor.config.name}) starting, tools: {len(llm._tools)}")
+            logger.info(f"Actor {actor.id} ({actor.config.name}) starting, tools: {len(llm.tools)}")
             
             # Start background progress timer
             progress_task = asyncio.create_task(
@@ -180,13 +208,7 @@ class ActorRunner:
                     break
                 
                 # Check for incoming messages
-                incoming = []
-                while not actor._inbox.empty():
-                    try:
-                        msg = actor._inbox.get_nowait()
-                        incoming.append(msg)
-                    except asyncio.QueueEmpty:
-                        break
+                incoming = actor.drain_inbox()
                 
                 # Build the message for this turn
                 if turn == 0:
@@ -214,7 +236,7 @@ class ActorRunner:
                             f"[Turn {turn + 1}/{actor.config.max_turns} — you're running low on turns. "
                             f"Call terminate(result) with your findings NOW.]"
                         )
-                    elif turn > 0 and turn % 5 == 0:
+                    elif turn > 0 and turn % 4 == 0:
                         message = (
                             f"[Turn {turn + 1}/{actor.config.max_turns}. "
                             f"If you have results, call terminate(result). Otherwise continue.]"
@@ -257,7 +279,7 @@ class ActorRunner:
                 except asyncio.CancelledError:
                     pass
         
-        return actor._result or "No result"
+        return actor.result or "No result"
 
 
 async def run_actor_in_background(
@@ -269,5 +291,5 @@ async def run_actor_in_background(
     """Start an actor running in the background."""
     runner = ActorRunner(actor, registry, llm_factory, available_tools)
     task = asyncio.create_task(runner.run(), name=f"actor-{actor.id}")
-    actor._task = task
+    actor.set_task_handle(task)
     return task

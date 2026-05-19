@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -857,6 +858,33 @@ class TestTelegramReactTool:
 
         assert payload["message_id"] == 42
         assert bot.calls[0][1] == 42
+
+    @pytest.mark.asyncio
+    async def test_telegram_react_reports_soft_failure(self, monkeypatch):
+        from lethe.tools.telegram_tools import (
+            clear_telegram_context,
+            set_last_message_id,
+            set_telegram_context,
+            telegram_react_async,
+        )
+
+        monkeypatch.setattr(
+            "lethe.tools.telegram_tools.send_message_reaction",
+            AsyncMock(return_value=False),
+        )
+
+        bot = DummyTelegramBot()
+        set_telegram_context(bot, 99)
+        set_last_message_id(42)
+
+        try:
+            payload = json.loads(await telegram_react_async("🔥"))
+        finally:
+            clear_telegram_context()
+
+        assert payload["success"] is False
+        assert payload["message_id"] == 42
+        assert bot.calls == []
 
     @pytest.mark.asyncio
     async def test_telegram_react_queues_when_guard_active(self):

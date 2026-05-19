@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.17.0 - 2026-05-20
+
+### Changed
+- **Brain-centric cognitive architecture**: README and prompts now position Lethe around explicit cortex, hippocampus, DMN, brainstem, notification, delegation, and tool-policy subsystems instead of a monolithic assistant loop.
+- **Actor runtime cleanup**: actor lifecycle, registry hooks, mailbox access, task state, progress reporting, and terminal result handling now use public APIs and cleaner responsibility boundaries.
+- **Subagent progress semantics**: subagents are instructed to report concrete progress on a two-minute cadence, with structured terminal results for parent/cortex handling.
+- **Hippocampus/salience separation**: emotional salience tracking moved into a dedicated `SalienceTracker`; hippocampus now focuses on associative recall and uses active salience as a recall-bias signal.
+- **Shared transport runtime**: Telegram and API entry points share runtime helpers for heartbeat routing, active reminder formatting, and proactive rate limiting.
+
+### Added
+- **Typed notification pipeline**: background `user_notify` events now flow through notification router, scoring, gate, reviewer, and signal modules before any user-visible delivery.
+- **Centralized tool policy**: tool-name sets for cortex, subagents, private/free tools, recall skip lists, and Telegram exclusions now live in `tools/policy.py`.
+- **Notification review prompt** and tests for notification gating/review behavior.
+
+### Fixed
+- **Subagent orchestration robustness**: auto-start hooks, recent-finished discovery, task-state checkpoints, and child actor termination handling are more explicit and easier for cortex to reason about.
+- **Telegram reaction transport fallback**: reaction sending has clearer fallback behavior and better coverage around guarded turns.
+
 ## v0.16.1 - 2026-05-17
 
 ### Fixed

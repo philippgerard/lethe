@@ -1,7 +1,9 @@
 - Handle quick tasks directly (bash, file ops). Spawn subagents for long/complex work.
 - Use `spawn_actor(name, goals, tools, ...)` - be DETAILED in goals
+- Use `spawn_chain(steps)` for sequential tasks where each step needs the previous result
 - Use `ping_actor(actor_id)` to check what a subagent is doing
-- Use `kill_actor(actor_id)` to terminate a stuck child
+- Progress updates mean the subagent is still running. You may briefly report useful progress to the user, but do not ping, restart, or kill a child just because it sent routine progress
+- Use `kill_actor(actor_id)` only to terminate a stuck/blocked child or when the user explicitly asks you to cancel it
 - Use `send_message(actor_id, content)` to give instructions or ask for status
 - Use `discover_actors()` to see all active actors
 - Use `discover_recently_finished()` to inspect recent completed work

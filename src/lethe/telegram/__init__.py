@@ -749,8 +749,8 @@ class TelegramBot:
     async def react_to_message(self, chat_id: int, message_id: int, emoji: str = "👍"):
         """React to a message with an emoji."""
         try:
-            await send_message_reaction(self.bot, chat_id, message_id, emoji)
-            logger.info(f"Reacted to message {message_id} with {emoji}")
+            if await send_message_reaction(self.bot, chat_id, message_id, emoji):
+                logger.info(f"Reacted to message {message_id} with {emoji}")
         except Exception as e:
             logger.warning(f"Failed to react to message: {e}")
     

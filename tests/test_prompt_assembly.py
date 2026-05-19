@@ -153,5 +153,37 @@ def test_request_tool_can_load_extended():
     assert "browser_open" in _EXTENDED_TOOLS or len(_EXTENDED_TOOLS) > 3
 
 
+def test_unknown_model_uses_registered_default_assembler():
+    from lethe.context import get_assembler
+    from lethe.context.default import DefaultAssembler
+
+    assembler = get_assembler("some-future-model")
+    assert isinstance(assembler, DefaultAssembler)
+
+
+def test_get_assembler_prefers_longest_matching_pattern():
+    import lethe.context as context_mod
+
+    original_registry = dict(context_mod._registry)
+    original_default = context_mod._default_assembler_cls
+
+    try:
+        class GenericAssembler(context_mod.ContextAssembler):
+            model_patterns = ["foo"]
+
+        class SpecificAssembler(context_mod.ContextAssembler):
+            model_patterns = ["foo-bar"]
+
+        context_mod.register(GenericAssembler)
+        context_mod.register(SpecificAssembler)
+
+        assembler = context_mod.get_assembler("vendor/foo-bar-v2")
+        assert isinstance(assembler, SpecificAssembler)
+    finally:
+        context_mod._registry.clear()
+        context_mod._registry.update(original_registry)
+        context_mod._default_assembler_cls = original_default
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

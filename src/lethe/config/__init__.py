@@ -66,6 +66,10 @@ class Settings(BaseSettings):
         default=100000,
         description="Context window size in tokens",
     )
+    llm_provider: str = Field(
+        default="",
+        description="LLM provider override (empty = auto-detect from configured credentials)",
+    )
     llm_messages_load: int = Field(
         default=20,
         description="Number of recent messages to load verbatim at startup",
@@ -96,6 +100,7 @@ class Settings(BaseSettings):
     # Agent
     lethe_agent_name: str = Field(default="lethe", description="Agent name")
     lethe_config_dir: Path = Field(default_factory=paths.config_dir, description="Seed config templates (repo)")
+    lethe_mode: str = Field(default="", description="Runtime mode override: api or telegram")
 
     # Paths — all derive from LETHE_HOME (~/.lethe) unless overridden
     lethe_home: Path = Field(default_factory=paths.lethe_home, description="Root for all runtime data")
@@ -112,10 +117,19 @@ class Settings(BaseSettings):
 
     # Background cognition modules
     # amygdala_enabled removed: salience tagging merged into hippocampus (per-message)
+    actors_enabled: bool = Field(default=True, description="Enable actor system and background cognition")
+    hippocampus_enabled: bool = Field(default=True, description="Enable associative memory recall")
     curator_enabled: bool = Field(
         default=True,
         description="Enable memory curator (harvest + curate episodic memories, extract notes)",
     )
+    heartbeat_enabled: bool = Field(default=True, description="Enable periodic heartbeat loop")
+    heartbeat_interval: int = Field(default=60 * 60, description="Heartbeat interval in seconds")
+    lethe_console: bool = Field(default=False, description="Enable local runtime console")
+    lethe_console_host: str = Field(default="127.0.0.1", description="Console bind host")
+    lethe_console_port: int = Field(default=8777, description="Console bind port")
+    lethe_api_token: str = Field(default="", description="Bearer token required in API mode")
+    lethe_api_host: str = Field(default="127.0.0.1", description="API bind host")
 
     # Proactive messaging limits (hard enforcement, not prompt-dependent)
     proactive_max_per_day: int = Field(

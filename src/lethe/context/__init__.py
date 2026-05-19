@@ -8,13 +8,15 @@ and it registers itself via the `model_patterns` class attribute.
 Usage:
     from lethe.context import get_assembler
     assembler = get_assembler("claude-opus-4-6")
-    system_prompt = assembler.build_system_prompt(identity=..., instructions=..., ...)
+    system_prompt = assembler.build_system_prompt(
+        SystemComponents(identity="...", instructions="...", tools_doc="...")
+    )
 """
 
 import importlib
 import logging
 import pkgutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
@@ -23,6 +25,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 _registry: Dict[str, type] = {}  # pattern -> assembler class
+_default_assembler_cls: Optional[type] = None
 
 
 @dataclass
@@ -34,18 +37,12 @@ class SystemComponents:
     comm_rules: str = ""
 
 
-@dataclass
-class SystemBlocks:
-    """Structured blocks ready for API call."""
-    system_content: List[Dict] = field(default_factory=list)
-
-
 class ContextAssembler:
     """Base context assembler — default behavior for unknown models.
 
     Subclass this and set `model_patterns` to register for specific models.
-    The first matching pattern wins, so more specific patterns should be
-    in more specific assembler classes.
+    More specific patterns win automatically because lookup prefers the
+    longest matching substring.
     """
 
     model_patterns: List[str] = []
@@ -57,16 +54,18 @@ class ContextAssembler:
 
     def build_system_prompt(self, components: SystemComponents) -> str:
         """Assemble the full system prompt text from components."""
-        parts = []
-        if components.identity:
-            parts.append(components.identity)
-        if components.instructions:
-            parts.append(components.instructions)
-        if components.tools_doc:
-            parts.append(components.tools_doc)
-        if components.comm_rules:
-            parts.append(components.comm_rules)
-        return "\n\n".join(parts)
+        parts = [components.identity]
+        parts.extend(self.get_prompt_insertions(components))
+        parts.extend([
+            components.instructions,
+            components.tools_doc,
+            components.comm_rules,
+        ])
+        return "\n\n".join(part for part in parts if part)
+
+    def get_prompt_insertions(self, components: SystemComponents) -> List[str]:
+        """Return extra prompt sections inserted after the identity block."""
+        return []
 
     def get_comm_rules_filename(self) -> Optional[str]:
         """Return the communication rules filename to load, or None."""
@@ -93,7 +92,7 @@ class ContextAssembler:
         blocks.append({
             "type": "text",
             "text": identity_block,
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": self.get_identity_cache_control(),
         })
 
         if memory_context:
@@ -119,6 +118,10 @@ class ContextAssembler:
             })
 
         return blocks
+
+    def get_identity_cache_control(self) -> Dict[str, str]:
+        """Return cache control settings for the lead system block."""
+        return {"type": "ephemeral"}
 
     def should_embed_tool_reference(self) -> bool:
         """Whether to embed a compact tool list in the system prompt text.
@@ -150,6 +153,10 @@ def _render_block(tag: str, content: str, timestamp: Optional[datetime] = None) 
 
 def register(cls: type):
     """Register an assembler class. Called automatically on import."""
+    global _default_assembler_cls
+    if not cls.model_patterns:
+        _default_assembler_cls = cls
+        return cls
     for pattern in cls.model_patterns:
         _registry[pattern.lower()] = cls
     return cls
@@ -159,12 +166,15 @@ def get_assembler(model: str) -> ContextAssembler:
     """Get the appropriate assembler for a model name.
 
     Matches model_patterns against the model string (case-insensitive substring).
-    Falls back to the base ContextAssembler if no match.
+    Longer patterns win so specific assemblers beat generic ones.
+    Falls back to the registered default assembler, then to the base class.
     """
     model_lower = model.lower()
-    for pattern, cls in _registry.items():
+    for pattern, cls in sorted(_registry.items(), key=lambda item: len(item[0]), reverse=True):
         if pattern in model_lower:
             return cls(model)
+    if _default_assembler_cls is not None:
+        return _default_assembler_cls(model)
     return ContextAssembler(model)
 
 

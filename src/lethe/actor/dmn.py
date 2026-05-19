@@ -240,7 +240,7 @@ class DefaultModeNetwork:
         # Periodic cleanup: remove actors terminated > 1 hour ago
         self.registry.cleanup_terminated()
         
-        logger.info(f"DMN round starting ({len(llm._tools)} tools)")
+        logger.info(f"DMN round starting ({len(llm.tools)} tools)")
         
         # Run the round
         user_message = None
@@ -251,13 +251,7 @@ class DefaultModeNetwork:
                     break
                 
                 # Check inbox for messages (from cortex)
-                incoming = []
-                while not actor._inbox.empty():
-                    try:
-                        msg = actor._inbox.get_nowait()
-                        incoming.append(msg)
-                    except asyncio.QueueEmpty:
-                        break
+                incoming = actor.drain_inbox()
                 
                 if turn == 0:
                     turn_message = message
@@ -283,7 +277,7 @@ class DefaultModeNetwork:
                 if event_notifies:
                     user_message = event_notifies[-1].payload.get("message", "") or user_message
                 else:
-                    user_message = self._extract_user_notification(actor._messages, self.cortex_id) or user_message
+                    user_message = self._extract_user_notification(actor.messages, self.cortex_id) or user_message
 
                 if actor.state == ActorState.TERMINATED:
                     break
@@ -298,7 +292,7 @@ class DefaultModeNetwork:
             if actor.state != ActorState.TERMINATED:
                 actor.terminate(f"Error: {e}")
         
-        result = actor._result or "No result"
+        result = actor.result or "No result"
         file_stats_after = self._snapshot_files()
         mode = "DEEP" if "DEEP" in result.upper() or actor._turns > 4 else "QUICK"
         touched = self._diff_file_stats(file_stats_before, file_stats_after)

@@ -21,6 +21,7 @@ from lethe.utils import strip_model_tags
 from lethe.memory.anthropic_oauth import AnthropicOAuth, RateLimitError, is_oauth_available
 from lethe.memory.openai_oauth import OpenAIOAuth, is_oauth_available_openai
 from lethe.prompts import load_prompt_template
+from lethe.tools.policy import FREE_TOOL_NAMES, SEARCH_RESULT_SKIP_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ TOKEN_SAFETY_MARGIN = 1.1  # char/4 * 1.1 approximation
 
 COMPACTION_TRIGGER_RATIO = 0.85  # compact when messages exceed 85% of available
 SLIDING_WINDOW_KEEP_RATIO = 0.7  # keep 70% of available after compaction
-SUMMARY_MAX_LINES = 60  # max lines in conversation summary
+SUMMARY_MAX_LINES = 100  # max lines in conversation summary
 MAX_OVERFLOW_RETRIES = 3  # max recovery attempts on context overflow
 MAX_TOOL_RESULT_CONTEXT_SHARE = 0.3  # single tool result capped at 30% of context
 
@@ -148,10 +149,24 @@ HEARTBEAT_SYSTEM_PROMPT = load_prompt_template(
     fallback="You are background reflection. Reply with ok unless urgent.",
 )
 
-# Summarization prompt (template)
+# Summarization prompts (structured compaction, pi-mono style)
 SUMMARIZE_PROMPT = load_prompt_template(
     "llm_summarize",
     fallback="Summarize conversation concisely. Output summary only.",
+)
+
+SUMMARIZE_UPDATE_PROMPT = load_prompt_template(
+    "llm_summarize_update",
+    fallback="Update the existing summary with new information. Preserve all existing details.",
+)
+
+SUMMARIZE_SYSTEM_PROMPT = load_prompt_template(
+    "llm_summarize_system",
+    fallback=(
+        "You are a context summarization assistant. "
+        "Do NOT continue the conversation. Do NOT respond to questions. "
+        "ONLY output the structured summary."
+    ),
 )
 
 
@@ -573,22 +588,23 @@ class ContextWindow:
     def _skim_old_tool_results(self) -> int:
         """Pass 1: Archive old tool results to temp files, replace with compact references.
 
-        Only the LAST tool_call group keeps full content. Older tool results are
+        The last 2 tool_call groups keep full content. Older tool results are
         archived to disk and replaced with a short reference + preview. The model
         can read_file the archived path if it needs the full content.
 
         Returns number of tool results archived.
         """
-        # Find the last tool_call group
-        last_tool_assistant_idx = None
+        # Find the last 2 tool_call groups
+        recent_tool_assistant_indices = []
         for i in range(len(self.messages) - 1, -1, -1):
             if self.messages[i].role == "assistant" and self.messages[i].tool_calls:
-                last_tool_assistant_idx = i
-                break
+                recent_tool_assistant_indices.append(i)
+                if len(recent_tool_assistant_indices) >= 2:
+                    break
 
         last_tool_ids = set()
-        if last_tool_assistant_idx is not None:
-            for tc in self.messages[last_tool_assistant_idx].tool_calls:
+        for idx in recent_tool_assistant_indices:
+            for tc in self.messages[idx].tool_calls:
                 last_tool_ids.add(tc.get("id", ""))
 
         archived = 0
@@ -917,6 +933,13 @@ class ContextWindow:
             lines.append(f"- **{name}**({param_names}): {desc}")
         lines.append("</available_tools>")
         return "\n".join(lines)
+
+    def _get_assembler(self):
+        """Resolve and cache the model-specific context assembler."""
+        if self._assembler is None:
+            from lethe.context import get_assembler
+            self._assembler = get_assembler(self.config.model)
+        return self._assembler
     
     def build_messages(self) -> List[Dict]:
         """Build messages array for API call with prompt caching."""
@@ -925,37 +948,13 @@ class ContextWindow:
 
         is_anthropic = "claude" in self.config.model.lower() or "anthropic" in self.config.model.lower()
 
-        # Delegate system block assembly to the context assembler
-        if self._assembler:
-            system_content = self._assembler.build_system_blocks(
-                system_prompt=self.system_prompt,
-                memory_context=self.memory_context,
-                summary=self.summary,
-                transient_context=self.transient_system_context,
-                tool_reference=self._tool_reference,
-            )
-        else:
-            # Fallback: inline assembly (no assembler set)
-            from lethe.context import _render_block
-            system_content = []
-            system_content.append({
-                "type": "text",
-                "text": _render_block("identity_block", self.system_prompt),
-                "cache_control": {"type": "ephemeral"},
-            })
-            if self.memory_context:
-                mem_text = _render_block("memory_context_block", self.memory_context)
-                if self._tool_reference:
-                    mem_text += "\n\n" + _render_block("available_tools_block", self._tool_reference)
-                system_content.append({
-                    "type": "text",
-                    "text": mem_text,
-                    "cache_control": {"type": "ephemeral"},
-                })
-            if self.summary:
-                system_content.append({"type": "text", "text": _render_block("conversation_summary_block", self.summary)})
-            if self.transient_system_context:
-                system_content.append({"type": "text", "text": _render_block("runtime_context_block", self.transient_system_context)})
+        system_content = self._get_assembler().build_system_blocks(
+            system_prompt=self.system_prompt,
+            memory_context=self.memory_context,
+            summary=self.summary,
+            transient_context=self.transient_system_context,
+            tool_reference=self._tool_reference,
+        )
 
         messages = [{"role": "system", "content": system_content}]
 
@@ -1300,20 +1299,13 @@ class AsyncLLMClient:
 
     # Tool results that should NOT be persisted to message history
     # (conversation_search results contain previous search results, creating recursive bloat)
-    _SKIP_PERSIST_TOOLS = {"conversation_search", "archival_search"}
+    _SKIP_PERSIST_TOOLS = set(SEARCH_RESULT_SKIP_TOOL_NAMES)
     
     # Tools that don't count toward the tool call iteration limit.
     # Communication tools (telegram, actor messaging), memory tools, and actor
     # coordination tools are "free" so the agent isn't penalized for keeping
     # the user informed, managing memory, or coordinating subagents.
-    _FREE_TOOLS = {
-        "telegram_send_message", "telegram_send_file", "telegram_react",
-        "send_message", "user_notify", "terminate",
-        "memory_read", "memory_update", "memory_append",
-        "conversation_search", "archival_search", "archival_insert",
-        "ping_actor", "wait_for_response", "discover_actors",
-        "spawn_actor", "kill_actor",
-    }
+    _FREE_TOOLS = set(FREE_TOOL_NAMES)
     
     def _add_and_persist(self, message: "Message"):
         """Add message to context and persist to storage."""
@@ -1374,50 +1366,147 @@ class AsyncLLMClient:
         if name in self._tools:
             return self._tools[name][0]
         return None
-    
-    def _summarize_messages_sync(self, messages: List[Message], existing_summary: str) -> str:
-        """Summarize messages (sync version for use in async context).
 
-        Work-aware: preserves active task state, commitments, and the latest
-        user request so the model doesn't lose track after compaction.
+    def iter_tool_entries(self) -> List[tuple[str, Callable, Dict]]:
+        """Return registered tools as stable (name, function, schema) triples."""
+        return [
+            (name, func, schema)
+            for name, (func, schema) in self._tools.items()
+        ]
+
+    def restrict_tools(self, allowed_names: set[str] | frozenset[str]) -> Dict[str, tuple[Callable, Dict]]:
+        """Keep only allowed tools and return the removed tool entries."""
+        removed: Dict[str, tuple[Callable, Dict]] = {}
+        for name in list(self._tools.keys()):
+            if name in allowed_names:
+                continue
+            removed[name] = self._tools.pop(name)
+        if removed:
+            self._update_tool_budget()
+        return removed
+    
+    @staticmethod
+    def _serialize_for_summary(messages: List[Message]) -> str:
+        """Serialize messages to labeled text for summarization.
+
+        Uses explicit role labels and truncates tool results so the
+        summarizer gets clean, bounded input and doesn't try to continue
+        the conversation.
         """
-        # Format messages for summarization — cap each to avoid blowing the aux model's context
-        formatted = []
+        TOOL_RESULT_MAX_CHARS = 2000
+        parts: List[str] = []
+
         for m in messages:
             text = m.get_text_content()
-            # Truncate very long tool results in the summarization input
-            if m.role == "tool" and len(text) > 500:
-                text = text[:300] + f"\n[...{len(text) - 500} chars omitted...]\n" + text[-200:]
-            elif len(text) > 1000:
-                text = text[:800] + f"\n[...{len(text) - 1000} chars omitted...]\n" + text[-200:]
-            formatted.append(f"{m.role}: {text}")
-        conversation = "\n".join(formatted)
+            if m.role == "user":
+                parts.append(f"[User]: {text}")
+            elif m.role == "assistant":
+                if m.tool_calls:
+                    calls = []
+                    for tc in m.tool_calls:
+                        func = tc.get("function", {})
+                        name = func.get("name", "?")
+                        args_raw = func.get("arguments", "")
+                        args_preview = args_raw[:120] + "..." if len(args_raw) > 120 else args_raw
+                        calls.append(f"{name}({args_preview})")
+                    parts.append(f"[Assistant tool calls]: {'; '.join(calls)}")
+                if text:
+                    if len(text) > 1500:
+                        text = text[:1200] + f"\n[...{len(text) - 1200} chars omitted...]"
+                    parts.append(f"[Assistant]: {text}")
+            elif m.role == "tool":
+                tool_name = m.name or "tool"
+                if len(text) > TOOL_RESULT_MAX_CHARS:
+                    # Keep head + tail — error diagnostics tend to appear at the end
+                    head_size = TOOL_RESULT_MAX_CHARS - 500
+                    tail_size = 500
+                    omitted = len(text) - head_size - tail_size
+                    text = text[:head_size] + f"\n[...{omitted} chars truncated...]\n" + text[-tail_size:]
+                parts.append(f"[Tool result ({tool_name})]: {text}")
 
-        # Include the kept messages (recent turns) as context so the summarizer
-        # knows what's already preserved and can avoid redundancy
-        kept_preview = ""
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _extract_file_ops(messages: List[Message]) -> tuple[list[str], list[str]]:
+        """Extract file read/write paths from tool calls for compaction metadata."""
+        read_files: set[str] = set()
+        modified_files: set[str] = set()
+
+        for m in messages:
+            if m.role != "assistant" or not m.tool_calls:
+                continue
+            for tc in m.tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+                path = args.get("file_path") or args.get("path") or ""
+                if not path:
+                    continue
+                if name in ("read_file", "grep_search", "list_directory"):
+                    read_files.add(path)
+                elif name in ("write_file", "edit_file"):
+                    modified_files.add(path)
+
+        read_only = sorted(read_files - modified_files)
+        modified_sorted = sorted(modified_files)
+        return read_only, modified_sorted
+
+    def _summarize_messages_sync(self, messages: List[Message], existing_summary: str) -> str:
+        """Summarize messages using structured compaction (pi-mono style).
+
+        Uses two separate prompts:
+        - Initial: creates a fresh structured summary
+        - Update: merges new information into the existing summary
+
+        This preserves facts across multiple compaction rounds instead of
+        rewriting from scratch each time.
+        """
+        conversation_text = self._serialize_for_summary(messages)
+
+        # Extract file operations for the summary footer
+        read_files, modified_files = self._extract_file_ops(messages)
+
+        # Build prompt with conversation wrapped in tags
+        prompt_text = f"<conversation>\n{conversation_text}\n</conversation>\n\n"
+
+        if existing_summary:
+            prompt_text += f"<previous-summary>\n{existing_summary}\n</previous-summary>\n\n"
+            prompt_text += SUMMARIZE_UPDATE_PROMPT
+        else:
+            prompt_text += SUMMARIZE_PROMPT
+
+        # Include the kept messages so the summarizer avoids redundancy
         if self.context.messages:
             recent = self.context.messages[-3:]
             kept_texts = [f"{m.role}: {m.get_text_content()[:150]}" for m in recent]
-            kept_preview = "\n\nRecent turns (already kept, don't repeat):\n" + "\n".join(kept_texts)
+            prompt_text += "\n\nRecent turns (already kept in context, don't repeat):\n" + "\n".join(kept_texts)
 
-        if existing_summary:
-            conversation = f"Previous summary: {existing_summary}\n\nNew messages to incorporate:\n{conversation}{kept_preview}"
-        else:
-            conversation = f"{conversation}{kept_preview}"
-
-        # Use litellm for summarization
         try:
             response = completion(
                 model=self.config.model_aux,
                 messages=[
-                    {"role": "system", "content": SUMMARIZE_PROMPT},
-                    {"role": "user", "content": conversation},
+                    {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt_text},
                 ],
                 temperature=0.3,
-                max_tokens=1500,  # Increased from 500 for better continuity after compaction
+                max_tokens=3500,
             )
-            return response.choices[0].message.content or ""
+            summary = response.choices[0].message.content or ""
+
+            # Append file operations section if any
+            file_sections = []
+            if read_files:
+                file_sections.append(f"<read-files>\n{chr(10).join(read_files)}\n</read-files>")
+            if modified_files:
+                file_sections.append(f"<modified-files>\n{chr(10).join(modified_files)}\n</modified-files>")
+            if file_sections:
+                summary += "\n\n" + "\n\n".join(file_sections)
+
+            return summary
         except Exception as e:
             logger.error(f"Summarization failed: {e}")
             return existing_summary

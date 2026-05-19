@@ -9,9 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -23,17 +22,6 @@ from starlette.routing import Route
 
 logger = logging.getLogger(__name__)
 
-# Global references set by run_api() before the server starts
-_agent = None
-_conversation_manager = None
-_actor_system = None
-_heartbeat = None
-_settings = None
-
-# Queue for proactive/heartbeat events (drained by /events SSE)
-_proactive_queue: asyncio.Queue = asyncio.Queue()
-
-
 @dataclass
 class ApiSession:
     """One active SSE chat stream."""
@@ -44,9 +32,48 @@ class ApiSession:
     closed: bool = False
 
 
+@dataclass
+class ApiRuntime:
+    """Runtime dependencies used by the API route handlers."""
+
+    agent: object = None
+    conversation_manager: object = None
+    actor_system: object = None
+    heartbeat: object = None
+    settings: object = None
+    proactive_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
+
+_runtime = ApiRuntime()
 _api_sessions: dict[str, ApiSession] = {}
 _chat_sessions: dict[int, str] = {}
 _api_session_lock = asyncio.Lock()
+
+
+def configure_runtime(
+    *,
+    agent=None,
+    conversation_manager=None,
+    actor_system=None,
+    heartbeat=None,
+    settings=None,
+):
+    """Install runtime dependencies before serving API requests."""
+    if agent is not None:
+        _runtime.agent = agent
+    if conversation_manager is not None:
+        _runtime.conversation_manager = conversation_manager
+    if actor_system is not None:
+        _runtime.actor_system = actor_system
+    if heartbeat is not None:
+        _runtime.heartbeat = heartbeat
+    if settings is not None:
+        _runtime.settings = settings
+
+
+def proactive_queue() -> asyncio.Queue:
+    """Return the queue used for proactive SSE events."""
+    return _runtime.proactive_queue
 
 
 def _sse_encode(event: str, data: dict) -> str:
@@ -56,7 +83,10 @@ def _sse_encode(event: str, data: dict) -> str:
 
 
 def _expected_api_token() -> str:
-    return os.environ.get("LETHE_API_TOKEN", "").strip()
+    if _runtime.settings is not None:
+        return str(getattr(_runtime.settings, "lethe_api_token", "")).strip()
+    from lethe.config import get_settings
+    return get_settings().lethe_api_token.strip()
 
 
 def _presented_api_token(request: Request) -> str:
@@ -75,8 +105,8 @@ def _auth_error() -> JSONResponse:
 
 
 def _workspace_root() -> Path:
-    if _settings and getattr(_settings, "workspace_dir", None):
-        return Path(_settings.workspace_dir).resolve()
+    if _runtime.settings and getattr(_runtime.settings, "workspace_dir", None):
+        return Path(_runtime.settings.workspace_dir).resolve()
     from lethe.paths import workspace_dir
     return workspace_dir().resolve()
 
@@ -202,12 +232,12 @@ async def _process_chat_message(
     if metadata.get("message_id"):
         set_last_message_id(metadata["message_id"])
 
-    if _agent:
-        removed = _agent.llm.clear_idle_markers()
+    if _runtime.agent:
+        removed = _runtime.agent.llm.clear_idle_markers()
         if removed:
             logger.info("Cleared %d idle marker(s) on incoming API message", removed)
-        if _heartbeat:
-            _heartbeat.reset_idle_timer("incoming API message")
+        if _runtime.heartbeat:
+            _runtime.heartbeat.reset_idle_timer("incoming API message")
 
     try:
         await emit("typing_start")
@@ -238,7 +268,7 @@ async def _process_chat_message(
                 },
             )
 
-        response = await _agent.chat(message, on_message=on_intermediate, on_image=on_image)
+        response = await _runtime.agent.chat(message, on_message=on_intermediate, on_image=on_image)
 
         if not interrupt_check() and response and response.strip():
             await emit(
@@ -283,7 +313,7 @@ async def chat(request: Request) -> StreamingResponse | JSONResponse:
     auth_error = await _require_auth(request)
     if auth_error:
         return auth_error
-    if not _conversation_manager or not _agent:
+    if not _runtime.conversation_manager or not _runtime.agent:
         return JSONResponse({"error": "agent not initialized"}, status_code=503)
 
     body = await request.json()
@@ -296,7 +326,7 @@ async def chat(request: Request) -> StreamingResponse | JSONResponse:
     session_id = await _register_session(chat_id, event_queue)
     metadata["_api_session_id"] = session_id
 
-    await _conversation_manager.add_message(
+    await _runtime.conversation_manager.add_message(
         chat_id=chat_id,
         user_id=user_id,
         content=message,
@@ -312,8 +342,8 @@ async def chat(request: Request) -> StreamingResponse | JSONResponse:
                 if ev["event"] == "done":
                     break
         except asyncio.CancelledError:
-            if _chat_sessions.get(chat_id) == session_id and _conversation_manager:
-                await _conversation_manager.cancel(chat_id)
+            if _chat_sessions.get(chat_id) == session_id and _runtime.conversation_manager:
+                await _runtime.conversation_manager.cancel(chat_id)
             raise
         finally:
             await _unregister_session(session_id)
@@ -330,8 +360,8 @@ async def cancel(request: Request) -> JSONResponse:
     body = await request.json()
     chat_id = body.get("chat_id", 0)
     cancelled = False
-    if _conversation_manager and chat_id:
-        cancelled = await _conversation_manager.cancel(chat_id)
+    if _runtime.conversation_manager and chat_id:
+        cancelled = await _runtime.conversation_manager.cancel(chat_id)
         session_id = _chat_sessions.get(chat_id)
         if session_id:
             await _unregister_session(session_id)
@@ -349,13 +379,13 @@ async def configure(request: Request) -> JSONResponse:
     username = body.get("username", "")
     first_name = body.get("first_name", "")
 
-    if _agent:
+    if _runtime.agent:
         human_info = f"Name: {first_name}\n"
         if username:
             human_info += f"Telegram: @{username}\n"
         human_info += f"User ID: {user_id}\n"
-        _agent.memory.blocks.update("human", human_info)
-        _agent.refresh_memory_context()
+        _runtime.agent.memory.blocks.update("human", human_info)
+        _runtime.agent.refresh_memory_context()
         logger.info("Configured user metadata: %s (@%s, id=%d)", first_name, username, user_id)
 
     return JSONResponse({"status": "configured"})
@@ -369,17 +399,20 @@ async def model(request: Request) -> JSONResponse:
 
     from lethe.models import get_available_providers, provider_for_model
 
-    if not _agent:
+    if not _runtime.agent:
         return JSONResponse({"error": "agent not initialized"}, status_code=503)
 
-    config = _agent.llm.config
+    config = _runtime.agent.llm.config
     if request.method == "GET":
-        force = getattr(_agent.llm, "_force_oauth", None)
+        force = getattr(_runtime.agent.llm, "_force_oauth", None)
         if force is True:
             current_auth = "sub"
         elif force is False:
             current_auth = "API"
-        elif getattr(_agent.llm, "_oauth", None) and config.provider == getattr(_agent.llm, "_oauth_provider", ""):
+        elif (
+            getattr(_runtime.agent.llm, "_oauth", None)
+            and config.provider == getattr(_runtime.agent.llm, "_oauth_provider", "")
+        ):
             current_auth = "sub"
         else:
             current_auth = "API"
@@ -413,14 +446,14 @@ async def model(request: Request) -> JSONResponse:
         if mapped_provider:
             target_provider = mapped_provider
 
-    changed = await _agent.reconfigure_models(
+    changed = await _runtime.agent.reconfigure_models(
         provider=target_provider,
         model=new_model,
         model_aux=new_aux,
         force_oauth=force_oauth,
     )
 
-    config = _agent.llm.config
+    config = _runtime.agent.llm.config
     return JSONResponse(
         {
             "status": "updated",
@@ -441,7 +474,7 @@ async def events(request: Request) -> StreamingResponse | JSONResponse:
     async def event_stream():
         try:
             while True:
-                ev = await _proactive_queue.get()
+                ev = await _runtime.proactive_queue.get()
                 yield _sse_encode(ev["event"], ev["data"])
         except asyncio.CancelledError:
             return
@@ -451,7 +484,7 @@ async def events(request: Request) -> StreamingResponse | JSONResponse:
 
 async def send_proactive(content: str):
     """Push a proactive message onto the /events stream."""
-    await _proactive_queue.put(
+    await _runtime.proactive_queue.put(
         {
             "event": "text",
             "data": {

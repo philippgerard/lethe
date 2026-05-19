@@ -74,6 +74,28 @@ class TestGuardedTelegramFinalization:
         marker.assert_called_once_with("assistant final response")
 
     @pytest.mark.asyncio
+    async def test_emoji_reply_falls_back_to_text_if_reaction_send_fails(self, monkeypatch):
+        bot = DummyTelegramBot()
+        reaction_send = AsyncMock(return_value=False)
+        monkeypatch.setattr("lethe.main.send_message_reaction", reaction_send)
+        start_telegram_turn_guard(rng=lambda: 0.1)
+        marker = Mock()
+        set_telegram_context(bot, 99)
+        set_last_message_id(42)
+
+        try:
+            payload = json.loads(await telegram_react_async("🔥", message_id=77))
+            await _send_guarded_telegram_final_response(bot, 99, "👍", marker)
+        finally:
+            clear_telegram_context()
+            clear_telegram_turn_guard()
+
+        assert payload["queued"] is True
+        reaction_send.assert_awaited_once()
+        bot.send_message.assert_awaited_once_with(99, "👍")
+        marker.assert_called_once_with("assistant final response")
+
+    @pytest.mark.asyncio
     async def test_text_reply_flushes_pending_reactions_then_text(self, monkeypatch):
         bot = DummyTelegramBot()
         reaction_send = AsyncMock()

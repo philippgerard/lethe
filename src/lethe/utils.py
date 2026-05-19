@@ -42,3 +42,17 @@ def strip_model_tags(content: str) -> str:
     content = re.sub(r'<\|?tool_response\|?>.*', '', content, flags=re.DOTALL)
 
     return content.strip()
+
+
+def normalize_user_visible_message(content: str) -> str:
+    """Normalize model output before user delivery.
+
+    Returns an empty string when the response is a trivial "ok" or otherwise
+    empty after wrapper stripping.
+    """
+    cleaned = strip_model_tags(content or "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.lower() == "ok":
+        return ""
+    return cleaned

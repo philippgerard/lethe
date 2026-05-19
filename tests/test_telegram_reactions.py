@@ -7,15 +7,23 @@ import pytest
 
 pytest.importorskip("aiogram")
 
+from lethe.reaction_transport import send_message_reaction
 from lethe.telegram import TelegramBot
 
 
 class DummyReactionBot:
-    def __init__(self):
+    def __init__(self, *, available_reactions=None, error: Exception | None = None):
         self.calls = []
+        self.available_reactions = available_reactions
+        self.error = error
 
     async def set_message_reaction(self, chat_id: int, message_id: int, reaction: list, **kwargs):
+        if self.error is not None:
+            raise self.error
         self.calls.append((chat_id, message_id, reaction))
+
+    async def get_chat(self, chat_id: int):
+        return SimpleNamespace(available_reactions=self.available_reactions)
 
 
 class TestTelegramReactionHelpers:
@@ -58,6 +66,47 @@ class TestTelegramReactionHelpers:
         assert recorder.calls[0][0] == 99
         assert recorder.calls[0][1] == 77
         assert getattr(recorder.calls[0][2][0], "emoji", None) == "🔥"
+
+    @pytest.mark.asyncio
+    async def test_send_message_reaction_skips_chat_disallowed_emoji(self):
+        recorder = DummyReactionBot(
+            available_reactions=[
+                SimpleNamespace(emoji="👍"),
+                SimpleNamespace(emoji="❤️"),
+            ]
+        )
+
+        result = await send_message_reaction(recorder, chat_id=99, message_id=77, emoji="🔥")
+
+        assert result is False
+        assert recorder.calls == []
+
+    @pytest.mark.asyncio
+    async def test_send_message_reaction_uses_chat_metadata_when_available(self):
+        recorder = DummyReactionBot(
+            available_reactions=[
+                SimpleNamespace(emoji="👍"),
+                SimpleNamespace(emoji="🔥"),
+            ]
+        )
+
+        result = await send_message_reaction(recorder, chat_id=99, message_id=77, emoji="🔥")
+
+        assert result is True
+        assert recorder.calls[0][0] == 99
+        assert recorder.calls[0][1] == 77
+        assert getattr(recorder.calls[0][2][0], "emoji", None) == "🔥"
+
+    @pytest.mark.asyncio
+    async def test_send_message_reaction_soft_fails_on_invalid_reaction(self):
+        recorder = DummyReactionBot(
+            available_reactions=None,
+            error=Exception("Telegram server says - Bad Request: REACTION_INVALID"),
+        )
+
+        result = await send_message_reaction(recorder, chat_id=99, message_id=77, emoji="🔥")
+
+        assert result is False
 
     def test_build_message_metadata_includes_message_id(self, tmp_path):
         bot, _ = self._make_bot(tmp_path)

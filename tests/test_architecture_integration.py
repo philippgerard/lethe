@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from unittest.mock import AsyncMock
 
-from lethe.actor import ActorConfig, ActorRegistry
+from lethe.actor import ActorConfig, ActorMessage, ActorRegistry
 from lethe.actor.brainstem import Brainstem
 from lethe.actor.integration import ActorSystem
 from lethe.config import Settings
@@ -108,6 +108,17 @@ def test_anthropic_transient_system_context_block_is_uncached(monkeypatch):
     assert "<runtime_context>volatile</runtime_context>" in transient.get("text", "")
     assert "<runtime_context_block" in transient.get("text", "")
     assert "cache_control" not in transient
+
+
+def test_context_window_resolves_claude_assembler_without_agent(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    config = LLMConfig(model="anthropic/claude-sonnet-4-20250514")
+    context = ContextWindow(system_prompt="sys", memory_context="", config=config)
+    context.add_message(Message(role="user", content="hello"))
+
+    built = context.build_messages()
+    identity = built[0]["content"][0]
+    assert identity["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
 
 def test_conversation_messages_stay_plain(monkeypatch):
@@ -324,8 +335,64 @@ async def test_principal_monitor_keeps_done_and_failed_updates_in_cortex(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_brainstem_user_notify_triggers_cortex_turn(monkeypatch):
-    """user_notify from brainstem triggers a cortex turn instead of auto-relaying."""
+async def test_progress_updates_wake_cortex_with_guardrails(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "1")
+
+    class DummyLLM:
+        def __init__(self):
+            self._tools = {}
+            self.tools = []
+            self.context = type("Ctx", (), {"_tool_reference": "", "_build_tool_reference": lambda self, tools: ""})()
+        def add_tool(self, func, schema=None):
+            self._tools[func.__name__] = (func, schema or {})
+        def _update_tool_budget(self):
+            return None
+
+    class DummyAgent:
+        def __init__(self):
+            self.llm = DummyLLM()
+        def add_tool(self, func):
+            self.llm.add_tool(func)
+
+    actor_system = ActorSystem(DummyAgent())
+    await actor_system.setup()
+    run_cortex_turn = AsyncMock()
+    actor_system.set_callbacks(
+        send_to_user=AsyncMock(),
+        run_cortex_turn=run_cortex_turn,
+    )
+
+    progress = ActorMessage(
+        sender="worker-1",
+        recipient=actor_system.principal.id,
+        content="worker still working",
+        metadata={"channel": "task_update", "kind": "progress"},
+    )
+    await actor_system._handle_principal_message(progress)
+    run_cortex_turn.assert_awaited_once()
+    progress_prompt = run_cortex_turn.await_args.args[0]
+    assert "still running" in progress_prompt
+    assert "do not kill" in progress_prompt
+    assert "worker still working" in progress_prompt
+    run_cortex_turn.reset_mock()
+
+    done = ActorMessage(
+        sender="worker-1",
+        recipient=actor_system.principal.id,
+        content="worker finished",
+        metadata={"channel": "task_update", "kind": "done"},
+    )
+    await actor_system._handle_principal_message(done)
+    run_cortex_turn.assert_awaited_once()
+
+    await actor_system.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_brainstem_user_notify_flows_through_notification_gate(monkeypatch):
+    """Background signals are routed and gated before any LLM review."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "1")
@@ -350,11 +417,11 @@ async def test_brainstem_user_notify_triggers_cortex_turn(monkeypatch):
     actor_system = ActorSystem(agent)
     await actor_system.setup()
     send_to_user = AsyncMock()
-    run_cortex_turn = AsyncMock()
+    review_user_notification = AsyncMock()
 
     actor_system.set_callbacks(
         send_to_user=send_to_user,
-        run_cortex_turn=run_cortex_turn,
+        review_user_notification=review_user_notification,
     )
 
     principal = actor_system.principal
@@ -364,39 +431,57 @@ async def test_brainstem_user_notify_triggers_cortex_turn(monkeypatch):
     )
 
     # Let setup-time notifications settle
-    await asyncio.sleep(2.0)
-    run_cortex_turn.reset_mock()
+    await asyncio.sleep(0.5)
+    review_user_notification.reset_mock()
     send_to_user.reset_mock()
 
+    # Non-urgent notifications are dropped before LLM review.
     await brainstem_actor.send_to(
         principal.id,
-        "Important insight",
+        "Routine insight",
         metadata={"channel": "user_notify", "kind": "insight"},
     )
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(0.4)
 
-    # Cortex turn should be triggered, NOT direct send_to_user
-    assert run_cortex_turn.await_count >= 1
-    synthetic = run_cortex_turn.await_args_list[0].args[0]
-    assert "brainstem" in synthetic
-    assert "user_notify" in synthetic or "notify the user" in synthetic
-
-    # send_to_user should NOT have been called directly
+    assert review_user_notification.await_count == 0
     assert send_to_user.await_count == 0
 
+    # Relay + gate decisions are still recorded for observability.
     events = actor_system.registry.events.query(
-        event_type="background_notify_deferred_to_cortex",
+        event_type="notification_signal_received",
         actor_id=principal.id,
     )
     assert events
-    assert events[-1].payload.get("from_actor_name") == "brainstem"
+    assert events[-1].payload.get("source") == "brainstem"
+    gate_events = actor_system.registry.events.query(
+        event_type="notification_gate_decision",
+        actor_id=principal.id,
+    )
+    assert gate_events
+    assert gate_events[-1].payload.get("action") == "drop"
+
+    # Urgent notifications do reach LLM review.
+    review_user_notification.reset_mock()
+    await brainstem_actor.send_to(
+        principal.id,
+        "Disk space critically low",
+        metadata={"channel": "user_notify", "kind": "warning"},
+    )
+    await asyncio.sleep(0.4)
+
+    assert review_user_notification.await_count >= 1
+    signal = review_user_notification.await_args_list[0].args[0]
+    assert signal.source.value == "brainstem"
+    assert signal.category.value == "warning"
+    assert signal.urgency.value == "high"
+    assert "Disk space critically low" in signal.content
 
     await actor_system.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_dmn_user_notify_triggers_cortex_turn(monkeypatch):
-    """user_notify from DMN triggers a cortex turn instead of auto-relaying."""
+async def test_dmn_user_notify_reaches_notification_review(monkeypatch):
+    """Urgent DMN signals are typed and forwarded once."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "1")
@@ -421,11 +506,11 @@ async def test_dmn_user_notify_triggers_cortex_turn(monkeypatch):
     actor_system = ActorSystem(agent)
     await actor_system.setup()
     send_to_user = AsyncMock()
-    run_cortex_turn = AsyncMock()
+    review_user_notification = AsyncMock()
 
     actor_system.set_callbacks(
         send_to_user=send_to_user,
-        run_cortex_turn=run_cortex_turn,
+        review_user_notification=review_user_notification,
     )
 
     principal = actor_system.principal
@@ -435,8 +520,8 @@ async def test_dmn_user_notify_triggers_cortex_turn(monkeypatch):
     )
 
     # Let setup-time notifications (brainstem restart etc.) settle
-    await asyncio.sleep(2.0)
-    run_cortex_turn.reset_mock()
+    await asyncio.sleep(0.5)
+    review_user_notification.reset_mock()
     send_to_user.reset_mock()
 
     await dmn_actor.send_to(
@@ -444,15 +529,88 @@ async def test_dmn_user_notify_triggers_cortex_turn(monkeypatch):
         "Urgent deadline tomorrow",
         metadata={"channel": "user_notify", "kind": "deadline"},
     )
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(0.4)
 
-    # Cortex turn should be triggered
-    assert run_cortex_turn.await_count >= 1
-    synthetic = run_cortex_turn.await_args_list[0].args[0]
-    assert "dmn" in synthetic
+    assert review_user_notification.await_count >= 1
+    signal = review_user_notification.await_args_list[0].args[0]
+    assert signal.source.value == "dmn"
+    assert signal.origin.value == "reflection"
+    assert signal.category.value == "reminder"
+    assert signal.urgency.value == "high"
+    assert "Urgent deadline tomorrow" in signal.content
 
     # send_to_user should NOT have been called directly
     assert send_to_user.await_count == 0
+
+    await actor_system.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_background_signal_queues_until_notification_review_is_ready(monkeypatch):
+    """Signals that pass gating are queued until notification review is installed."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "1")
+
+    class DummyLLM:
+        def __init__(self):
+            self._tools = {}
+            self.tools = []
+            self.context = type("Ctx", (), {"_tool_reference": "", "_build_tool_reference": lambda self, tools: ""})()
+        def add_tool(self, func, schema=None):
+            self._tools[func.__name__] = (func, schema or {})
+        def _update_tool_budget(self):
+            return None
+
+    class DummyAgent:
+        def __init__(self):
+            self.llm = DummyLLM()
+        def add_tool(self, func):
+            self.llm.add_tool(func)
+
+    agent = DummyAgent()
+    actor_system = ActorSystem(agent)
+    await actor_system.setup()
+    send_to_user = AsyncMock()
+
+    actor_system.set_callbacks(
+        send_to_user=send_to_user,
+    )
+
+    principal = actor_system.principal
+    dmn_actor = actor_system.registry.spawn(
+        ActorConfig(name="dmn", group="main", goals="background notify"),
+        spawned_by=principal.id,
+    )
+
+    await asyncio.sleep(0.5)
+    send_to_user.reset_mock()
+
+    await dmn_actor.send_to(
+        principal.id,
+        "Urgent deadline tomorrow",
+        metadata={"channel": "user_notify", "kind": "deadline"},
+    )
+    await asyncio.sleep(0.4)
+
+    assert send_to_user.await_count == 0
+    queued = actor_system.registry.events.query(
+        event_type="notification_signal_queued",
+        actor_id=principal.id,
+    )
+    assert queued
+
+    review_user_notification = AsyncMock()
+    actor_system.set_callbacks(
+        send_to_user=send_to_user,
+        review_user_notification=review_user_notification,
+    )
+    await asyncio.sleep(0.4)
+
+    assert review_user_notification.await_count == 1
+    signal = review_user_notification.await_args_list[0].args[0]
+    assert signal.source.value == "dmn"
+    assert signal.category.value == "reminder"
 
     await actor_system.shutdown()
 

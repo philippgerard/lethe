@@ -4,6 +4,7 @@ Butler (principal) tools: spawn, kill, send, discover, ping, wait, terminate
 Subagent tools: send, discover, wait, terminate, restart_self, spawn (always)
 """
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -112,8 +113,8 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
             result_info = ""
             if info.state == ActorState.TERMINATED:
                 target = registry.get(info.id)
-                if target and target._result:
-                    result_info = f" result: {target._result[:100]}"
+                if target and target.result:
+                    result_info = f" result: {target.result[:100]}"
             lines.append(
                 f"  {info.name} (id={info.id}, state={info.state.value}, task={info.task_state.value})"
                 f"{marker}{relationship}: {info.goals}{result_info}"
@@ -137,7 +138,7 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
 
         lines = [f"Recently finished in '{search_group}':"]
         for a in finished:
-            result = (a._result or "no result").strip()
+            result = (a.result or "no result").strip()
             if len(result) > 160:
                 result = result[:160] + "...[truncated]"
             when = a.terminated_at.strftime("%H:%M:%S") if a.terminated_at else "unknown"
@@ -146,20 +147,37 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
             )
         return "\n".join(lines)
 
-    def terminate(result: str = "") -> str:
-        """Terminate this actor and report results.
-        
-        Call this when your task is complete. Include a summary of what
-        you accomplished — this will be sent to the actor that spawned you.
-        
+    def terminate(
+        result: str = "",
+        outcome: str = "success",
+        files_touched: str = "",
+        follow_up: str = "",
+    ) -> str:
+        """Terminate this actor and report structured results.
+
+        Call this when your task is complete.
+
         Args:
-            result: Summary of what was accomplished
-            
+            result: What you accomplished — the core deliverable
+            outcome: "success", "failure", or "partial"
+            files_touched: Comma-separated list of file paths you read or modified
+            follow_up: Optional suggestion for parent (e.g. "spawn a sibling to test this")
+
         Returns:
             Confirmation
         """
-        actor.terminate(result)
-        # Signal LLM client to stop — prevents wasted API call after terminate
+        # Build structured result from fields
+        parts = []
+        if outcome and outcome != "success":
+            parts.append(f"[outcome: {outcome}]")
+        parts.append(result or "Done")
+        if files_touched:
+            parts.append(f"[files: {files_touched}]")
+        if follow_up:
+            parts.append(f"[follow-up: {follow_up}]")
+        structured_result = "\n".join(parts)
+
+        actor.terminate(structured_result)
         if hasattr(actor, '_llm') and actor._llm:
             actor._llm._stop_after_tool = True
         return "Terminated. Result sent to parent."
@@ -183,20 +201,23 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
         group: str = "",
         tools: str = "",
         model: str = "aux",
-        max_turns: int = 50,
+        max_turns: int = 20,
     ) -> str:
-        """Spawn a new subagent actor to handle a subtask.
+        """Spawn a new subagent actor to handle a focused subtask.
 
         IMPORTANT: Before spawning, check if an existing actor can handle this.
         Use discover_actors() first to see who's already running.
 
+        Give each subagent ONE atomic goal. If you have multiple independent
+        tasks, spawn one subagent per task.
+
         Args:
             name: Short name for the actor (e.g., "researcher", "coder")
-            goals: Detailed description of what to accomplish. Include all context the subagent needs.
+            goals: Detailed description of ONE specific thing to accomplish. Include all context the subagent needs — file paths, success criteria, constraints. The subagent has no access to your conversation.
             group: Actor group for discovery (default: same as yours)
             tools: Comma-separated EXTRA tool names beyond the defaults. All subagents always get: bash, read_file, write_file, edit_file, list_directory, grep_search, view_image. Specify extras like: "web_search,fetch_webpage,browser_open" etc.
             model: "main" for complex reasoning tasks, "aux" (default) for routine work.
-            max_turns: Max LLM turns before forced termination (default 50)
+            max_turns: Max LLM turns before forced termination (default 20)
 
         Returns:
             Actor ID and confirmation, or existing actor info if duplicate
@@ -259,6 +280,17 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
                 f"{_format_children(active_children)}"
             )
         
+        # Limit nesting depth: subagents can spawn children, but those children cannot
+        # spawn grandchildren. Prevents unbounded recursive delegation.
+        if actor.spawned_by:
+            parent = registry.get(actor.spawned_by)
+            if parent and parent.spawned_by and not parent.is_principal:
+                return (
+                    "NESTING LIMIT: You are already a grandchild actor (2 levels deep). "
+                    "Cannot spawn further children — do the work yourself or report back "
+                    "to your parent suggesting it spawn a sibling for this subtask."
+                )
+
         tool_list = [t.strip() for t in tools.split(",") if t.strip()] if tools else []
 
         # Resolve model tier from string
@@ -293,6 +325,102 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
     
     tools.append((spawn_actor, False))
 
+    # --- spawn_chain: sequential subagent execution with result passing ---
+    MAX_CHAIN_STEPS = 5
+
+    async def spawn_chain(
+        steps: str,
+        tools: str = "",
+        model: str = "aux",
+    ) -> str:
+        """Run subagents sequentially, feeding each result into the next.
+
+        Each step's goals can include {previous} which is replaced with
+        the previous step's result. The chain stops on failure.
+
+        Args:
+            steps: JSON array of objects: [{"name": "step-name", "goals": "...{previous}..."}]
+            tools: Comma-separated extra tools for ALL steps (beyond defaults)
+            model: Model tier for all steps ("main" or "aux")
+
+        Returns:
+            Final step's result, or error if chain fails
+
+        Example:
+            steps='[{"name":"researcher","goals":"Find the API docs for X"},{"name":"implementer","goals":"Using this context: {previous}\\nImplement the feature in src/foo.py"}]'
+        """
+        import json as _json
+        try:
+            parsed = _json.loads(steps)
+        except _json.JSONDecodeError as e:
+            return f"Error: steps must be valid JSON array. Parse error: {e}"
+
+        if not isinstance(parsed, list) or len(parsed) == 0:
+            return "Error: steps must be a non-empty JSON array of {name, goals} objects."
+        if len(parsed) > MAX_CHAIN_STEPS:
+            return f"Error: max {MAX_CHAIN_STEPS} steps in a chain (got {len(parsed)})."
+
+        from lethe.actor import ActorConfig, ActorState, ModelTier
+
+        tool_list = [t.strip() for t in tools.split(",") if t.strip()] if tools else []
+        model_key = model.strip().lower() if model else "aux"
+        try:
+            model_tier = ModelTier(model_key)
+        except ValueError:
+            model_tier = ModelTier.AUX
+
+        previous_result = ""
+        results = []
+        target_group = actor.config.group
+
+        for i, step in enumerate(parsed):
+            step_name = step.get("name", f"chain-step-{i+1}")
+            step_goals = step.get("goals", "")
+            if not step_goals:
+                return f"Error: step {i+1} has no goals."
+
+            step_goals = step_goals.replace("{previous}", previous_result)
+
+            config = ActorConfig(
+                name=step_name,
+                group=target_group,
+                goals=step_goals,
+                tools=tool_list,
+                model=model_tier,
+                max_turns=20,
+            )
+
+            # Spawn triggers auto-start via the registry hook in integration.py
+            child = registry.spawn(config, spawned_by=actor.id)
+
+            # Wait for the auto-started background task to complete
+            if child.task:
+                try:
+                    await child.task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            result = child.result or "No result"
+            is_failure = "error" in result.lower()[:50] or "failure" in result.lower()[:50]
+            results.append({"step": i + 1, "name": step_name, "result": result[:500]})
+
+            if is_failure:
+                summary = "\n".join(
+                    f"Step {r['step']} ({r['name']}): {r['result'][:200]}" for r in results
+                )
+                return f"Chain stopped at step {i+1} ({step_name}):\n{summary}"
+
+            previous_result = result
+
+        summary = "\n".join(
+            f"Step {r['step']} ({r['name']}): {r['result'][:200]}" for r in results
+        )
+        return f"Chain complete ({len(results)} steps):\n{summary}\n\nFinal result:\n{previous_result[:1000]}"
+
+    tools.append((spawn_chain, False))
+
     # --- ping_actor: check what a child/group member is doing ---
     async def ping_actor(actor_id: str) -> str:
         """Ping an actor to check its status and progress.
@@ -313,14 +441,14 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
             f"Task: {target.task_state.value}",
             f"Goals: {target.config.goals}",
             f"Turns: {target._turns}/{target.config.max_turns}",
-            f"Messages: {len(target._messages)}",
+            f"Messages: {len(target.messages)}",
         ]
         
         if target.state == ActorState.TERMINATED:
-            lines.append(f"Result: {target._result or 'none'}")
+            lines.append(f"Result: {target.result or 'none'}")
         
         # Show last 3 messages
-        recent = target._messages[-3:]
+        recent = target.recent_messages(3)
         if recent:
             lines.append("Recent activity:")
             for m in recent:
@@ -363,7 +491,7 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
 
         Args:
             state: One of planned, running, blocked, done
-            note: Optional note describing why
+            note: Specific checkpoint or blocker. This is used in automatic progress reports.
 
         Returns:
             Confirmation or error
@@ -411,8 +539,8 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
                     loop = asyncio.get_running_loop()
                     loop.create_task(parent.send(msg))
                 except RuntimeError:
-                    parent._messages.append(msg)
-                    parent._inbox.put_nowait(msg)
+                    parent.append_message(msg)
+                    parent.put_inbox_nowait(msg)
             
             actor.terminate(f"Restart requested with new goals: {new_goals[:200]}")
             return "Terminating for restart. Parent will respawn with new goals."
@@ -422,5 +550,5 @@ def create_actor_tools(actor: "Actor", registry: "ActorRegistry") -> list:
     return tools
 
 
-# Import for type checking in restart_self
+# Import late to avoid circular import during actor module initialization.
 from lethe.actor import ActorState

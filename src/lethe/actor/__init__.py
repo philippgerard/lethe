@@ -35,12 +35,14 @@ PRINCIPAL_PROMPT_BLOCK = load_prompt_template(
         "- Anything completable in under a minute\n\n"
         "Spawn a subagent ONLY when:\n"
         "- The task will take more than ~1 minute (multi-step, research, long builds)\n"
-        "- It benefits from isolation or parallel execution (long crawling, multi-source research, independent subtasks)\n"
-        "- You want parallel execution (multiple independent tasks)\n"
-        "Be specific in subagent goals - they only know what you tell them.\n"
-        "After spawning, respond to the user immediately ('Working on it' etc) and MOVE ON.\n"
-        "Do NOT poll or wait — you'll be notified automatically when the subagent finishes.\n"
-        "Kill stuck ones with kill_actor().\n\n"
+        "- It benefits from isolation or parallel execution\n"
+        "- You want parallel execution (multiple independent tasks)\n\n"
+        "TASK DECOMPOSITION — when spawning subagents:\n"
+        "- Each subagent gets ONE atomic goal with a clear deliverable\n"
+        "- If a task has N independent parts, spawn N subagents, not 1\n"
+        "- Goals must be self-contained: include file paths, context, and success criteria\n"
+        "- After spawning, respond to the user immediately and FINISH YOUR TURN\n"
+        "- You'll be notified automatically when a subagent finishes — do NOT poll\n\n"
         "CRITICAL - NEVER spawn duplicates:\n"
         "- ALWAYS call discover_actors() BEFORE spawning to see who's already running\n"
         "- If an actor with similar goals exists, send_message() to it instead\n"
@@ -52,9 +54,11 @@ SUBAGENT_PROMPT_BLOCK = load_prompt_template(
     "actor_subagent_preamble",
     fallback=(
         "You are a subagent actor named '{actor_name}'.\n"
-        "You were spawned by '{parent_name}' (id={parent_id}) to accomplish a specific task.\n"
-        "You CANNOT talk to the user directly. Report your results to the actor that spawned you.\n"
-        "If something goes wrong, notify your parent immediately.\n"
+        "You were spawned by '{parent_name}' (id={parent_id}) to accomplish ONE specific task.\n"
+        "You CANNOT talk to the user directly. Report your results to the actor that spawned you.\n\n"
+        "Stay focused on your single assigned goal. Do NOT expand scope beyond what was asked.\n"
+        "If your goals contain multiple unrelated parts, pick the most important one and "
+        "report back suggesting the parent spawn separate actors for the rest.\n"
         "If your goals are unclear, use restart_self(new_goals) with better goals."
     ),
 )
@@ -67,7 +71,8 @@ PRINCIPAL_RULES_BLOCK = load_prompt_template(
         "- After spawning, tell the user you've started the task and FINISH YOUR TURN\n"
         "- You'll be automatically notified when a subagent completes — do NOT poll or loop\n"
         "- Use `ping_actor(actor_id)` ONLY if the user asks about progress or it's been very long\n"
-        "- Use `kill_actor(actor_id)` to terminate a stuck child\n"
+        "- Progress updates mean the subagent is still running. You may briefly report useful progress, but do not ping, restart, or kill a child just because it sent routine progress\n"
+        "- Use `kill_actor(actor_id)` only to terminate a stuck/blocked child or when the user explicitly asks you to cancel it\n"
         "- Use `send_message(actor_id, content)` to give instructions or ask for status\n"
         "- Use `discover_actors()` to see all active actors\n"
         "- Use `discover_recently_finished()` to inspect recent completed work"
@@ -80,7 +85,7 @@ SUBAGENT_RULES_BLOCK = load_prompt_template(
         "- Use your tools to accomplish your goals\n"
         "- Use `send_message(actor_id, content)` to message parent, siblings, or children\n"
         "- Use `spawn_actor(...)` if you need to delegate a subtask\n"
-        "- Use `update_task_state(state, note)` to checkpoint: planned/running/blocked/done\n"
+        "- Use `update_task_state(state, note)` whenever you make meaningful progress, start a long step, or hit a blocker. Be specific.\n"
         "- Use `restart_self(new_goals)` if your goals are unclear or you need a different approach\n"
         "- Report results to your parent '{parent_name}' (id={parent_id}) before terminating\n"
         "- Use `terminate(result)` when done - include a detailed summary\n"
@@ -111,6 +116,73 @@ class TaskState(str, Enum):
     DONE = "done"
 
 
+class MessageIntent(str, Enum):
+    """What a message means for routing. Single source of truth.
+
+    Each intent carries its routing policy:
+    - wakes_cortex: should receiving this trigger an LLM turn?
+    - is_terminal: does this signal end-of-work for the sender?
+    """
+    # Subagent lifecycle (task_update channel)
+    PROGRESS    = "progress"      # non-terminal, wakes cortex for optional user status
+    DONE        = "done"          # terminal, wakes cortex
+    FAILED      = "failed"        # terminal, wakes cortex
+    ERROR       = "error"         # terminal, wakes cortex
+    MAX_TURNS   = "max_turns"     # terminal, wakes cortex
+
+    # Background → cortex (user_notify channel)
+    ALERT       = "alert"         # urgent, wakes cortex — relay to user
+    REMINDER    = "reminder"      # urgent, wakes cortex — relay to user
+    INFO        = "info"          # routine, suppressed — log only
+
+    # Generic
+    MESSAGE     = "message"       # plain inter-actor message, no routing
+
+    @property
+    def wakes_cortex(self) -> bool:
+        return self not in (MessageIntent.INFO, MessageIntent.MESSAGE)
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (
+            MessageIntent.DONE, MessageIntent.FAILED,
+            MessageIntent.ERROR, MessageIntent.MAX_TURNS,
+        )
+
+    @property
+    def channel(self) -> str:
+        """Derive channel from intent (backward compat for metadata)."""
+        if self in (MessageIntent.ALERT, MessageIntent.REMINDER, MessageIntent.INFO):
+            return "user_notify"
+        if self.is_terminal or self == MessageIntent.PROGRESS:
+            return "task_update"
+        return ""
+
+    @classmethod
+    def from_strings(cls, channel: str = "", kind: str = "") -> "MessageIntent":
+        """Map legacy channel+kind strings to an intent. Best-effort."""
+        kind_lower = kind.strip().lower()
+        # Direct enum match
+        try:
+            return cls(kind_lower)
+        except ValueError:
+            pass
+        # Map legacy brainstem/dmn kinds
+        if "alert" in kind_lower or "warning" in kind_lower:
+            return cls.ALERT
+        if "deadline" in kind_lower or "reminder" in kind_lower or "update_ready" in kind_lower:
+            return cls.REMINDER
+        if "error" in kind_lower or "fatal" in kind_lower:
+            return cls.ERROR
+        if kind_lower in ("done",):
+            return cls.DONE
+        if kind_lower in ("failed",):
+            return cls.FAILED
+        # Unknown kind — default to INFO (suppressed). Only explicit
+        # enum values like "progress", "done", "alert" wake cortex.
+        return cls.INFO
+
+
 @dataclass
 class ActorMessage:
     """Message passed between actors."""
@@ -119,6 +191,7 @@ class ActorMessage:
     recipient: str = ""    # Actor ID of recipient
     content: str = ""      # Message text
     reply_to: Optional[str] = None  # Message ID this replies to
+    intent: MessageIntent = MessageIntent.MESSAGE
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -200,7 +273,7 @@ class ActorConfig:
     goals: str = ""                        # What this actor should accomplish
     model: Optional[ModelTier] = None      # Model tier (None = AUX default)
     tools: List[str] = field(default_factory=list)  # Tool names available to this actor
-    max_turns: int = 50                    # Max LLM turns before forced termination
+    max_turns: int = 20                    # Max LLM turns before forced termination
     max_messages: int = 50                 # Max inter-actor messages
 
 
@@ -270,6 +343,8 @@ class Actor:
         # Turn counter
         self._turns = 0
         self._last_prompt_stats: Dict[str, int] = {}
+        self._task_state_note = ""
+        self._task_state_updated_at: Optional[datetime] = None
         
         self.created_at = datetime.now(timezone.utc)
         
@@ -288,6 +363,67 @@ class Actor:
             spawned_by=self.spawned_by,
         )
 
+    @property
+    def result(self) -> Optional[str]:
+        """Terminal result reported by the actor, if any."""
+        return self._result
+
+    @property
+    def messages(self) -> List[ActorMessage]:
+        """Read-only snapshot of actor message history."""
+        return list(self._messages)
+
+    @property
+    def turn_count(self) -> int:
+        """Number of LLM turns consumed by this actor."""
+        return self._turns
+
+    @property
+    def task_state_note(self) -> str:
+        """Latest checkpoint note supplied by the actor."""
+        return self._task_state_note
+
+    @property
+    def task_state_updated_at(self) -> Optional[datetime]:
+        """When the actor last checkpointed task state."""
+        return self._task_state_updated_at
+
+    @property
+    def task(self) -> Optional[asyncio.Task]:
+        """Asyncio task currently running this actor, if any."""
+        return self._task
+
+    def set_task_handle(self, task: asyncio.Task) -> None:
+        """Attach the running asyncio task that owns this actor."""
+        self._task = task
+
+    def append_message(self, message: ActorMessage) -> None:
+        """Append a historical message without enqueueing it for processing."""
+        self._messages.append(message)
+
+    def put_inbox_nowait(self, message: ActorMessage) -> None:
+        """Queue a message for processing without awaiting."""
+        self._inbox.put_nowait(message)
+
+    def has_pending_messages(self) -> bool:
+        """Return True when the actor has unread inbox messages."""
+        return not self._inbox.empty()
+
+    def drain_inbox(self) -> List[ActorMessage]:
+        """Drain currently queued inbox messages in FIFO order."""
+        drained: List[ActorMessage] = []
+        while not self._inbox.empty():
+            try:
+                drained.append(self._inbox.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return drained
+
+    def recent_messages(self, limit: int = 8, *, include_self: bool = True) -> List[ActorMessage]:
+        """Return a snapshot of the most recent actor messages."""
+        messages = self._messages if include_self else [m for m in self._messages if m.sender != self.id]
+        return list(messages[-max(0, limit):])
+
     def set_task_state(self, state: str, note: str = "") -> tuple[bool, str]:
         """Update task execution state with transition validation."""
         try:
@@ -302,10 +438,12 @@ class Actor:
 
         previous = self.task_state
         self.task_state = new_state
+        self._task_state_note = str(note or "").strip()
+        self._task_state_updated_at = datetime.now(timezone.utc)
         self.registry.emit_event(
             "task_state_changed",
             self,
-            {"from": previous.value, "to": new_state.value, "note": note},
+            {"from": previous.value, "to": new_state.value, "note": self._task_state_note},
         )
         return True, f"Task state updated: {previous.value} -> {new_state.value}"
 
@@ -350,6 +488,7 @@ class Actor:
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        intent: Optional[MessageIntent] = None,
     ) -> ActorMessage:
         """Send a message to another actor."""
         recipient = self.registry.get(recipient_id)
@@ -357,12 +496,24 @@ class Actor:
             raise ValueError(f"Actor {recipient_id} not found")
         if not self.can_message(recipient_id):
             raise PermissionError(f"Actor {self.id} cannot message actor {recipient_id} (not related)")
+
+        meta = dict(metadata or {})
+        # Resolve intent: explicit > from metadata strings > default
+        if intent is None:
+            intent = MessageIntent.from_strings(
+                meta.get("channel", ""), meta.get("kind", ""),
+            )
+        # Back-populate metadata for backward compat (events, logging)
+        meta.setdefault("channel", intent.channel)
+        meta.setdefault("kind", intent.value)
+
         msg = ActorMessage(
             sender=self.id,
             recipient=recipient_id,
             content=content,
             reply_to=reply_to,
-            metadata=dict(metadata or {}),
+            intent=intent,
+            metadata=meta,
         )
         await recipient.send(msg)
         self._messages.append(msg)
@@ -374,17 +525,22 @@ class Actor:
                 "recipient": recipient_id,
                 "message_id": msg.id,
                 "content_preview": preview,
-                "channel": msg.metadata.get("channel", ""),
-                "kind": msg.metadata.get("kind", ""),
+                "intent": intent.value,
+                "channel": intent.channel,
             },
         )
-        channel = str(msg.metadata.get("channel", "")).strip()
-        if channel == "user_notify":
-            notify = content.strip()
+        if intent.channel == "user_notify":
             self.registry.emit_event(
                 "user_notify",
                 self,
-                {"recipient": recipient_id, "message_id": msg.id, "message": notify},
+                {
+                    "recipient": recipient_id,
+                    "message_id": msg.id,
+                    "message": content.strip(),
+                    "channel": intent.channel,
+                    "kind": intent.value,
+                    "metadata": dict(meta),
+                },
             )
         return msg
 
@@ -496,8 +652,18 @@ class Actor:
                 parts.append(f"- [... {omitted_visible} more active actors omitted to save context ...]")
             parts.append("</visible_actors>")
         
-        # Recent messages from other actors
-        all_inbox_messages = [m for m in self._messages if m.sender != self.id]
+        # Recent messages from other actors (exclude background actors —
+        # their notifications are routed through the event-driven speech gate)
+        _BACKGROUND_ACTOR_NAMES = {"dmn", "brainstem"}
+        def _is_background_sender(sender_id: str) -> bool:
+            sender = self.registry.get(sender_id)
+            return sender is not None and sender.config.name in _BACKGROUND_ACTOR_NAMES
+
+        all_inbox_messages = [
+            m for m in self._messages
+            if m.sender != self.id
+            and not (self.is_principal and _is_background_sender(m.sender))
+        ]
         inbox_messages = all_inbox_messages[-limits["inbox_messages"]:]
         omitted_inbox = max(0, len(all_inbox_messages) - len(inbox_messages))
         if inbox_messages:
@@ -564,6 +730,7 @@ class ActorRegistry:
         # Callbacks
         self._on_user_message: Optional[Callable] = None
         self._llm_factory: Optional[Callable] = None
+        self._spawn_hooks: List[Callable[[Actor], Any]] = []
 
     def emit_event(self, event_type: str, actor: Actor, payload: Optional[Dict[str, Any]] = None):
         """Emit structured actor event."""
@@ -591,6 +758,22 @@ class ActorRegistry:
             callback: async Callable(message: str) -> None
         """
         self._on_user_message = callback
+
+    def subscribe_spawn(self, callback: Callable[[Actor], Any]):
+        """Run callback whenever an actor is spawned."""
+        self._spawn_hooks.append(callback)
+
+    def _emit_spawn_hooks(self, actor: Actor):
+        for callback in list(self._spawn_hooks):
+            try:
+                result = callback(actor)
+                if asyncio.iscoroutine(result):
+                    try:
+                        asyncio.get_running_loop().create_task(result)
+                    except RuntimeError:
+                        pass
+            except Exception as e:
+                logger.warning("Actor spawn hook failed for %s: %s", actor.id, e)
 
     def find_by_name(self, name: str, group: str = "") -> Optional[Actor]:
         """Find a running actor by name (and optionally group).
@@ -638,6 +821,7 @@ class ActorRegistry:
             actor,
             {"name": actor.config.name, "spawned_by": actor.spawned_by, "is_principal": is_principal},
         )
+        self._emit_spawn_hooks(actor)
         logger.info(f"Registry: spawned {actor.config.name} (id={actor.id}, principal={is_principal})")
         return actor
 
@@ -697,7 +881,7 @@ class ActorRegistry:
         if not actor:
             return
 
-        result_text = (actor._result or "no result").strip()
+        result_text = (actor.result or "no result").strip()
         lowered = result_text.lower()
         is_failed = (
             lowered.startswith("error:")
@@ -706,7 +890,7 @@ class ActorRegistry:
             or "killed by parent" in lowered
             or lowered.startswith("system shutdown")
         )
-        status_kind = "failed" if is_failed else "done"
+        status_intent = MessageIntent.FAILED if is_failed else MessageIntent.DONE
 
         # Notify parent if exists and not terminated
         parent = self._actors.get(actor.spawned_by) if actor.spawned_by else None
@@ -716,13 +900,9 @@ class ActorRegistry:
             logger.warning(f"Actor {actor.config.name} terminated but parent {parent.config.name} already terminated")
         if parent and parent.state != ActorState.TERMINATED:
             # Skip if this actor already sent a terminal task_update to the parent
-            # (the subagent LLM may have sent one via send_message before calling terminate)
-            _TERMINAL_KINDS = {"done", "failed", "error", "max_turns", "fatal"}
             already_notified = any(
-                m.sender == actor_id
-                and (m.metadata or {}).get("channel") == "task_update"
-                and (m.metadata or {}).get("kind") in _TERMINAL_KINDS
-                for m in parent._messages
+                m.sender == actor_id and m.intent.is_terminal
+                for m in parent.messages
             )
             if already_notified:
                 logger.info(
@@ -734,21 +914,22 @@ class ActorRegistry:
                     sender=actor_id,
                     recipient=actor.spawned_by,
                     content=f"{actor.config.name}: {result_text}",
+                    intent=status_intent,
                     metadata={
-                        "channel": "task_update",
-                        "kind": status_kind,
+                        "channel": status_intent.channel,
+                        "kind": status_intent.value,
                         "source": "termination",
                     },
                 )
-                parent._messages.append(msg)
+                parent.append_message(msg)
                 try:
-                    parent._inbox.put_nowait(msg)
+                    parent.put_inbox_nowait(msg)
                 except Exception:
                     pass
         self.emit_event(
             "actor_terminated",
             actor,
-            {"name": actor.config.name, "result": actor._result or "", "turns": actor._turns},
+            {"name": actor.config.name, "result": actor.result or "", "turns": actor.turn_count},
         )
 
     @property

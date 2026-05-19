@@ -17,6 +17,7 @@ from lethe.memory.notes import NoteStore
 from lethe.memory.curator import run_curator
 from lethe.prompts import load_prompt_template
 from lethe.tools import get_core_tools, get_all_tools, function_to_schema, set_note_store, set_llm_client
+from lethe.tools.policy import EXTERNAL_INTERACTION_TOOL_NAMES, TRIVIAL_OUTCOME_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class Agent:
         # Initialize LLM client (provider auto-detected from env vars)
         # Only pass model if explicitly set in env/settings (otherwise use provider default)
         llm_config = LLMConfig(
-            provider=os.environ.get("LLM_PROVIDER", ""),  # Empty = auto-detect
+            provider=getattr(self.settings, "llm_provider", ""),  # Empty = auto-detect
             model=self.settings.llm_model,  # Empty = use provider default
             model_aux=self.settings.llm_model_aux,  # Empty = use provider default aux
             api_base=self.settings.llm_api_base,  # Custom API URL for local providers
@@ -82,13 +83,12 @@ class Agent:
         self.llm.context._assembler = self.assembler
         
         # Initialize hippocampus with LLM functions (analyzer + summarizer + salience use aux model)
-        hippocampus_enabled = os.environ.get("HIPPOCAMPUS_ENABLED", "true").lower() == "true"
         self.hippocampus = Hippocampus(
             self.memory, 
             summarizer=self._summarize_memories,
             analyzer=self._summarize_memories,  # Same aux model for analysis
             salience_classifier=self._classify_salience,
-            enabled=hippocampus_enabled,
+            enabled=getattr(self.settings, "hippocampus_enabled", True),
         )
         self.hippocampus.note_store = self.notes
 
@@ -120,6 +120,9 @@ class Agent:
 
     async def run_startup_curator(self):
         """Run memory curator in background after bot starts."""
+        if not getattr(self.settings, "curator_enabled", True):
+            logger.info("Memory curator disabled by settings")
+            return
         try:
             stats = await run_curator(self.notes, self.memory.archival, self.memory.messages, force=True)
             if not stats.get("skipped"):
@@ -589,13 +592,8 @@ class Agent:
         actor = self._principal_actor
         if not actor:
             return ""
-        import asyncio
         parts = []
-        while not actor._inbox.empty():
-            try:
-                msg = actor._inbox.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        for msg in actor.drain_inbox():
             sender = actor.registry.get(msg.sender)
             sender_name = sender.config.name if sender else msg.sender
             parts.append(f"[From {sender_name}]: {msg.content}")
@@ -643,12 +641,16 @@ class Agent:
             except Exception:
                 pass
 
-        # Store user message in history (clean, without inbox or recall prepended)
-        self.memory.messages.add("user", message)
+        # Store user message in history (clean, without inbox or recall prepended).
+        # Skip synthetic system messages — they pollute history and confuse
+        # the summarizer on session reload.
+        is_synthetic = message.startswith("[System:")
+        if not is_synthetic:
+            self.memory.messages.add("user", message)
 
-        # Recall relevant memories (unless disabled)
+        # Recall relevant memories (unless disabled; skip for synthetic turns)
         recall_context = None
-        if use_hippocampus:
+        if use_hippocampus and not is_synthetic:
             recent = self.memory.messages.get_recent(10)
             recall_context = await self.hippocampus.recall(message, recent)
         
@@ -665,7 +667,7 @@ class Agent:
             try:
                 actor = self._principal_actor
                 if actor:
-                    has_inbox = any(m.sender != actor.id for m in actor._messages[-8:])
+                    has_inbox = any(m.sender != actor.id for m in actor.recent_messages(8))
                     has_subagents = any(
                         a.state.value == "running"
                         for a in actor.registry.get_children(actor.id)
@@ -700,18 +702,16 @@ class Agent:
             # Never carry transient per-turn context into subsequent turns.
             self.llm.context.transient_system_context = ""
 
-        # Store assistant response in history
-        self.memory.messages.add("assistant", response)
+        # Store assistant response in history (skip responses to synthetic turns)
+        if not is_synthetic:
+            self.memory.messages.add("assistant", response)
 
-        # Auto-archive significant tool achievements so they survive
-        # session restarts and are discoverable by hippocampus.
-        self._auto_archive_tool_outcomes()
-
-        # Auto-extract skills/conventions into notes when applicable.
-        try:
-            await self._auto_extract_notes()
-        except Exception as e:
-            logger.debug(f"Auto-extract notes failed (non-fatal): {e}")
+        if not is_synthetic:
+            self._auto_archive_tool_outcomes()
+            try:
+                await self._auto_extract_notes()
+            except Exception as e:
+                logger.debug(f"Auto-extract notes failed (non-fatal): {e}")
 
         # Notify console of idle status
         self.llm._notify_status("idle")
@@ -733,16 +733,7 @@ class Agent:
         return await self.llm.heartbeat(message)
     
     # Tools that represent queries/reads — not worth archiving as "achievements"
-    _TRIVIAL_TOOLS = {
-        "conversation_search", "archival_search", "archival_insert",
-        "memory_read", "memory_update", "memory_append",
-        "grep_search", "list_directory", "read_file",
-        "telegram_send_message", "telegram_send_file", "telegram_react",
-        "send_message", "user_notify", "terminate",
-        "ping_actor", "wait_for_response", "discover_actors",
-        "spawn_actor", "kill_actor",
-        "todo_list", "todo_add", "todo_done", "todo_remove",
-    }
+    _TRIVIAL_TOOLS = set(TRIVIAL_OUTCOME_TOOL_NAMES)
 
     def _auto_archive_tool_outcomes(self):
         """Archive significant tool achievements to archival memory.
@@ -780,7 +771,7 @@ class Agent:
             logger.warning(f"Failed to auto-archive tool outcomes: {e}")
 
     # Tools that indicate external system interaction (skill candidates)
-    _EXTERNAL_TOOLS = {"bash", "web_search", "fetch_webpage", "browser_open", "browser_click", "browser_fill"}
+    _EXTERNAL_TOOLS = set(EXTERNAL_INTERACTION_TOOL_NAMES)
 
     async def _auto_extract_notes(self):
         """Check if the completed turn produced a skill or convention worth noting.
@@ -866,7 +857,7 @@ class Agent:
             "archival_memories": self.memory.archival.count(),
             "message_history": self.memory.messages.count(),
             "total_messages": self.memory.messages.count(),  # Alias for console
-            "tools": len(self.llm._tools),
+            "tools": len(self.llm.tools),
             "llm": self.llm.get_context_stats(),
         }
     

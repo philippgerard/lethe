@@ -152,6 +152,9 @@ class Brainstem:
                     "If useful, I can review what was in-flight before restart."
                 ),
                 kind="brainstem_restart",
+                signal_origin="startup",
+                signal_category="status",
+                signal_urgency="low",
             )
         await self._run_cycle(trigger="startup", heartbeat_message="")
         self._status["state"] = "online"
@@ -266,7 +269,12 @@ class Brainstem:
             )
             for key, message in notify_items:
                 if self._should_notify(key):
-                    await self._send_user_notify(message, kind="brainstem_alert")
+                    await self._send_user_notify(
+                        message,
+                        kind="brainstem_alert",
+                        signal_category="warning",
+                        signal_urgency="high",
+                    )
 
             self._history.append(
                 {
@@ -379,14 +387,29 @@ class Brainstem:
         except Exception as e:
             logger.debug("Brainstem task update failed: %s", e)
 
-    async def _send_user_notify(self, text: str, kind: str = "brainstem_alert"):
+    async def _send_user_notify(
+        self,
+        text: str,
+        kind: str = "brainstem_alert",
+        *,
+        signal_origin: str = "",
+        signal_category: str = "",
+        signal_urgency: str = "",
+    ):
         if not self._actor:
             return
         try:
+            metadata = {"channel": "user_notify", "kind": kind}
+            if signal_origin:
+                metadata["signal_origin"] = signal_origin
+            if signal_category:
+                metadata["signal_category"] = signal_category
+            if signal_urgency:
+                metadata["signal_urgency"] = signal_urgency
             await self._actor.send_to(
                 self.cortex_id,
                 text,
-                metadata={"channel": "user_notify", "kind": kind},
+                metadata=metadata,
             )
         except Exception as e:
             logger.debug("Brainstem user notify failed: %s", e)
@@ -491,6 +514,8 @@ class Brainstem:
                     "If your runtime did not auto-restart, please restart Lethe to apply it."
                 ),
                 kind="brainstem_update_ready",
+                signal_category="update",
+                signal_urgency="normal",
             )
 
     async def _run_update_script(self, script_path: Path) -> tuple[bool, str]:

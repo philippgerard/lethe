@@ -278,10 +278,10 @@ async def telegram_react_async(emoji: str = "👍", message_id: int = 0) -> str:
             "message_id": target_message_id,
         })
     
-    await send_message_reaction(bot, chat_id, target_message_id, emoji)
+    reaction_sent = await send_message_reaction(bot, chat_id, target_message_id, emoji)
     
     return json.dumps({
-        "success": True,
+        "success": reaction_sent,
         "emoji": emoji,
         "message_id": target_message_id,
     })

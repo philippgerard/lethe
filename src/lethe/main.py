@@ -5,7 +5,7 @@ import logging
 import os
 import signal
 import sys
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 # Load .env file before anything else
 from dotenv import load_dotenv
@@ -20,6 +20,8 @@ from lethe.conversation import ConversationManager
 from lethe.telegram import TelegramBot
 from lethe.heartbeat import Heartbeat
 from lethe import console as lethe_console
+from lethe.notification_reviewer import review_user_notification
+from lethe.notification_signals import UserNotificationSignal
 from lethe.reaction_transport import send_message_reaction
 from lethe.telegram_turn_guard import (
     clear_telegram_turn_guard,
@@ -27,6 +29,8 @@ from lethe.telegram_turn_guard import (
     is_emoji_only_reply,
     start_telegram_turn_guard,
 )
+from lethe.runtime import ProactiveRateLimiter, format_active_reminders, run_background_heartbeat
+from lethe.utils import normalize_user_visible_message
 
 console = Console()
 
@@ -61,30 +65,108 @@ async def _send_guarded_telegram_final_response(
     if guard and is_emoji_only_reply(response) and pending_reactions:
         if guard.choose_visible_channel() == "reaction":
             pending = pending_reactions[0]
-            await send_message_reaction(
+            reaction_sent = await send_message_reaction(
                 pending.bot,
                 pending.chat_id,
                 pending.message_id,
                 pending.emoji,
             )
-            mark_user_visible_activity("assistant reaction response")
+            if reaction_sent:
+                mark_user_visible_activity("assistant reaction response")
+            else:
+                await telegram_bot.send_message(chat_id, response)
+                mark_user_visible_activity("assistant final response")
         else:
             await telegram_bot.send_message(chat_id, response)
             mark_user_visible_activity("assistant final response")
         return
 
     for pending in pending_reactions:
-        await send_message_reaction(
+        reaction_sent = await send_message_reaction(
             pending.bot,
             pending.chat_id,
             pending.message_id,
             pending.emoji,
         )
-        mark_user_visible_activity("assistant reaction response")
+        if reaction_sent:
+            mark_user_visible_activity("assistant reaction response")
 
     if response and response.strip():
         await telegram_bot.send_message(chat_id, response)
         mark_user_visible_activity("assistant final response")
+
+
+def _truncate_context_text(value: str, limit: int = 240) -> str:
+    text = " ".join((value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "..."
+
+
+def _coerce_message_content(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if text:
+                    parts.append(str(text))
+        return " ".join(parts)
+    return str(content or "")
+
+
+def _render_notification_context(agent: Agent) -> str:
+    parts = []
+    summary = (getattr(agent.llm.context, "summary", "") or "").strip()
+    if summary:
+        parts.append(f"Conversation summary:\n{_truncate_context_text(summary, 900)}")
+
+    recent_messages = list(getattr(agent.llm.context, "messages", []) or [])[-6:]
+    rendered_recent = []
+    for message in recent_messages:
+        role = getattr(message, "role", "unknown")
+        content = _coerce_message_content(getattr(message, "content", ""))
+        content = _truncate_context_text(content, 240)
+        if content:
+            rendered_recent.append(f"- {role}: {content}")
+    if rendered_recent:
+        parts.append("Recent exchanges:\n" + "\n".join(rendered_recent))
+
+    return "\n\n".join(parts) if parts else "No recent user context."
+
+
+def _make_notification_review_handler(
+    agent: Agent,
+    deliver_fn: Callable[[str], Awaitable[None]],
+    logger: logging.Logger,
+) -> Callable[[UserNotificationSignal], Awaitable[None]]:
+    async def handle(signal: UserNotificationSignal) -> None:
+        async def complete(prompt: str) -> str:
+            return await agent.llm.complete(
+                prompt,
+                use_aux=True,
+                usage_tag="notification_review",
+            )
+
+        speech_act = await review_user_notification(
+            signal,
+            recent_context=_render_notification_context(agent),
+            complete_fn=complete,
+        )
+        if not speech_act.send:
+            logger.info(
+                "Notification reviewer suppressed %s %s: %s",
+                signal.source.value,
+                signal.category.value,
+                signal.content[:120],
+            )
+            return
+
+        await deliver_fn(speech_act.text)
+
+    return handle
 
 
 async def run():
@@ -112,7 +194,7 @@ async def run():
     
     # Initialize actor system (subagent support)
     actor_system = None
-    if os.environ.get("ACTORS_ENABLED", "true").lower() == "true":
+    if settings.actors_enabled:
         from lethe.actor.integration import ActorSystem
         actor_system = ActorSystem(agent, settings=settings)
         await actor_system.setup()
@@ -122,9 +204,9 @@ async def run():
     console.print(f"[green]Agent ready[/green] - {stats['memory_blocks']} blocks, {stats['archival_memories']} memories")
 
     # Initialize console (mind state visualization) if enabled
-    console_enabled = os.environ.get("LETHE_CONSOLE", "false").lower() == "true"
-    console_port = int(os.environ.get("LETHE_CONSOLE_PORT", 8777))
-    console_host = os.environ.get("LETHE_CONSOLE_HOST", "127.0.0.1")
+    console_enabled = settings.lethe_console
+    console_port = settings.lethe_console_port
+    console_host = settings.lethe_console_host
 
     if console_enabled:
         from lethe.console.ui import run_console
@@ -259,65 +341,45 @@ async def run():
     # heartbeat_callback will be set below after Heartbeat is created
 
     # Initialize heartbeat
-    heartbeat_interval = int(os.environ.get("HEARTBEAT_INTERVAL", 60 * 60))  # Default 1 hour
-    heartbeat_enabled = os.environ.get("HEARTBEAT_ENABLED", "true").lower() == "true"
+    heartbeat_interval = settings.heartbeat_interval
+    heartbeat_enabled = settings.heartbeat_enabled
     
     async def heartbeat_process(message: str) -> str:
         """Process heartbeat — triggers background rounds if actor system is active."""
-        if actor_system:
-            await actor_system.brainstem_heartbeat(message)
-            result = await actor_system.background_round()
-            return result or "ok"
-        return await agent.heartbeat(message)
+        return await run_background_heartbeat(agent, actor_system, message)
     
     async def heartbeat_full_context(message: str) -> str:
         """Full context heartbeat — triggers supervision + background rounds."""
-        if actor_system:
-            await actor_system.brainstem_heartbeat(message)
-            result = await actor_system.background_round()
-            return result or "ok"
-        return await agent.chat(message, use_hippocampus=False)
+        return await run_background_heartbeat(agent, actor_system, message, full_context=True)
     
     # --- Proactive message rate limiter (hard enforcement) ---
-    _proactive_sends: list[float] = []  # timestamps of proactive messages sent
-    _proactive_max = settings.proactive_max_per_day
-    _proactive_cooldown = settings.proactive_cooldown_minutes * 60  # seconds
+    proactive_limiter = ProactiveRateLimiter.from_settings(settings)
 
-    def _proactive_allowed() -> bool:
-        """Check if a proactive message is allowed right now."""
-        import time
-        now = time.time()
-        # Prune old entries (older than 24h)
-        while _proactive_sends and (now - _proactive_sends[0]) > 86400:
-            _proactive_sends.pop(0)
-        # Check daily budget
-        if _proactive_max > 0 and len(_proactive_sends) >= _proactive_max:
-            logger.info("Proactive message blocked: daily limit (%d/%d)", len(_proactive_sends), _proactive_max)
+    async def send_proactive_message(response: str, activity_reason: str) -> bool:
+        target_chat_id = get_target_chat_id()
+        if not target_chat_id:
+            logger.info("Proactive message suppressed: no active chat target")
             return False
-        # Check cooldown
-        if _proactive_sends and (now - _proactive_sends[-1]) < _proactive_cooldown:
-            remaining = int(_proactive_cooldown - (now - _proactive_sends[-1]))
-            logger.info("Proactive message blocked: cooldown (%d seconds remaining)", remaining)
+        if not proactive_limiter.allowed():
+            logger.info("Proactive message suppressed by rate limiter")
             return False
+        await telegram_bot.send_message(target_chat_id, response)
+        proactive_limiter.record()
+        mark_user_visible_activity(activity_reason)
         return True
-
-    def _proactive_record():
-        """Record that a proactive message was sent."""
-        import time
-        _proactive_sends.append(time.time())
 
     async def heartbeat_send(response: str):
         """Send heartbeat response to user (rate-limited)."""
+        await send_proactive_message(response, "proactive outbound message")
+
+    async def deliver_background_message(response: str) -> None:
         target_chat_id = get_target_chat_id()
         if not target_chat_id:
-            logger.info("Heartbeat message suppressed: no active chat target")
-            return
-        if not _proactive_allowed():
-            logger.info("Heartbeat message suppressed by rate limiter")
+            logger.info("Background executive message suppressed: no active chat target")
             return
         await telegram_bot.send_message(target_chat_id, response)
-        _proactive_record()
-        mark_user_visible_activity("proactive outbound message")
+        proactive_limiter.record()
+        mark_user_visible_activity("background executive message")
     
     async def heartbeat_summarize(prompt: str) -> str:
         """Summarize/evaluate heartbeat response before sending (uses aux model)."""
@@ -329,21 +391,7 @@ async def run():
 
     async def get_active_reminders() -> str:
         """Get active reminders as formatted string."""
-        from lethe.todos import TodoManager
-        todo_manager = TodoManager(settings.db_path)
-        todos = await todo_manager.list(status="pending")
-        
-        if not todos:
-            return ""
-        
-        lines = []
-        for todo in todos[:10]:  # Limit to 10
-            priority = todo.get("priority", "normal")
-            due = todo.get("due_at", "")
-            due_str = f" (due: {due})" if due else ""
-            lines.append(f"- [{priority}] {todo['title']}{due_str}")
-        
-        return "\n".join(lines)
+        return await format_active_reminders(settings)
 
     heartbeat = Heartbeat(
         process_callback=heartbeat_process,
@@ -379,8 +427,9 @@ async def run():
         try:
             await telegram_bot.start_typing(target_chat_id)
             response = await agent.chat(synthetic_message)
-            if response and response.strip():
-                await telegram_bot.send_message(target_chat_id, response)
+            outbound = normalize_user_visible_message(response)
+            if outbound:
+                await telegram_bot.send_message(target_chat_id, outbound)
                 mark_user_visible_activity("cortex subagent followup")
         except Exception as e:
             logger.exception("run_cortex_turn failed: %s", e)
@@ -390,10 +439,16 @@ async def run():
 
     # Wire DMN callbacks (send_to_user, get_reminders)
     if actor_system:
+        review_user_notification_handler = _make_notification_review_handler(
+            agent,
+            deliver_fn=deliver_background_message,
+            logger=logger,
+        )
         actor_system.set_callbacks(
             send_to_user=heartbeat_send,
             get_reminders=get_active_reminders,
             run_cortex_turn=run_cortex_turn,
+            review_user_notification=review_user_notification_handler,
         )
 
     # Console monitoring pump for dynamic runtime subsystems.
@@ -522,7 +577,7 @@ async def run_api(port: int = 8080):
     console.print(f"Memory: {settings.memory_dir}")
     console.print()
 
-    if not os.environ.get("LETHE_API_TOKEN", "").strip():
+    if not settings.lethe_api_token.strip():
         console.print("[red]LETHE_API_TOKEN must be set in API mode.[/red]")
         sys.exit(1)
 
@@ -534,7 +589,7 @@ async def run_api(port: int = 8080):
 
     # Initialize actor system
     actor_system = None
-    if os.environ.get("ACTORS_ENABLED", "true").lower() == "true":
+    if settings.actors_enabled:
         from lethe.actor.integration import ActorSystem
         actor_system = ActorSystem(agent, settings=settings)
         await actor_system.setup()
@@ -546,33 +601,31 @@ async def run_api(port: int = 8080):
     # Initialize conversation manager
     conversation_manager = ConversationManager(debounce_seconds=settings.debounce_seconds)
 
-    # Set up the API module globals
+    # Set up the API route runtime
     from lethe import api as api_module
-    api_module._agent = agent
-    api_module._conversation_manager = conversation_manager
-    api_module._actor_system = actor_system
-    api_module._settings = settings
+    api_module.configure_runtime(
+        agent=agent,
+        conversation_manager=conversation_manager,
+        actor_system=actor_system,
+        settings=settings,
+    )
 
     # Initialize heartbeat with proactive messages going to /events SSE
-    heartbeat_interval = int(os.environ.get("HEARTBEAT_INTERVAL", 60 * 60))  # Default 1 hour
-    heartbeat_enabled = os.environ.get("HEARTBEAT_ENABLED", "true").lower() == "true"
+    heartbeat_interval = settings.heartbeat_interval
+    heartbeat_enabled = settings.heartbeat_enabled
 
     async def heartbeat_process(message: str) -> str:
-        if actor_system:
-            await actor_system.brainstem_heartbeat(message)
-            result = await actor_system.background_round()
-            return result or "ok"
-        return await agent.heartbeat(message)
+        return await run_background_heartbeat(agent, actor_system, message)
 
     async def heartbeat_full_context(message: str) -> str:
-        if actor_system:
-            await actor_system.brainstem_heartbeat(message)
-            result = await actor_system.background_round()
-            return result or "ok"
-        return await agent.chat(message, use_hippocampus=False)
+        return await run_background_heartbeat(agent, actor_system, message, full_context=True)
+
+    async def send_proactive_message(response: str) -> bool:
+        await api_module.send_proactive(response)
+        return True
 
     async def heartbeat_send(response: str):
-        await api_module.send_proactive(response)
+        await send_proactive_message(response)
 
     async def heartbeat_summarize(prompt: str) -> str:
         return await agent.llm.complete(prompt, use_aux=True)
@@ -581,18 +634,7 @@ async def run_api(port: int = 8080):
         agent.llm.note_idle_interval(minutes_passed)
 
     async def get_active_reminders() -> str:
-        from lethe.todos import TodoManager
-        todo_manager = TodoManager(settings.db_path)
-        todos = await todo_manager.list(status="pending")
-        if not todos:
-            return ""
-        lines = []
-        for todo in todos[:10]:
-            priority = todo.get("priority", "normal")
-            due = todo.get("due_at", "")
-            due_str = f" (due: {due})" if due else ""
-            lines.append(f"- [{priority}] {todo['title']}{due_str}")
-        return "\n".join(lines)
+        return await format_active_reminders(settings)
 
     heartbeat = Heartbeat(
         process_callback=heartbeat_process,
@@ -604,28 +646,35 @@ async def run_api(port: int = 8080):
         interval=heartbeat_interval,
         enabled=heartbeat_enabled,
     )
-    api_module._heartbeat = heartbeat
+    api_module.configure_runtime(heartbeat=heartbeat)
 
     # Wire actor system callbacks
     if actor_system:
         async def run_cortex_turn(synthetic_message: str):
             from lethe.tools import set_telegram_context, clear_telegram_context
             from lethe.proxy_bot import ProxyBot
-            proxy = ProxyBot(api_module._proactive_queue)
+            proxy = ProxyBot(api_module.proactive_queue())
             set_telegram_context(proxy, 0)
             try:
                 response = await agent.chat(synthetic_message)
-                if response and response.strip():
-                    await api_module.send_proactive(response)
+                outbound = normalize_user_visible_message(response)
+                if outbound:
+                    await api_module.send_proactive(outbound)
             except Exception as e:
                 logger.exception("run_cortex_turn failed: %s", e)
             finally:
                 clear_telegram_context()
 
+        review_user_notification_handler = _make_notification_review_handler(
+            agent,
+            deliver_fn=send_proactive_message,
+            logger=logger,
+        )
         actor_system.set_callbacks(
             send_to_user=heartbeat_send,
             get_reminders=get_active_reminders,
             run_cortex_turn=run_cortex_turn,
+            review_user_notification=review_user_notification_handler,
         )
 
     # Set up shutdown handling
@@ -643,7 +692,7 @@ async def run_api(port: int = 8080):
     import uvicorn
     config = uvicorn.Config(
         api_module.app,
-        host=os.environ.get("LETHE_API_HOST", "127.0.0.1"),
+        host=settings.lethe_api_host,
         port=port,
         log_level="info",
     )
@@ -715,7 +764,7 @@ def main():
     setup_logging(verbose=args.verbose)
 
     # Check for API mode (CLI flag or env var)
-    api_mode = args.api or os.environ.get("LETHE_MODE", "").lower() == "api"
+    api_mode = args.api or get_settings().lethe_mode.lower() == "api"
 
     try:
         if api_mode:

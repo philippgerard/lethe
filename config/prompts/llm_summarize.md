@@ -1,15 +1,33 @@
-Summarize this conversation concisely from the AI's perspective (first person).
+Create a structured context checkpoint from the conversation below. Another LLM will use this to continue the work without seeing the original messages.
 
-You MUST preserve:
-- Active tasks: what's in progress, what's done, what's remaining
-- The latest user request or instruction (quote it if short)
-- Commitments made: anything promised to follow up on
-- Key decisions and outcomes
-- Important facts learned about the user
+Use this EXACT format:
 
-Do NOT lose:
-- Partial progress on multi-step work (e.g. "edited 3 of 5 files")
-- Pending follow-ups or deferred items
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
 
-Keep it under 100 words. Be terse - bullet points are fine.
-Output ONLY the summary, nothing else.
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes — include file paths]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Key Facts
+- [Specific facts, names, numbers, URLs, user-stated preferences that must survive]
+- [Or "(none)" if none worth preserving]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+Keep each section concise. Preserve exact file paths, function names, error messages, and user-stated facts verbatim.
+Output ONLY the structured summary, nothing else.

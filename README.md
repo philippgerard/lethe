@@ -4,9 +4,125 @@
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11+-blue?style=flat-square&logo=python&logoColor=white)](https://python.org)
 
-Autonomous AI assistant with persistent memory, background cognition, and a multi-agent architecture.
+Brain-centric cognitive architecture for a long-running AI assistant.
 
-Lethe runs 24/7 in an isolated container, communicates via Telegram, remembers your preferences and projects across sessions, and thinks in the background even when you're not talking to it. It uses tools, browses files, searches the web, and delegates focused work to subagents.
+Lethe is built around a simple premise: a useful personal assistant should not be a single chat loop with tools bolted on. It should have memory, attention, background thought, supervision, and delegation as separate runtime systems with clear responsibilities.
+
+Lethe runs 24/7, communicates through Telegram or an HTTP/SSE API, remembers your preferences and projects across sessions, thinks in the background, and delegates focused work to subagents. The system is brain-inspired, but pragmatic: each cognitive module is just software with an explicit interface, tests, and logs.
+
+## Why This Architecture
+
+Most assistants are reactive. They wait for a message, stuff recent chat into a prompt, call tools, and forget the shape of the work once the turn ends.
+
+Lethe is designed as a persistent cognitive system:
+
+- **Executive control:** the cortex handles user-facing decisions and delegates long work.
+- **Associative memory:** the hippocampus recalls notes, prior conversations, and archival memories when they are relevant.
+- **Background cognition:** the DMN runs between user turns, reflecting on goals and surfacing useful signals.
+- **Autonomic supervision:** the brainstem monitors health, resources, releases, and runtime state.
+- **Attention gating:** background notifications pass through scoring, gating, and review before reaching the user.
+- **Focused delegation:** subagents work on bounded tasks with their own tools, state, progress updates, and terminal results.
+
+The result is an assistant that can keep continuity over days, do long-running work without blocking the main conversation, and avoid turning every internal thought into a user notification.
+
+## Architecture
+
+```
+                 Telegram / HTTP API
+                        |
+                        v
+              Cortex: conscious executive
+        user turns, tool use, delegation, replies
+                        |
+       +----------------+----------------+
+       |                |                |
+       v                v                v
+ Hippocampus       Actor System     Notification Pipeline
+ associative       subagents,       scoring, gating,
+ recall +          registry,        LLM review,
+ salience bias     event bus        transport send
+       |                |
+       v                +----------------+
+ Memory Stack                            |
+ blocks, notes,                         v
+ archival memory,             Brainstem + DMN
+ message history              supervision + background thought
+                        |
+                        v
+                 Tool Policy + Tools
+            CLI, files, browser, web, Telegram
+```
+
+This is not a metaphor pasted on top of a monolith. The modules map to code boundaries:
+
+| Cognitive System | Code | Responsibility |
+|------------------|------|----------------|
+| **Cortex** | `agent/`, principal actor | User-facing executive control, local tools, delegation, final replies. |
+| **Hippocampus** | `memory/hippocampus.py` | Associative recall over notes, archive, and conversation history. |
+| **Salience tracker** | `memory/salience.py` | Emotional salience tagging and recall bias from active patterns. |
+| **Brainstem** | `actor/brainstem.py` | Startup/runtime supervision, resource checks, update checks, health signals. |
+| **DMN** | `actor/dmn.py` | Background cognition, goal scanning, reflection, and useful signal generation. |
+| **Notification gate** | `notification_*.py` | Turns background signals into reviewed, user-safe notifications. |
+| **Actor registry** | `actor/__init__.py` | Actor lifecycle, event bus, spawn hooks, message routing. |
+| **Tool policy** | `tools/policy.py` | Centralized tool surfaces for cortex, subagents, memory, and Telegram. |
+
+### Cognitive Loop
+
+1. A user message enters through Telegram or the API.
+2. Hippocampus decides whether recall is useful and injects relevant memory.
+3. Cortex acts directly for quick work or delegates bounded tasks to subagents.
+4. Subagents work independently, report progress, and return terminal results to cortex.
+5. DMN and brainstem run in the background and emit notification candidates.
+6. Notification scoring/gating/review decides what, if anything, should reach the user.
+7. Curator and salience systems update long-term memory and recall bias over time.
+
+### Transport Runtime
+
+Lethe has two transports with the same core runtime:
+
+- **Telegram mode** polls Telegram and sends direct bot messages.
+- **API mode** exposes `/chat`, `/events`, `/model`, `/cancel`, and `/file`; chat and proactive output are streamed over SSE.
+
+Shared runtime helpers in `src/lethe/runtime.py` own heartbeat routing, active reminder formatting, and proactive message rate limiting. API route handlers receive their dependencies through an `ApiRuntime` container instead of module-level service globals.
+
+### Actors
+
+| Component | Role |
+|-----------|------|
+| **Cortex** | Principal actor. The only actor that speaks to the user directly. |
+| **Subagents** | Spawned on demand for focused work. They report progress every two minutes and return a structured terminal result. |
+| **Actor registry** | Owns actors, lifecycle events, and spawn hooks. Ordinary child actors are auto-started through explicit registry hooks. |
+| **Tool policy** | Centralized tool-name sets define cortex tools, subagent defaults, private/free tools, recall skip lists, and Telegram exclusions. |
+
+Actors use public lifecycle and mailbox APIs (`messages`, `drain_inbox()`, `set_task_handle()`, `recent_messages()`) rather than reaching into each other's private state.
+
+### Memory and recall
+
+| Component | Role |
+|-----------|------|
+| **Memory blocks** | Always-in-context markdown state: identity, human, project. |
+| **Notes** | Tagged durable procedures, conventions, and facts. |
+| **Archival memory** | Long-term semantic storage with hybrid vector/full-text search. |
+| **Message history** | Full local conversation history in LanceDB. |
+| **Hippocampus** | LLM-guided associative recall over notes, archive, and conversation history. |
+| **Salience tracker** | Emotional salience tagging, rolling tag compaction, active-pattern tracking, and emotional recall bias. |
+
+Hippocampus no longer owns salience tagging directly; it calls into `SalienceTracker` and uses active salience patterns only as a recall-bias signal.
+
+### Notification pipeline
+
+Background actors cannot talk to the user directly. They emit typed notification candidates that pass through a deterministic and LLM-reviewed path:
+
+```
+actor user_notify event
+    -> NotificationRouter
+    -> NotificationScoring
+    -> NotificationGate
+    -> NotificationReviewer
+    -> transport send callback
+```
+
+The notification modules are named for their runtime job (`notification_router.py`, `notification_gate.py`, `notification_scoring.py`, `notification_reviewer.py`) and own the implementation directly.
 
 ## Install
 
@@ -37,39 +153,6 @@ curl -fsSL https://lethe.gg/update | bash
 curl -fsSL https://lethe.gg/uninstall | bash
 ```
 
-## Architecture
-
-```
-Telegram
-    |
-    v
-  Cortex  (principal actor, user-facing)
-    |
-  Brainstem  (supervision, health checks)
-    |
-    +--- DMN  (background cognition, hourly)
-    +--- Hippocampus  (recall + salience tagging)
-    +--- Subagents  (spawned on demand)
-    +--- Tools  (CLI, files, web, browser)
-    |
-  Actor Registry + Event Bus
-    |
-  Memory
-    +-- workspace/memory/*.md  (identity, human, project)
-    +-- notes/  (skills, conventions, persistent knowledge)
-    +-- LanceDB  (archival memory + message history)
-```
-
-### Actors
-
-| Actor | Role |
-|-------|------|
-| **Cortex** | Principal actor. Only actor that talks to the user. Handles quick tasks directly, delegates complex work to subagents. |
-| **Brainstem** | Boot supervisor. Checks resources, releases, reports findings to cortex. |
-| **DMN** | Background cognition on an hourly cadence. Scans goals, updates state, writes reflections, escalates insights. |
-| **Hippocampus** | Autoassociative recall and salience tagging. Searches notes, archival memory, and conversation history on each message. |
-| **Subagents** | Spawned on demand for focused tasks. Report to parent actors. No direct user channel. |
-
 ### Prompt architecture
 
 System prompt content is split by update lifecycle:
@@ -80,6 +163,7 @@ System prompt content is split by update lifecycle:
 | System instructions | `config/prompts/agent_instructions.md` | Current after `git pull`. |
 | Tools documentation | `config/prompts/agent_tools.md` | Current after `git pull`. |
 | Actor rules | `config/prompts/actor_*.md` | Current after `git pull`. |
+| Notification review | `config/prompts/notification_review.md` | Current after `git pull`. |
 
 ## Security
 
@@ -135,6 +219,10 @@ Always in context. Stored in `workspace/memory/`:
 ### Archival memory
 
 Long-term semantic storage with hybrid search (vector + full-text). The curator runs on startup to extract valuable entries into notes.
+
+### Salience tags
+
+Emotional salience tags are maintained separately from recall in `workspace/emotional_tags.md`. They are compacted to a rolling window and used to bias future memory search when recent high-arousal patterns are active.
 
 ### Message history
 
@@ -196,13 +284,19 @@ Key flags: `--split-mode tensor` for true tensor parallelism across GPUs, `--jin
 | `LLM_CONTEXT_LIMIT` | Context window size | `100000` |
 | `EXA_API_KEY` | Exa web search | optional |
 | `ACTORS_ENABLED` | Enable actor model | `true` |
-| `HIPPOCAMPUS_ENABLED` | Enable recall + salience | `true` |
+| `HIPPOCAMPUS_ENABLED` | Enable associative recall | `true` |
+| `CURATOR_ENABLED` | Enable startup memory curator | `true` |
 | `HEARTBEAT_INTERVAL` | Heartbeat interval (seconds) | `3600` |
 | `HEARTBEAT_ENABLED` | Enable heartbeat loop | `true` |
 | `PROACTIVE_MAX_PER_DAY` | Proactive message limit | `4` |
 | `PROACTIVE_COOLDOWN_MINUTES` | Min spacing between proactive msgs | `60` |
 | `LETHE_HOME` | Runtime root directory | `~/.lethe` |
+| `LETHE_MODE` | Runtime mode: `api` or Telegram polling | Telegram polling |
+| `LETHE_API_TOKEN` | Bearer token required in API mode | required for API |
 | `LETHE_API_HOST` | API server bind address | `127.0.0.1` |
+| `LETHE_CONSOLE` | Enable local runtime console | `false` |
+| `LETHE_CONSOLE_HOST` | Console bind address | `127.0.0.1` |
+| `LETHE_CONSOLE_PORT` | Console port | `8777` |
 
 ### Persona
 
@@ -243,17 +337,21 @@ uv run pytest tests/test_notes.py -v
 src/lethe/
   actor/       -- actor model (cortex, dmn, brainstem, subagents)
   agent/       -- runtime orchestration
-  memory/      -- blocks, LanceDB, notes, hippocampus, curator, LLM client
+  memory/      -- blocks, LanceDB, notes, hippocampus, salience, curator, LLM client
+  context/     -- provider-specific prompt/context assembly
   tools/       -- CLI, files, web, browser, Telegram
+  tools/policy.py -- centralized tool policy sets
   telegram/    -- Telegram bot interface
   conversation/ -- conversation management
+  notification_*.py -- background user-notification routing, gating, review
+  runtime.py   -- shared runtime helpers
+  api.py       -- HTTP API routes and API runtime container
+  main.py      -- service entry point and transport wiring
   paths.py     -- centralized path derivation from LETHE_HOME
-  api.py       -- HTTP API server
-  main.py      -- entry point
 
 config/
   blocks/      -- seed memory blocks
-  prompts/     -- system, actor, and heartbeat prompts
+  prompts/     -- system, actor, heartbeat, and notification prompts
   workspace/   -- workspace seed files (copied once on first run)
 ```
 

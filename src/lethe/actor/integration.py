@@ -11,10 +11,9 @@ and notifies the cortex when something needs user attention.
 
 import asyncio
 import logging
-import os
 from typing import Awaitable, Callable, Dict, List, Optional
 
-from lethe.actor import Actor, ActorConfig, ActorMessage, ActorRegistry, ActorState, ModelTier
+from lethe.actor import Actor, ActorConfig, ActorMessage, ActorRegistry, ActorState, MessageIntent, ModelTier
 from lethe.actor.tools import create_actor_tools
 from lethe.actor.runner import ActorRunner
 from lethe.actor.dmn import DefaultModeNetwork
@@ -23,30 +22,17 @@ from lethe.actor.brainstem import Brainstem
 from lethe.memory.curator import run_curator
 from lethe.config import Settings, get_settings
 from lethe.memory.llm import AsyncLLMClient, LLMConfig
+from lethe.notification_gate import GateAction, NotificationGate
+from lethe.notification_router import NotificationRouter
+from lethe.notification_scoring import NotificationScoring
+from lethe.notification_signals import UserNotificationSignal
+from lethe.tools.policy import CORTEX_TOOL_NAMES, SUBAGENT_DEFAULT_TOOL_NAMES, SUBAGENT_EXCLUDED_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
-# Tools the cortex keeps (hybrid mode: actor + quick CLI/file + memory + telegram)
-CORTEX_TOOL_NAMES = {
-    # Core tools (15 — under Gemma 4's recommended limit)
-    'bash', 'read_file', 'write_file', 'edit_file',
-    'note_search', 'note_create', 'note_list',
-    'telegram_react', 'telegram_send_file',
-    'conversation_search',
-    'spawn_actor', 'send_message', 'discover_actors', 'kill_actor',
-    'request_tool',
-    # telegram_send_message moved to extended — model was using it for normal
-    # responses instead of returning text, causing infinite send loops
-}
-
-# Tools that request_tool() can activate for cortex (kept in CORTEX_TOOL_NAMES
-# so they survive the stripping phase, but only registered on demand)
-
-# Tools that ALL subagents always get (CLI + file are fundamental)
-SUBAGENT_DEFAULT_TOOLS = {
-    'bash', 'read_file', 'write_file', 'edit_file',
-    'list_directory', 'grep_search', 'view_image',
-}
+# Backward-compatible exported names. The canonical policy lives in
+# lethe.tools.policy.
+SUBAGENT_DEFAULT_TOOLS = set(SUBAGENT_DEFAULT_TOOL_NAMES)
 
 
 class ActorSystem:
@@ -63,7 +49,6 @@ class ActorSystem:
         self.principal: Optional[Actor] = None
         self.brainstem: Optional[Brainstem] = None
         self.dmn: Optional[DefaultModeNetwork] = None
-        self._curator_enabled = True
         self._background_tasks: Dict[str, asyncio.Task] = {}
         self._principal_monitor_task: Optional[asyncio.Task] = None
         self._processed_principal_message_ids: set[str] = set()
@@ -76,6 +61,11 @@ class ActorSystem:
         self._send_to_user: Optional[Callable] = None
         self._get_reminders: Optional[Callable] = None
         self._run_cortex_turn: Optional[Callable[[str], Awaitable[None]]] = None
+        self._review_user_notification: Optional[Callable[[UserNotificationSignal], Awaitable[None]]] = None
+        self._pending_user_notifications: List[UserNotificationSignal] = []
+        self._notification_router: Optional[NotificationRouter] = None
+        self._notification_scoring = NotificationScoring()
+        self._notification_gate = NotificationGate()
 
     def _get_principal_context(self) -> str:
         """Build principal context for DMN from live memory blocks."""
@@ -131,6 +121,8 @@ class ActorSystem:
             ),
             is_principal=True,
         )
+        self._notification_router = NotificationRouter(self.registry, self.principal.id)
+        self.registry.events.subscribe(self._on_actor_event)
         
         # Set up LLM factory
         self.registry.set_llm_factory(self._create_llm_for_actor)
@@ -142,18 +134,16 @@ class ActorSystem:
 
         # Strip tools down to CORTEX_TOOL_NAMES (keep under 15 for Gemma 4).
         # Stash stripped tools in _EXTENDED_TOOLS so request_tool() can activate them.
-        if hasattr(self.agent, 'llm') and hasattr(self.agent.llm, '_tools'):
+        if hasattr(self.agent, 'llm') and hasattr(self.agent.llm, 'restrict_tools'):
             from lethe.tools import _EXTENDED_TOOLS
-            for name in list(self.agent.llm._tools.keys()):
-                if name not in CORTEX_TOOL_NAMES:
-                    func, schema = self.agent.llm._tools[name]
-                    if name not in _EXTENDED_TOOLS:
-                        _EXTENDED_TOOLS[name] = (func, None)
-            to_strip = [name for name in self.agent.llm._tools if name not in CORTEX_TOOL_NAMES]
-            for name in to_strip:
-                del self.agent.llm._tools[name]
-            self.agent.llm._update_tool_budget()
-            logger.info(f"Cortex tools: {len(self.agent.llm._tools)} (stripped {len(to_strip)}: {sorted(to_strip)})")
+            removed = self.agent.llm.restrict_tools(CORTEX_TOOL_NAMES)
+            for name, (func, _schema) in removed.items():
+                if name not in _EXTENDED_TOOLS:
+                    _EXTENDED_TOOLS[name] = (func, None)
+            logger.info(
+                f"Cortex tools: {len(self.agent.llm.tools)} "
+                f"(stripped {len(removed)}: {sorted(removed)})"
+            )
 
         # Wire principal actor into the agent so it can drain inbox and see actor context.
         self.agent._principal_actor = self.principal
@@ -163,15 +153,8 @@ class ActorSystem:
             return ""
         self.agent._actor_context_provider = _principal_actor_context
 
-        # Hook spawn to auto-start actors in background
-        original_spawn = self.registry.spawn
-        def spawn_and_start(*args, **kwargs):
-            actor = original_spawn(*args, **kwargs)
-            # Auto-start non-principal actors, but NOT background supervisors.
-            if not actor.is_principal and actor.config.name not in {"brainstem", "dmn"}:
-                self._start_actor(actor)
-            return actor
-        self.registry.spawn = spawn_and_start
+        # Auto-start ordinary child actors via an explicit registry hook.
+        self.registry.subscribe_spawn(self._on_actor_spawned)
         
         # Rebuild tool reference in system prompt (was built before stripping)
         if hasattr(self.agent, 'llm'):
@@ -202,7 +185,7 @@ class ActorSystem:
             principal_context_provider=self._get_principal_context,
             model_override=self.settings.llm_model_dmn,
         )
-        tool_count = len(self.agent.llm._tools)
+        tool_count = len(self.agent.llm.tools)
         available_count = len(self._available_tools)
         logger.info(
             f"Actor system initialized. Principal: {self.principal.id}, "
@@ -212,9 +195,7 @@ class ActorSystem:
         self._start_principal_monitor()
 
     # Tools subagents must NOT have — they communicate via actors only
-    SUBAGENT_EXCLUDED_TOOLS = {
-        'telegram_send_message', 'telegram_send_file', 'telegram_react',
-    }
+    SUBAGENT_EXCLUDED_TOOLS = set(SUBAGENT_EXCLUDED_TOOL_NAMES)
 
     def _collect_available_tools(self):
         """Collect tools from the agent for subagent use.
@@ -222,14 +203,26 @@ class ActorSystem:
         This runs BEFORE stripping cortex tools, so it captures everything.
         Subagents can request any tool EXCEPT telegram (they message actors, not users).
         """
-        if hasattr(self.agent, 'llm') and hasattr(self.agent.llm, '_tools'):
-            for name, (func, schema) in self.agent.llm._tools.items():
+        if hasattr(self.agent, 'llm') and hasattr(self.agent.llm, 'iter_tool_entries'):
+            for name, func, schema in self.agent.llm.iter_tool_entries():
                 if name not in self.SUBAGENT_EXCLUDED_TOOLS:
                     self._available_tools[name] = (func, schema)
 
     def get_available_tool_names(self) -> List[str]:
         """List tool names available for subagents."""
         return sorted(self._available_tools.keys())
+
+    def _should_autostart_actor(self, actor: Actor) -> bool:
+        return (
+            not actor.is_principal
+            and actor.config.name not in {"brainstem", "dmn"}
+            and actor.id not in self._background_tasks
+        )
+
+    def _on_actor_spawned(self, actor: Actor):
+        """Start ordinary spawned actors without monkey-patching the registry."""
+        if self._should_autostart_actor(actor):
+            self._start_actor(actor)
 
     async def _create_llm_for_actor(self, actor: Actor) -> AsyncLLMClient:
         """Create an LLM client for a subagent actor."""
@@ -273,7 +266,7 @@ class ActorSystem:
         
         task = asyncio.create_task(_run(), name=f"actor-{actor.id}-{actor.config.name}")
         self._background_tasks[actor.id] = task
-        actor._task = task
+        actor.set_task_handle(task)
         logger.info(f"Started background actor: {actor.config.name} (id={actor.id})")
 
     def _start_principal_monitor(self):
@@ -287,7 +280,7 @@ class ActorSystem:
                     await asyncio.sleep(1.0)
                     if not self.principal or self.principal.state == ActorState.TERMINATED:
                         continue
-                    all_messages = self.principal._messages
+                    all_messages = self.principal.messages
                     if self._last_principal_message_idx >= len(all_messages):
                         continue
                     new_messages = all_messages[self._last_principal_message_idx:]
@@ -308,13 +301,102 @@ class ActorSystem:
 
         self._principal_monitor_task = asyncio.create_task(_monitor(), name="actor-principal-monitor")
 
+    async def _on_actor_event(self, event):
+        """Route background user notifications through scoring, gating, and review."""
+        if not self.principal or not self._notification_router:
+            return
+
+        signal = self._notification_router.from_actor_event(event)
+        if not signal:
+            return
+
+        self.registry.emit_event(
+            "notification_signal_received",
+            self.principal,
+            {
+                "signal_id": signal.event_id,
+                "source": signal.source.value,
+                "origin": signal.origin.value,
+                "category": signal.category.value,
+                "urgency": signal.urgency.value,
+                "kind": signal.kind,
+                "content_preview": signal.content[:240],
+            },
+        )
+
+        assessment = self._notification_scoring.assess(signal)
+        decision = self._notification_gate.decide(signal, assessment)
+        self.registry.emit_event(
+            "notification_gate_decision",
+            self.principal,
+            {
+                "signal_id": signal.event_id,
+                "action": decision.action.value,
+                "reason": decision.reason,
+                "urgency_score": assessment.urgency,
+                "user_relevance": assessment.user_relevance,
+                "interruptibility": assessment.interruptibility,
+            },
+        )
+        if decision.action == GateAction.DROP:
+            logger.info(
+                "Notification gate dropped %s %s (%s): %s",
+                signal.source.value,
+                signal.category.value,
+                decision.reason,
+                signal.content[:120],
+            )
+            return
+
+        if self._review_user_notification:
+            self.registry.emit_event(
+                "notification_review_requested",
+                self.principal,
+                {
+                    "signal_id": signal.event_id,
+                    "source": signal.source.value,
+                    "category": signal.category.value,
+                    "urgency": signal.urgency.value,
+                },
+            )
+            try:
+                await self._review_user_notification(signal)
+            except Exception as e:
+                logger.warning("Notification review failed for %s: %s", signal.source.value, e)
+        else:
+            self._pending_user_notifications.append(signal)
+            self.registry.emit_event(
+                "notification_signal_queued",
+                self.principal,
+                {
+                    "signal_id": signal.event_id,
+                    "source": signal.source.value,
+                    "category": signal.category.value,
+                    "urgency": signal.urgency.value,
+                },
+            )
+            logger.info(
+                "Queued user-facing signal from %s until notification review is ready",
+                signal.source.value,
+            )
+
     async def _handle_principal_message(self, message: ActorMessage):
-        """Record child->principal updates without bypassing cortex."""
+        """Route child→principal messages using MessageIntent for dispatch."""
         content = (message.content or "").strip()
-        metadata = message.metadata or {}
         sender = self.registry.get(message.sender)
         sender_name = sender.config.name if sender else message.sender
-        # Route stays actor->cortex; cortex decides whether/how to message the user.
+        intent = message.intent
+        if intent == MessageIntent.MESSAGE and message.metadata:
+            intent = MessageIntent.from_strings(
+                message.metadata.get("channel", ""),
+                message.metadata.get("kind", ""),
+            )
+
+        _BACKGROUND_ACTORS = {"brainstem", "dmn"}
+        is_background = sender_name in _BACKGROUND_ACTORS
+        if is_background:
+            return
+
         if self.principal:
             self.registry.emit_event(
                 "principal_update_received",
@@ -324,83 +406,39 @@ class ActorSystem:
                     "from_actor_name": sender_name,
                     "message_id": message.id,
                     "content_preview": content[:240],
-                    "channel": metadata.get("channel", ""),
-                    "kind": metadata.get("kind", ""),
+                    "intent": intent.value,
                 },
             )
-        logger.debug(
-            "Principal update received from %s (%s): %s",
-            sender_name,
-            message.sender,
-            content[:180],
+        logger.info(
+            "Principal message from %s: intent=%s content=%s",
+            sender_name, intent.value, content[:120],
         )
 
-        # Subagent task updates — trigger a cortex turn so it can decide how to respond.
-        _TERMINAL_KINDS = {"done", "failed", "error", "max_turns"}
-        _NOTIFY_KINDS = _TERMINAL_KINDS | {"progress"}
-        channel = metadata.get("channel", "")
-        kind = metadata.get("kind", "")
-        logger.info(
-            "Principal message from %s: channel=%s kind=%s content=%s",
-            sender_name, channel, kind, content[:120],
-        )
-        if (
-            channel == "task_update"
-            and kind in _NOTIFY_KINDS
-            and sender_name not in {"brainstem", "dmn"}
-        ):
-            if kind in _TERMINAL_KINDS:
+        # --- Subagent task lifecycle ---
+        if intent.channel == "task_update" and intent.wakes_cortex:
+            if intent.is_terminal:
                 synthetic = (
-                    f"[System: subagent '{sender_name}' finished ({kind}). "
+                    f"[System: subagent '{sender_name}' finished ({intent.value}). "
                     f"Its result is in your inbox. Review it and respond to the user.]"
                 )
             else:
                 synthetic = (
-                    f"[System: subagent '{sender_name}' progress update: {content[:200]}. "
-                    f"Let the user know if appropriate.]"
+                    f"[System: subagent '{sender_name}' sent a progress update. "
+                    f"The subagent is still running; do not kill, restart, ping, or otherwise manage it "
+                    f"unless the user explicitly asked you to intervene or the update says it is blocked. "
+                    f"You may send the user a brief status update if it adds value; otherwise return no text. "
+                    f"Progress: {content[:500]}]"
                 )
             if self._run_cortex_turn:
-                logger.info("Triggering cortex turn for subagent '%s' %s", sender_name, kind)
+                logger.info("Triggering cortex turn for subagent '%s' %s", sender_name, intent.value)
                 try:
                     await self._run_cortex_turn(synthetic)
                 except Exception as e:
-                    logger.warning("Cortex turn for subagent %s failed: %s", kind, e)
+                    logger.warning("Cortex turn for subagent %s failed: %s", intent.value, e)
             else:
-                logger.warning("No run_cortex_turn callback; subagent '%s' %s stuck in inbox", sender_name, kind)
+                logger.warning("No run_cortex_turn callback; subagent '%s' %s stuck in inbox", sender_name, intent.value)
             return
 
-        # Background processes can ask cortex to notify the user.
-        # Route through cortex turn — never relay directly to user.
-        # Cortex wakes up, reads the inbox, decides what/when/how to say it.
-        if metadata.get("channel") != "user_notify":
-            return
-        if sender_name not in {"brainstem", "dmn"}:
-            return
-        if self.principal:
-            self.registry.emit_event(
-                "background_notify_deferred_to_cortex",
-                self.principal,
-                {
-                    "from_actor_id": message.sender,
-                    "from_actor_name": sender_name,
-                    "message_preview": content[:240],
-                },
-            )
-        if self._run_cortex_turn:
-            kind = metadata.get("kind", "info")
-            synthetic = (
-                f"[System: background actor '{sender_name}' wants to notify the user ({kind}). "
-                f"Its message is in your inbox. Review it and decide whether/how to relay it.]"
-            )
-            try:
-                await self._run_cortex_turn(synthetic)
-            except Exception as e:
-                logger.warning("Cortex turn for user_notify failed: %s", e)
-        else:
-            logger.warning(
-                "No run_cortex_turn callback; %s user_notify stuck in inbox",
-                sender_name,
-            )
         return
 
     def set_callbacks(
@@ -408,20 +446,37 @@ class ActorSystem:
         send_to_user: Callable,
         get_reminders: Optional[Callable] = None,
         run_cortex_turn: Optional[Callable[[str], Awaitable[None]]] = None,
+        review_user_notification: Optional[Callable[[UserNotificationSignal], Awaitable[None]]] = None,
     ):
         """Set callbacks for DMN and actor system.
 
         Args:
             send_to_user: async Callable(message: str) -> None
             get_reminders: async Callable() -> str
-            run_cortex_turn: async Callable(synthetic_message: str) -> None — triggers a full cortex LLM turn
+            run_cortex_turn: async Callable(synthetic_message: str) -> None — triggers a full cortex LLM turn for subagent updates
+            review_user_notification: async Callable(signal: UserNotificationSignal) -> None — review for background user-facing signals
         """
         self._send_to_user = send_to_user
         self._get_reminders = get_reminders
         self._run_cortex_turn = run_cortex_turn
+        self._review_user_notification = review_user_notification
         if self.dmn:
             self.dmn.send_to_user = send_to_user
             self.dmn.get_reminders = get_reminders
+        if review_user_notification and self._pending_user_notifications:
+            asyncio.create_task(self._flush_pending_user_notifications())
+
+    async def _flush_pending_user_notifications(self):
+        if not self._review_user_notification:
+            return
+        pending = list(self._pending_user_notifications)
+        self._pending_user_notifications.clear()
+        for signal in pending:
+            try:
+                await self._review_user_notification(signal)
+            except Exception as e:
+                logger.warning("Failed to flush queued signal %s: %s", signal.event_id, e)
+
     async def dmn_round(self) -> Optional[str]:
         """Run a DMN round. Called by heartbeat timer.
 
@@ -547,4 +602,3 @@ class ActorSystem:
             "brainstem": brainstem_status,
             "dmn": dmn_status,
         }
-
