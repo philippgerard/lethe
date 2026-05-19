@@ -15,6 +15,9 @@ ENV/
 # Data
 data/
 *.db
+*.sqlite
+*.sqlite3
+*.session
 
 # IDE
 .idea/
@@ -54,10 +57,10 @@ emotional_tags.md
 .dmn_state_reset_v1
 epost/
 browser/
+thoughts/
 
 # Private data directories (never commit)
 data-split/
 outputs/
 unsloth_compiled_cache/
 workspace-split/
-
