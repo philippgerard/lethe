@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## v0.17.1 - 2026-05-22
+
+### Fixed
+- Expose todo tools (`todo_add`, `todo_list`, `todo_done`, `todo_remove`) to cortex actor, enabling proactive reminder workflow
+
 ## v0.17.0 - 2026-05-20
 
 ### Changed

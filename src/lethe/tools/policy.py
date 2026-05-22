@@ -114,6 +114,10 @@ CORTEX_TOOL_NAMES = frozenset(
         "discover_actors",
         "kill_actor",
         "request_tool",
+        "todo_add",
+        "todo_list",
+        "todo_done",
+        "todo_remove",
     }
 )
 
