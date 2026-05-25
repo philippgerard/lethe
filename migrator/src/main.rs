@@ -233,6 +233,15 @@ async fn run(cli: Cli) -> Result<()> {
         )
     })?;
     tracing::info!("migration complete → {}", cli.sqlite_path.display());
+
+    let old_dir = cli
+        .lancedb_dir
+        .canonicalize()
+        .unwrap_or_else(|_| cli.lancedb_dir.clone());
+    println!();
+    println!("The legacy LanceDB directory is no longer used:");
+    println!("    {}", old_dir.display());
+    println!("It can now be backed up, moved, or deleted.");
     Ok(())
 }
 
