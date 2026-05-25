@@ -5,9 +5,9 @@
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 ![Swiss Made Software](https://img.shields.io/badge/swiss%20made-software-red?style=flat-square&labelColor=FF0000&logoColor=white)
 
-Lethe is a long-running personal AI assistant with local memory, Telegram and HTTP/SSE transports, background reflection, and focused subagents.
+Lethe is a long-running personal AI assistant with a brain-inspired cognitive architecture: cortex, hippocampus, brainstem, and a default-mode network running as cooperating actors. She has continuous memory across sessions, notices things on her own, delegates to focused subagents, and can read her own source — propose changes to it, restart herself with new logic. Lives on your machine as a systemd service. Persists across reboots, models, hardware upgrades.
 
-This v1 branch is the Rust runtime. It builds as a single binary, uses `genai` as the universal LLM router, and intentionally does not include a web console.
+**Written in Rust** as a single static binary. No Python runtime, no virtualenv pinball, no dependency drift between hosts. Fast cold-start, predictable memory, no GC pauses during a tool loop. The runtime ships as one ~50 MB executable plus a small migrator for legacy data. Uses `genai` as the universal LLM router and intentionally has no web console.
 
 ## Quickstart
 
