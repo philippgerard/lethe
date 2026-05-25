@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.20.0 - Rust v1 release
+
+- First Rust release on `main`. Merges the entire v1 branch (single-binary runtime, SQLite-vec memory, lethe-migrate, multi-target release pipeline).
+- Aligned agent loop with the Python `main` reference implementation:
+  - Dropped the duplicated `<recent_tool_context>` system-prompt block; tool calls live only in the conversation stream.
+  - User messages are always timestamped (current + historical).
+  - Removed the hard 20-message history cap; token-budget compaction is the only trimmer. DB read raised to 500 rows per turn.
+- Tool-loop hardening:
+  - `MAX_TOOL_ITERATIONS` 8 → 50; on cap, push a wrap-up nudge and run a no-tools final call.
+  - Empty-response nudge: retry once before forcing wrap-up.
+  - `FREE_TOOL_NAMES` (memory, telegram, actor lifecycle) excluded from the billable counter.
+  - Per-turn tool log (ready for future auto-archival).
+  - Circuit breakers: `MAX_TOOL_ERRORS=8`, `MAX_REPEATED_TOOL_CALLS=4`, `MAX_NO_PROGRESS_TURNS=4`.
+  - Recover Gemma/llama-style `<tool_call:name{args}>` text embeddings when the native tool_calls field is empty.
+- Telegram transport:
+  - Send with `parse_mode=Markdown`; fall back to plain text on parse-entity errors.
+  - Restored `---` bubble splitter (Python convention): pure-dash divider lines split, fenced code and markdown table separators preserved.
+  - Actor-update flow uses an `ok` sentinel contract — prompt asks for `ok` when nothing to surface; code checks exact match and skips Telegram.
+
 ## 0.18.0 - Rust v1
 
 - Rewrote Lethe as a Rust single-binary runtime.
