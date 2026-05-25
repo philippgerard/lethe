@@ -17,16 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux gnu builds pin to ubuntu-22.04 so the resulting glibc
-          # floor is 2.35 — covers Ubuntu 22.04+, Debian 12+, Fedora 36+,
-          # RHEL/Rocky 9+. macOS binaries link only system libs and are
+          # Linux gnu builds pin to ubuntu-24.04 (glibc 2.39) because the
+          # prebuilt ort/onnxruntime binaries pulled in by fastembed
+          # require `__isoc23_strtol*` symbols introduced in glibc 2.39.
+          # End-user floor: Ubuntu 24.04+, Debian 13+, Fedora 40+,
+          # RHEL/Rocky 10+. macOS binaries link only system libs and are
           # portable across recent macOS versions on the matching arch.
           - name: linux-x86_64
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
           - name: linux-aarch64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
           - name: macos-x86_64
