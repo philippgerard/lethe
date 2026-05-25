@@ -218,6 +218,18 @@ lethe restore archive.tgz --yes          # skip prompts (for scripts / non-TTY)
 
 Restore prompts before overwriting an existing **workspace** and again before overwriting an existing **`.env`** — declining either keeps the local copy intact. Memory and history are restored unconditionally (that is the point of restoring).
 
+## Migrating from v0.18 (LanceDB → SQLite-vec)
+
+v0.19 moved memory storage from LanceDB to SQLite-vec. If you ran a pre-0.19 Lethe, use the one-shot [`lethe-migrate`](migrator/) tool to copy your `archival_memory`, `message_history`, and `notes` into the new layout:
+
+```bash
+lethe-migrate \
+  --lancedb-dir  ~/.lethe/data/memory/lancedb \
+  --sqlite-path  ~/.lethe/data/memory/lethe-memory.db
+```
+
+`lethe-migrate` is a standalone subproject under [`migrator/`](migrator/) with its own dependency tree — the Arrow/LanceDB stack stays out of the main `lethe` build. Full data contract is in [`MIGRATION-SPEC.md`](MIGRATION-SPEC.md).
+
 ## Logging
 
 Lethe writes structured runtime logs to `$LOGS_DIR/lethe.log` and mirrors them to stderr. The default level is `info`; override it with `RUST_LOG`, for example:
@@ -290,7 +302,7 @@ scripts/package-release
 ls dist/
 ```
 
-Tagged pushes (`v*`) build GitHub release assets named `lethe-<target>.tar.gz`; `install.sh` and `update.sh` consume those assets from the latest release.
+Tagged pushes (`v*`) build GitHub release assets on a four-runner matrix — `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64` — each producing one `lethe-<target>.tar.gz` plus a sibling `lethe-migrate-<target>.tar.gz` (`install.sh` and `update.sh` consume the `lethe-*` assets from the latest release). Linux gnu binaries are built on `ubuntu-22.04(-arm)` for a glibc 2.35 floor; macOS binaries link only against system frameworks.
 
 Useful smoke checks:
 

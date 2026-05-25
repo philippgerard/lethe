@@ -10,4 +10,6 @@
 - Added filesystem, shell, PTY terminal, browser, image, web, memory, notes, todos, actor, and transport tools.
 - Added binary release packaging and binary-first install/update scripts with source-build fallback.
 - Added `lethe backup` / `lethe restore` to pack and unpack the workspace, agent state (memory + history), and `.env` as a single tar.gz, prompting before overwriting an existing workspace or `.env`.
+- Added `migrator/` subproject (`lethe-migrate` binary) that moves legacy LanceDB data (`archival_memory`, `message_history`, `notes`) into the new SQLite-vec storage. Standalone Cargo project — keeps the Arrow/LanceDB stack out of the main `lethe` build.
+- Release workflow now builds `lethe` and `lethe-migrate` for four targets (linux x86_64/aarch64, macOS x86_64/aarch64) on native GitHub Actions runners.
 - Removed the former package/test stack and the web console while keeping Anthropic subscription/OAuth support in the Rust runtime.

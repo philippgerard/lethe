@@ -17,33 +17,64 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux gnu builds pin to ubuntu-22.04 so the resulting glibc
+          # floor is 2.35 — covers Ubuntu 22.04+, Debian 12+, Fedora 36+,
+          # RHEL/Rocky 9+. macOS binaries link only system libs and are
+          # portable across recent macOS versions on the matching arch.
           - name: linux-x86_64
-            runner: ubuntu-latest
-            deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - name: macos
-            runner: macos-latest
+            deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
+          - name: linux-aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
+          - name: macos-x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
             deps: brew install protobuf
-            target: ""
+          - name: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            deps: brew install protobuf
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # `migrator` is a separate Cargo project (its own [workspace]) so
+      # cache it as a distinct workspace entry.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            migrator
+
       - name: Install native dependencies
         run: ${{ matrix.deps }}
 
-      - name: Test
+      - name: Test lethe
         run: cargo test --locked
 
-      - name: Build
+      - name: Test lethe-migrate
+        run: cargo test --locked --manifest-path migrator/Cargo.toml
+
+      - name: Build lethe
         run: cargo build --release --locked
 
-      - name: Package
+      - name: Build lethe-migrate
+        run: cargo build --release --locked --manifest-path migrator/Cargo.toml
+
+      - name: Package lethe
         env:
           LETHE_RELEASE_TARGET: ${{ matrix.target }}
         run: scripts/package-release
+
+      - name: Package lethe-migrate
+        env:
+          LETHE_RELEASE_TARGET: ${{ matrix.target }}
+        run: scripts/package-migrator
 
       - uses: actions/upload-artifact@v4
         with:

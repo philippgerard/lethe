@@ -1,0 +1,43 @@
+# `lethe-migrate` is intentionally a standalone Cargo project rather than
+# a workspace member of the parent `lethe` crate. The empty `[workspace]`
+# below stops Cargo from walking up and inheriting the parent crate's
+# manifest — the migrator must not pull LanceDB/Arrow into the main
+# Lethe build, and Lethe must not pull `lethe-migrate` into its own.
+[workspace]
+
+[package]
+name = "lethe-migrate"
+version = "0.1.0"
+edition = "2024"
+description = "One-shot migrator from Lethe's legacy LanceDB storage to the new SQLite-vec storage."
+license = "MIT"
+
+[[bin]]
+name = "lethe-migrate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arrow-array = "58"
+arrow-schema = "58"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+lancedb = "0.29"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = "1"
+sqlite-vec = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zerocopy = { version = "0.7", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Strip symbols from release binaries — knocks ~25 MB off the 180 MB
+# binary (most of which is lancedb + arrow + datafusion). Debug builds
+# are unaffected.
+[profile.release]
+strip = true
