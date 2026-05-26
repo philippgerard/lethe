@@ -348,17 +348,8 @@ impl FileTools {
         };
         let selected = lines[start_index..selected_end].join("\n");
         let result = truncate_head(&selected, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-        let output_lines = result.content.split('\n').collect::<Vec<_>>();
-        let mut numbered = Vec::new();
-        for (index, line) in output_lines.iter().enumerate() {
-            numbered.push(format!(
-                "{:6}\t{}",
-                start_index + index + 1,
-                line.trim_end()
-            ));
-        }
 
-        let mut output = numbered.join("\n");
+        let mut output = result.content.clone();
         if result.truncated {
             let notice = format_truncation_notice(&result, start_index + 1, None);
             output.push_str("\n\n");
@@ -534,7 +525,7 @@ fn exec_grep_search(registry: &ToolRegistry<'_>, args: &Value) -> String {
 pub const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "read_file",
-        description: "Read a file with line numbers.",
+        description: "Read a file.",
         params: &[
             p_str_req("file_path", "Path."),
             p_int("offset", "Line offset (0 = start)."),
@@ -607,7 +598,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_existing_file_with_line_numbers() {
+    fn read_existing_file_returns_raw_lines() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.txt");
         fs::write(&path, "line 1\nline 2\nline 3\n").unwrap();
@@ -615,10 +606,7 @@ mod tests {
 
         let result = tools.read_file(path.to_str().unwrap(), 0, 0);
 
-        assert!(result.contains("line 1"));
-        assert!(result.contains("line 2"));
-        assert!(result.contains("line 3"));
-        assert!(result.contains("     1\t"));
+        assert_eq!(result, "line 1\nline 2\nline 3");
     }
 
     #[test]
