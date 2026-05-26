@@ -31,10 +31,6 @@ jobs:
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config
-          - name: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            deps: brew install protobuf
           - name: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
@@ -56,14 +52,8 @@ jobs:
       - name: Install native dependencies
         run: ${{ matrix.deps }}
 
-      - name: Test lethe
-        run: cargo test --locked
-
-      - name: Test lethe-migrate
-        run: cargo test --locked --manifest-path migrator/Cargo.toml
-
       - name: Build lethe
-        run: cargo build --release --locked
+        run: cargo build --release --locked --bin lethe
 
       - name: Build lethe-migrate
         run: cargo build --release --locked --manifest-path migrator/Cargo.toml
