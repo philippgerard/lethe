@@ -17,6 +17,11 @@ const COMPLETION_SUMMARY_PROMPT: &str =
     include_str!("../../config/prompts/curator_summarize_completed.md");
 const COMPLETION_SUMMARY_BATCH: usize = 20;
 const COMPLETION_SUMMARY_MAX_CHARS: usize = 200;
+/// Cadence for the per-completed-entry summariser. Callers (every
+/// chat_once, every heartbeat) would otherwise fire up to
+/// COMPLETION_SUMMARY_BATCH aux-LLM calls per invocation; gating here
+/// caps the cost without coupling to the 6h harvest cadence.
+pub const COMPLETION_SUMMARY_CADENCE_SECONDS: i64 = 60 * 60;
 
 pub const CURATOR_CADENCE_SECONDS: i64 = 6 * 60 * 60;
 const HARVEST_RECENT_LIMIT: usize = 200;
@@ -43,6 +48,8 @@ pub type CuratorResult<T> = Result<T, CuratorError>;
 pub struct CuratorState {
     pub last_run_at: Option<String>,
     pub last_harvest_at: Option<String>,
+    #[serde(default)]
+    pub last_summary_at: Option<String>,
     pub total_runs: usize,
     pub total_harvested: usize,
     pub total_deleted: usize,
@@ -132,15 +139,26 @@ impl MemoryCurator {
     /// have a one-line summary. Uses the aux LLM and writes results back.
     /// Returns the number of entries successfully summarised. Safe to call
     /// alongside `run`; it has no shared state with harvest/dedupe.
+    /// Cadence-gated to `COMPLETION_SUMMARY_CADENCE_SECONDS` so callers
+    /// invoked on every turn/heartbeat don't spend up to BATCH aux-LLM
+    /// calls per invocation.
     pub async fn summarize_completed_entries(
         &self,
         store: &MemoryStore,
         router: &LlmRouter,
     ) -> CuratorResult<usize> {
+        let mut state = self.load_state()?;
+        if !should_summarize_state(&state, Utc::now()) {
+            return Ok(0);
+        }
         let pending = store
             .archival
             .list_completed_without_summary(COMPLETION_SUMMARY_BATCH)?;
         if pending.is_empty() {
+            // Touch the timestamp anyway so the cheap "list pending"
+            // query is bounded to the cadence, not run on every tick.
+            state.last_summary_at = Some(Utc::now().to_rfc3339());
+            self.save_state(&state)?;
             return Ok(0);
         }
         let mut done = 0;
@@ -170,6 +188,8 @@ impl MemoryCurator {
                 }
             }
         }
+        state.last_summary_at = Some(Utc::now().to_rfc3339());
+        self.save_state(&state)?;
         Ok(done)
     }
 
@@ -281,6 +301,18 @@ pub fn should_run_state(state: &CuratorState, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(last.with_timezone(&Utc))
         .num_seconds()
         >= CURATOR_CADENCE_SECONDS
+}
+
+pub fn should_summarize_state(state: &CuratorState, now: DateTime<Utc>) -> bool {
+    let Some(last) = &state.last_summary_at else {
+        return true;
+    };
+    let Ok(parsed) = DateTime::parse_from_rfc3339(last) else {
+        return true;
+    };
+    now.signed_duration_since(parsed.with_timezone(&Utc))
+        .num_seconds()
+        >= COMPLETION_SUMMARY_CADENCE_SECONDS
 }
 
 fn is_harvestable_message(message: &StoredMessage, last_harvest_at: Option<&str>) -> bool {

@@ -1191,6 +1191,20 @@ async fn process_heartbeat_once(
     let prompts = prompt_store(settings);
     let reminders = active_reminders_text(settings)?;
     let prompt = heartbeat.trigger(&prompts, &reminders);
+    // Idle gate: no due reminders, not the first tick, and not a periodic
+    // deeper review — the model would respond "idle" anyway, so don't
+    // spend two LLM turns (cortex + DMN) to learn that. First-tick,
+    // full-context, and reminder-bearing ticks always proceed.
+    if !prompt.first_tick && !prompt.use_full_context && reminders.trim().is_empty() {
+        let outcome =
+            heartbeat.finish_response(r#"{"action":"idle","message":""}"#, None);
+        tracing::debug!(
+            count = heartbeat.heartbeat_count(),
+            idle_minutes = ?outcome.idle_minutes,
+            "heartbeat skipped: nothing to do"
+        );
+        return Ok(());
+    }
     let req = TurnRequest::new(&prompt.message)
         .with_metadata(message_metadata_value(
             MessageVisibility::Internal,

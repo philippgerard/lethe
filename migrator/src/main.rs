@@ -22,7 +22,7 @@ mod dest;
 mod source;
 mod verify;
 
-use dest::Destination;
+use dest::{Destination, ensure_note_id};
 use source::{
     ARCHIVAL_TABLE, MESSAGES_TABLE, NOTES_TABLE, SourceCounts, count_rows, detect_embedding_dim,
     read_archival, read_messages, read_notes,
@@ -307,7 +307,9 @@ fn sample_messages(rows: &[source::MessageRow]) -> Vec<(String, String, Vec<f32>
 }
 
 fn sample_notes(rows: &[source::NoteRow]) -> Vec<(String, String, Vec<f32>)> {
+    // Note ids gain a `note-` prefix on insert; verify looks the row up
+    // by stored id, so the sample must use the prefixed form too.
     rows.iter()
-        .map(|r| (r.id.clone(), r.text.clone(), r.embedding.clone()))
+        .map(|r| (ensure_note_id(&r.id), r.text.clone(), r.embedding.clone()))
         .collect()
 }

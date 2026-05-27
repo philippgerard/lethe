@@ -102,12 +102,16 @@ impl Destination {
 
     pub fn insert_note(&self, row: &NoteRow) -> Result<()> {
         let tags = csv_to_json_array(&row.tags_csv);
+        // Live note writer (src/memory/notes.rs) creates ids as
+        // `note-<uuid>`; legacy LanceDB notes stored bare UUIDs. Backfill
+        // the prefix so the new code's id-format invariant holds.
+        let id = ensure_note_id(&row.id);
         self.conn().execute(
             "INSERT INTO memory \
                  (id, kind, title, text, metadata, tags, file_path, created_at, updated_at) \
              VALUES (?, 'note', ?, ?, '{}', ?, ?, ?, ?)",
             params![
-                row.id,
+                id,
                 row.title,
                 row.text,
                 tags,
@@ -118,7 +122,7 @@ impl Destination {
         )?;
         self.conn().execute(
             "INSERT INTO memory_vec (id, embedding) VALUES (?, ?)",
-            params![row.id, f32_slice_bytes(&row.embedding)],
+            params![id, f32_slice_bytes(&row.embedding)],
         )?;
         Ok(())
     }
@@ -211,13 +215,62 @@ fn sanitize_tags_json(raw: &str, id: &str, kind: &str) -> String {
     }
 }
 
+/// Mirrors `src/memory/search.rs::clean_tags` in the main crate: trim,
+/// lowercase, drop empties, dedupe in first-seen order. The live tag
+/// filter (`tags_match_any`) compares strings verbatim against a list
+/// the writer always normalized through `clean_tags`, so migrated rows
+/// with mixed-case or duplicated tags silently fail to match user
+/// queries unless we normalize too.
 fn csv_to_json_array(csv: &str) -> String {
-    let tags: Vec<&str> = csv
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-    json!(tags).to_string()
+    let mut seen = std::collections::BTreeSet::new();
+    let mut clean: Vec<String> = Vec::new();
+    for part in csv.split(',') {
+        let normalized = part.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && seen.insert(normalized.clone()) {
+            clean.push(normalized);
+        }
+    }
+    json!(clean).to_string()
+}
+
+pub fn ensure_note_id(id: &str) -> String {
+    if id.starts_with("note-") {
+        id.to_string()
+    } else {
+        format!("note-{id}")
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn csv_to_json_array_trims_lowercases_and_dedupes() {
+        // Mirrors src/memory/search.rs::clean_tags in the main crate so
+        // migrated tag arrays match what the live tag filter expects.
+        assert_eq!(
+            csv_to_json_array("Alpha,  beta , ALPHA, Beta,"),
+            r#"["alpha","beta"]"#
+        );
+        assert_eq!(csv_to_json_array(""), "[]");
+        assert_eq!(csv_to_json_array(" , , "), "[]");
+        assert_eq!(csv_to_json_array("one"), r#"["one"]"#);
+    }
+
+    #[test]
+    fn ensure_note_id_is_idempotent_and_prefixes_bare_uuids() {
+        assert_eq!(
+            ensure_note_id("note-deadbeef"),
+            "note-deadbeef",
+            "already-prefixed ids pass through"
+        );
+        assert_eq!(
+            ensure_note_id("00000000-0000-0000-0000-000000000000"),
+            "note-00000000-0000-0000-0000-000000000000",
+            "bare legacy UUIDs are backfilled"
+        );
+    }
 }
 
 /// Encode an `f32` slice as raw little-endian bytes for the `vec0`

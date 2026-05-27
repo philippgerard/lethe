@@ -46,7 +46,10 @@ pub struct NoteRow {
     pub tags_csv: String,
     pub file_path: String,
     pub created_at: String,
-    pub updated_at: String,
+    /// `None` when the source stored an empty string. The destination
+    /// column is nullable; the live reader expects `Option<String>` and
+    /// will misinterpret `Some("")` as a real timestamp.
+    pub updated_at: Option<String>,
     pub embedding: Vec<f32>,
 }
 
@@ -63,8 +66,8 @@ impl SourceCounts {
     }
 }
 
-pub async fn count_rows(lancedb_dir: &Path, table: &str) -> Result<SourceCounts> {
-    if !table_path(lancedb_dir, table).exists() {
+pub async fn count_rows(lancedb_dir: &Path, table_name: &str) -> Result<SourceCounts> {
+    if !table_path(lancedb_dir, table_name).exists() {
         return Ok(SourceCounts::default());
     }
     let db = lancedb::connect(&lancedb_dir.display().to_string())
@@ -72,17 +75,21 @@ pub async fn count_rows(lancedb_dir: &Path, table: &str) -> Result<SourceCounts>
         .await
         .with_context(|| format!("opening LanceDB at {}", lancedb_dir.display()))?;
     let table = db
-        .open_table(table)
+        .open_table(table_name)
         .execute()
         .await
-        .with_context(|| format!("opening table {table}"))?;
+        .with_context(|| format!("opening table {table_name}"))?;
     let raw = table.count_rows(None).await? as usize;
-    // The `_init_` row may not exist (a fresh install that never wrote it),
-    // so swallow "not found" filters as zero.
+    // `count_rows` returns 0 (not an error) when no row matches the
+    // predicate, so any error here is a real failure — surface it
+    // instead of silently treating init as 0, which would inflate the
+    // expected-user-row target and produce a misleading verification
+    // failure.
     let init = table
         .count_rows(Some(format!("id = '{INIT_ID}'")))
         .await
-        .unwrap_or(0) as usize;
+        .with_context(|| format!("counting init rows in table {table_name}"))?
+        as usize;
     Ok(SourceCounts { raw, init })
 }
 
@@ -165,6 +172,14 @@ pub async fn read_notes(lancedb_dir: &Path) -> Result<Vec<NoteRow>> {
             if id == INIT_ID {
                 continue;
             }
+            let updated_at = {
+                let raw = updated.value(row);
+                if raw.is_empty() {
+                    None
+                } else {
+                    Some(raw.to_string())
+                }
+            };
             out.push(NoteRow {
                 id: id.to_string(),
                 title: titles.value(row).to_string(),
@@ -172,7 +187,7 @@ pub async fn read_notes(lancedb_dir: &Path) -> Result<Vec<NoteRow>> {
                 tags_csv: tags.value(row).to_string(),
                 file_path: file_paths.value(row).to_string(),
                 created_at: created.value(row).to_string(),
-                updated_at: updated.value(row).to_string(),
+                updated_at,
                 embedding: extract_vector(&vectors, row)?,
             });
         }

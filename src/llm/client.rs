@@ -10,8 +10,8 @@ use chrono::Utc;
 use genai::Client;
 use genai::adapter::AdapterKind;
 use genai::chat::{
-    BinarySource, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatRole, ContentPart,
-    MessageContent, PromptTokensDetails, ToolCall, ToolResponse, Usage,
+    BinarySource, CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatResponse, ChatRole,
+    ContentPart, MessageContent, PromptTokensDetails, ToolCall, ToolResponse, Usage,
 };
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{ModelIden, ServiceTarget};
@@ -1004,7 +1004,7 @@ fn truncate_error(text: &str) -> String {
 
 fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptions) -> Value {
     let max_tokens = options.max_tokens.unwrap_or(8000);
-    let mut system_blocks = Vec::new();
+    let mut system_blocks: Vec<Value> = Vec::new();
     if let Some(system) = request.system.filter(|system| !system.trim().is_empty()) {
         system_blocks.push(json!({"type": "text", "text": system}));
     }
@@ -1013,10 +1013,23 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
     for message in request.messages {
         match message.role {
             ChatRole::System => {
+                // Stamp cache_control on the LAST emitted block for this
+                // message so the Persistent / Ephemeral breakpoints set by
+                // apply_cache_markers in agent.rs survive the OAuth path.
+                // Without this every heartbeat re-pays the full system
+                // prompt as fresh input.
+                let cache = message.options.as_ref().and_then(|o| o.cache_control);
+                let prev_len = system_blocks.len();
                 for text in message.content.texts() {
                     if !text.trim().is_empty() {
                         system_blocks.push(json!({"type": "text", "text": text}));
                     }
+                }
+                if let Some(control) = cache
+                    && system_blocks.len() > prev_len
+                    && let Some(obj) = system_blocks.last_mut().and_then(Value::as_object_mut)
+                {
+                    obj.insert("cache_control".into(), cache_control_value(control));
                 }
             }
             ChatRole::User => messages.push(json!({
@@ -1067,12 +1080,19 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
         messages.push(json!({"role": "user", "content": "[No user message provided.]"}));
     }
 
-    let tools = request
+    // Tools intentionally carry no cache_control: a 5m marker on the
+    // last tool sits before the system 1h marker in Anthropic's
+    // tools → system → messages processing order, and the API rejects
+    // ttl=5m occurring before ttl=1h. The system breakpoint already
+    // caches everything from the start of the prompt (tools included),
+    // so the tools marker is redundant anyway. Mirrors what genai's
+    // vendored anthropic adapter does on the non-OAuth path.
+    let tools: Vec<Value> = request
         .tools
         .unwrap_or_default()
         .into_iter()
         .map(anthropic_tool_schema)
-        .collect::<Vec<_>>();
+        .collect();
 
     json!({
         "model": normalize_anthropic_model(model),
@@ -1081,6 +1101,13 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
         "messages": messages,
         "tools": tools,
     })
+}
+
+fn cache_control_value(control: CacheControl) -> Value {
+    match control {
+        CacheControl::Ephemeral => json!({"type": "ephemeral"}),
+        CacheControl::Persistent => json!({"type": "ephemeral", "ttl": "1h"}),
+    }
 }
 
 fn anthropic_user_content(content: MessageContent) -> Vec<Value> {

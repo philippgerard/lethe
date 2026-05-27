@@ -149,7 +149,14 @@ fn check_vec_prefix(
     let array = parsed
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("vec_to_json did not return an array for {id}"))?;
-    for (i, expected_value) in expected.iter().take(4).enumerate() {
+    if array.len() != expected.len() {
+        bail!(
+            "{vec_table} sample {id}: dim mismatch — expected {} elements, got {}",
+            expected.len(),
+            array.len()
+        );
+    }
+    for (i, expected_value) in expected.iter().enumerate() {
         let actual = array
             .get(i)
             .and_then(Value::as_f64)
