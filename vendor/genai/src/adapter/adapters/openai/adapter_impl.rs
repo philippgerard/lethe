@@ -3,7 +3,7 @@ use crate::adapter::openai::OpenAIStreamer;
 use crate::adapter::openai::ToWebRequestCustom;
 use crate::adapter::{Adapter, AdapterDispatcher, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
-	BinarySource, ChatOptionsSet, ChatRequest, ChatResponse, ChatResponseFormat, ChatRole, ChatStream,
+	BinarySource, CacheControl, ChatOptionsSet, ChatRequest, ChatResponse, ChatResponseFormat, ChatRole, ChatStream,
 	ChatStreamResponse, ContentPart, MessageContent, ReasoningEffort, ToolCall, Usage,
 };
 use crate::resolver::{AuthData, Endpoint};
@@ -376,11 +376,29 @@ impl OpenAIAdapter {
 		// -- Process the messages
 		for msg in chat_req.messages {
 			// Note: Will handle more types later
+			// Lethe fork: capture cache_control off the message before
+			// moving its content. Forwarding cache markers as a
+			// content-parts array is OpenRouter's documented extension
+			// for routing prompt caching to providers that support it
+			// (Anthropic, Gemini, Moonshot/Kimi). Direct OpenAI silently
+			// drops unknown fields, so this is safe on both paths.
+			let msg_cache_control = msg.options.as_ref().and_then(|opts| opts.cache_control);
 			match msg.role {
 				// For now, system and tool messages go to the system
 				ChatRole::System => {
 					if let Some(content) = msg.content.into_joined_texts() {
-						messages.push(json!({"role": "system", "content": content}))
+						if let Some(cache_control) = msg_cache_control {
+							messages.push(json!({
+								"role": "system",
+								"content": [{
+									"type": "text",
+									"text": content,
+									"cache_control": cache_control_value(cache_control),
+								}],
+							}));
+						} else {
+							messages.push(json!({"role": "system", "content": content}));
+						}
 					}
 					// TODO: Probably need to warn if it is a ToolCalls type of content
 				}
@@ -631,3 +649,90 @@ fn parse_tool_call(raw_tool_call: Value) -> Result<ToolCall> {
 }
 
 // endregion: --- Support
+
+// region:    --- Lethe fork cache_control helpers
+
+/// Lethe fork: build the OpenRouter/Anthropic-compatible `cache_control`
+/// object from a `CacheControl` marker. `Persistent` is the fork's
+/// extension for Anthropic's 1h extended cache; OpenRouter forwards
+/// the marker verbatim to upstream providers and drops it for ones
+/// that don't recognize the field.
+fn cache_control_value(control: CacheControl) -> Value {
+	match control {
+		CacheControl::Ephemeral => json!({"type": "ephemeral"}),
+		CacheControl::Persistent => json!({"type": "ephemeral", "ttl": "1h"}),
+	}
+}
+
+// endregion: --- Lethe fork cache_control helpers
+
+#[cfg(test)]
+mod cache_control_tests {
+	use super::*;
+	use crate::chat::ChatMessage;
+
+	#[test]
+	fn system_message_without_cache_marker_stays_a_plain_string() {
+		let req = ChatRequest::new(vec![ChatMessage::system("you are helpful")]);
+		let parts = OpenAIAdapter::into_openai_request_parts(
+			&ModelIden::new(AdapterKind::OpenAI, "gpt-5.4".to_string()),
+			req,
+		)
+		.unwrap();
+		assert_eq!(parts.messages.len(), 1);
+		assert_eq!(parts.messages[0]["role"], json!("system"));
+		assert_eq!(parts.messages[0]["content"], json!("you are helpful"));
+	}
+
+	#[test]
+	fn system_message_with_persistent_marker_emits_cache_control_parts() {
+		let mut msg = ChatMessage::system("stable prefix");
+		msg.options = Some(CacheControl::Persistent.into());
+		let req = ChatRequest::new(vec![msg]);
+		let parts = OpenAIAdapter::into_openai_request_parts(
+			&ModelIden::new(AdapterKind::OpenAI, "gpt-5.4".to_string()),
+			req,
+		)
+		.unwrap();
+		assert_eq!(parts.messages.len(), 1);
+		assert_eq!(parts.messages[0]["role"], json!("system"));
+		let content = parts.messages[0]["content"].as_array().unwrap();
+		assert_eq!(content.len(), 1);
+		assert_eq!(content[0]["type"], json!("text"));
+		assert_eq!(content[0]["text"], json!("stable prefix"));
+		assert_eq!(
+			content[0]["cache_control"],
+			json!({"type": "ephemeral", "ttl": "1h"})
+		);
+	}
+
+	#[test]
+	fn system_message_with_ephemeral_marker_emits_5m_cache_control() {
+		let mut msg = ChatMessage::system("volatile tail");
+		msg.options = Some(CacheControl::Ephemeral.into());
+		let req = ChatRequest::new(vec![msg]);
+		let parts = OpenAIAdapter::into_openai_request_parts(
+			&ModelIden::new(AdapterKind::OpenAI, "gpt-5.4".to_string()),
+			req,
+		)
+		.unwrap();
+		let content = parts.messages[0]["content"].as_array().unwrap();
+		assert_eq!(
+			content[0]["cache_control"],
+			json!({"type": "ephemeral"})
+		);
+	}
+
+	#[test]
+	fn non_system_messages_keep_their_existing_shape() {
+		let req = ChatRequest::new(vec![ChatMessage::user("hello")]);
+		let parts = OpenAIAdapter::into_openai_request_parts(
+			&ModelIden::new(AdapterKind::OpenAI, "gpt-5.4".to_string()),
+			req,
+		)
+		.unwrap();
+		assert_eq!(parts.messages[0]["role"], json!("user"));
+		// User content stays a plain string when no parts split is needed.
+		assert_eq!(parts.messages[0]["content"], json!("hello"));
+	}
+}

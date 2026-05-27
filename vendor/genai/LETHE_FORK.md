@@ -18,12 +18,18 @@ themselves Persistent and survive the gap between user replies.
 
 ## Patch surface (vs upstream 0.5.3)
 
-Only two files are modified:
+Three files are modified:
 
 - `src/chat/chat_message.rs`: add `Persistent` variant to `CacheControl`.
 - `src/adapter/adapters/anthropic/adapter_impl.rs`: stamp `ttl: "1h"` on
   the emitted `cache_control` object when the marker is `Persistent`.
   Four emission sites updated; `Ephemeral` behaviour is unchanged.
+- `src/adapter/adapters/openai/adapter_impl.rs`: forward `cache_control`
+  on system messages as a content-parts array, mirroring OpenRouter's
+  documented extension. Direct OpenAI silently drops unknown fields, so
+  this is safe on both paths and unlocks caching for OpenRouter →
+  Anthropic / Moonshot / Gemini routes that would otherwise re-bill the
+  full prompt every turn.
 
 All other code is byte-identical to upstream 0.5.3.
 
