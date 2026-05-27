@@ -1,6 +1,9 @@
+pub mod anthropic_oauth;
 pub mod client;
 pub mod dialect;
 pub mod models;
+pub mod oauth_env;
+pub mod openai_oauth;
 pub mod prompt_builder;
 pub mod prompts;
 pub mod response_format;

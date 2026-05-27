@@ -22,6 +22,16 @@ enum Command {
     /// Interactive setup: pick provider + model + API key, write
     /// ~/.lethe/config/.env, seed the workspace, run a smoke test.
     Init,
+    /// Sign in to an LLM provider. Subscription paths (ChatGPT
+    /// Plus/Pro, Claude Pro/Max) store OAuth tokens under
+    /// `~/.lethe/credentials/`; API-key paths (OpenRouter, plus the
+    /// API-key alternative on the OAuth-capable providers) write the
+    /// key to `~/.lethe/config/.env`. Either way, `LLM_PROVIDER` and
+    /// the model defaults are aligned to the chosen provider.
+    Login {
+        #[command(subcommand)]
+        command: LoginCommand,
+    },
     /// Validate the Rust runtime configuration and embedded prompt access.
     Check,
     /// Print a prompt template after workspace/config/embedded resolution.
@@ -116,6 +126,18 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LoginCommand {
+    /// Sign in to OpenAI. Prompts for subscription (ChatGPT Plus/Pro
+    /// device-code OAuth, default) or API key.
+    Openai,
+    /// Sign in to Anthropic. Prompts for subscription (Claude Pro/Max
+    /// browser-PKCE OAuth, default) or API key.
+    Anthropic,
+    /// Sign in to OpenRouter (API key only — no subscription path).
+    Openrouter,
 }
 
 #[derive(Debug, Subcommand)]
@@ -488,6 +510,57 @@ async fn main() -> Result<()> {
     use cli::handlers as h;
     match command {
         Command::Init => cli::init::run().await,
+        Command::Login { command } => match command {
+            LoginCommand::Openai => {
+                if lethe::llm::oauth_env::prompt_subscription_or_api(
+                    "OpenAI",
+                    "ChatGPT Plus/Pro",
+                )? {
+                    lethe::llm::openai_oauth::run_device_login().await?;
+                    let (main, aux) =
+                        lethe::llm::oauth_env::prompt_provider_models("openai")?;
+                    lethe::llm::oauth_env::update_env_after_oauth_login(
+                        "openai",
+                        main.as_deref(),
+                        aux.as_deref(),
+                        Some("OPENAI_API_KEY"),
+                    )
+                } else {
+                    lethe::llm::oauth_env::run_api_key_login(
+                        "openai",
+                        "OPENAI_API_KEY",
+                        "Paste OPENAI_API_KEY (https://platform.openai.com/api-keys): ",
+                    )
+                }
+            }
+            LoginCommand::Anthropic => {
+                if lethe::llm::oauth_env::prompt_subscription_or_api(
+                    "Anthropic",
+                    "Claude Pro/Max",
+                )? {
+                    lethe::llm::anthropic_oauth::run_device_login().await?;
+                    let (main, aux) =
+                        lethe::llm::oauth_env::prompt_provider_models("anthropic")?;
+                    lethe::llm::oauth_env::update_env_after_oauth_login(
+                        "anthropic",
+                        main.as_deref(),
+                        aux.as_deref(),
+                        Some("ANTHROPIC_API_KEY"),
+                    )
+                } else {
+                    lethe::llm::oauth_env::run_api_key_login(
+                        "anthropic",
+                        "ANTHROPIC_API_KEY",
+                        "Paste ANTHROPIC_API_KEY (https://console.anthropic.com/settings/keys): ",
+                    )
+                }
+            }
+            LoginCommand::Openrouter => lethe::llm::oauth_env::run_api_key_login(
+                "openrouter",
+                "OPENROUTER_API_KEY",
+                "Paste OPENROUTER_API_KEY (https://openrouter.ai/keys): ",
+            ),
+        },
         Command::Check => h::check().await,
         Command::Prompt { name } => h::print_prompt(&name),
         Command::InitMemory => h::init_memory(),

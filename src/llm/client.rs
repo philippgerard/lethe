@@ -28,9 +28,10 @@ use crate::config::Settings;
 const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/";
 const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/";
-const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+pub(crate) const ANTHROPIC_OAUTH_TOKEN_URL: &str =
+    "https://console.anthropic.com/v1/oauth/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+pub(crate) const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_CODE_VERSION: &str = "2.1.117";
 const CLAUDE_CODE_SALT: &str = "59cf53e54c78";
 static LLM_DEBUG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -240,16 +241,19 @@ pub struct LlmRouter {
     client: Client,
     config: LlmRouterConfig,
     anthropic_oauth: Option<AnthropicOAuthClient>,
+    openai_oauth: Option<crate::llm::openai_oauth::OpenAiOAuthClient>,
 }
 
 impl LlmRouter {
     pub fn new(config: LlmRouterConfig) -> Self {
         let client = build_client(&config);
         let anthropic_oauth = AnthropicOAuthClient::from_env();
+        let openai_oauth = crate::llm::openai_oauth::OpenAiOAuthClient::from_env();
         Self {
             client,
             config,
             anthropic_oauth,
+            openai_oauth,
         }
     }
 
@@ -280,6 +284,14 @@ impl LlmRouter {
         }
 
         let options = self.config.chat_options();
+        if let Some(oauth) = &self.openai_oauth
+            && should_use_openai_oauth(model, &self.config)
+        {
+            return oauth
+                .exec_chat_request(model, request, &options)
+                .await
+                .with_context(|| format!("LLM chat request failed for model {model}"));
+        }
         if let Some(oauth) = &self.anthropic_oauth
             && should_use_anthropic_oauth(model, &self.config)
         {
@@ -812,7 +824,7 @@ fn llm_debug_request_payload(
     })
 }
 
-fn log_llm_interaction(label: &str, model: &str, request: Value, response: Value) {
+pub(crate) fn log_llm_interaction(label: &str, model: &str, request: Value, response: Value) {
     if !llm_debug_enabled() {
         return;
     }
@@ -885,6 +897,26 @@ fn should_use_anthropic_oauth(model: &str, config: &LlmRouterConfig) -> bool {
         || model.contains("claude")
 }
 
+fn should_use_openai_oauth(model: &str, config: &LlmRouterConfig) -> bool {
+    if normalize_api_base(&config.api_base).is_some() {
+        return false;
+    }
+    if slash_provider(model) == Some("openrouter") {
+        return false;
+    }
+    if normalized_provider(&config.provider).as_deref() == Some("openrouter") {
+        return false;
+    }
+    // Routes to OAuth when the user has explicitly selected the openai
+    // provider (either via LLM_PROVIDER=openai or a model id prefixed
+    // with `openai/`). API-key paths via genai's standard OpenAI adapter
+    // still work — having an OAuth token doesn't override an explicit
+    // OPENAI_API_KEY for openrouter or custom api_base targets, since
+    // those branches return false above.
+    slash_provider(model) == Some("openai")
+        || normalized_provider(&config.provider).as_deref() == Some("openai")
+}
+
 pub fn llm_auth_mode_for_settings(settings: &Settings) -> String {
     let config = LlmRouterConfig::from_settings(settings);
     let main = auth_mode_for_model(config.model_for(false), &config);
@@ -897,6 +929,11 @@ pub fn llm_auth_mode_for_settings(settings: &Settings) -> String {
 }
 
 fn auth_mode_for_model(model: &str, config: &LlmRouterConfig) -> String {
+    if should_use_openai_oauth(model, config)
+        && crate::llm::openai_oauth::openai_oauth_available()
+    {
+        return "openai_oauth".to_string();
+    }
     if should_use_anthropic_oauth(model, config) && anthropic_oauth_available() {
         return "anthropic_oauth".to_string();
     }
@@ -926,7 +963,7 @@ fn anthropic_oauth_available() -> bool {
         || read_anthropic_oauth_tokens(&anthropic_oauth_token_file()).is_some()
 }
 
-fn anthropic_oauth_token_file() -> PathBuf {
+pub(crate) fn anthropic_oauth_token_file() -> PathBuf {
     if let Some(path) = env::var_os("LETHE_ANTHROPIC_OAUTH_TOKENS") {
         return PathBuf::from(path);
     }
@@ -1840,5 +1877,60 @@ mod tests {
         assert_eq!(target.auth_env, "ANTHROPIC_API_KEY");
         assert_eq!(target.adapter, AdapterKind::Anthropic);
         assert_eq!(target.model_name, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn openai_oauth_routes_when_provider_is_openai() {
+        let mut config = LlmRouterConfig {
+            model: "gpt-5.2".to_string(),
+            aux_model: String::new(),
+            provider: "openai".to_string(),
+            api_base: String::new(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 500,
+        };
+        assert!(should_use_openai_oauth(&config.model, &config));
+
+        config.model = "openai/gpt-5.2".to_string();
+        config.provider = String::new();
+        assert!(should_use_openai_oauth(&config.model, &config));
+    }
+
+    #[test]
+    fn openai_oauth_skips_openrouter_and_custom_api_base() {
+        // openrouter slash-prefix wins regardless of provider
+        let config = LlmRouterConfig {
+            model: "openrouter/openai/gpt-5.2".to_string(),
+            aux_model: String::new(),
+            provider: "openai".to_string(),
+            api_base: String::new(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 500,
+        };
+        assert!(!should_use_openai_oauth(&config.model, &config));
+
+        // custom api_base means the user wired their own gateway
+        let config = LlmRouterConfig {
+            model: "gpt-5.2".to_string(),
+            aux_model: String::new(),
+            provider: "openai".to_string(),
+            api_base: "http://localhost:8080/v1/".to_string(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 500,
+        };
+        assert!(!should_use_openai_oauth(&config.model, &config));
+    }
+
+    #[test]
+    fn openai_oauth_skipped_when_provider_is_unrelated() {
+        let config = LlmRouterConfig {
+            model: "claude-opus-4-6".to_string(),
+            aux_model: String::new(),
+            provider: "anthropic".to_string(),
+            api_base: String::new(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 500,
+        };
+        assert!(!should_use_openai_oauth(&config.model, &config));
     }
 }

@@ -55,8 +55,8 @@ pub async fn run() -> Result<()> {
     info(&format!("Main: {main_model}"));
     info(&format!("Aux:  {aux_model}"));
 
-    // -- API key ------------------------------------------------------------
-    let api_key = prompt_api_key(provider, &existing_env)?;
+    // -- API key (or OAuth for ChatGPT Plus/Pro) ----------------------------
+    let api_key = prompt_api_key(provider, &existing_env).await?;
 
     // -- Optional Telegram --------------------------------------------------
     let telegram = prompt_telegram(&existing_env)?;
@@ -70,7 +70,7 @@ pub async fn run() -> Result<()> {
         provider,
         &main_model,
         &aux_model,
-        &api_key,
+        api_key.as_deref(),
         telegram.as_ref(),
     )?;
     info(&format!("Wrote {}", env_path.display()));
@@ -83,7 +83,7 @@ pub async fn run() -> Result<()> {
 
     // -- Smoke test ---------------------------------------------------------
     println!("\nRunning smoke test...");
-    smoke_test(provider, &main_model, &aux_model, &api_key).await?;
+    smoke_test(provider, &main_model, &aux_model, api_key.as_deref()).await?;
 
     println!();
     success("Setup complete.");
@@ -259,8 +259,23 @@ fn pick_model(label: &str, entries: &[lethe::llm::models::ModelEntry]) -> Result
 // API key
 // =============================================================================
 
-fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<String> {
+/// Returns `None` when the user picked a no-API-key auth path (currently
+/// only ChatGPT Plus/Pro OAuth for the OpenAI provider). Caller must
+/// skip writing the API key into the .env in that case.
+async fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<Option<String>> {
     let env_name = provider.key_env();
+
+    if provider == Provider::OpenAI {
+        println!("\nOpenAI sign-in options:");
+        println!("  1) API key (platform.openai.com)");
+        println!("  2) ChatGPT Plus/Pro subscription (browser sign-in)");
+        let choice = prompt_line("Choose [1-2, default=1]: ")?;
+        if choice.trim() == "2" {
+            lethe::llm::openai_oauth::run_device_login().await?;
+            return Ok(None);
+        }
+    }
+
     let existing = std::env::var(env_name)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -274,7 +289,7 @@ fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<String> {
         println!("\nFound existing {env_name}: {}", mask_key(&key));
         let answer = prompt_line("Use it? [Y/n]: ")?;
         if !answer.trim().to_ascii_lowercase().starts_with('n') {
-            return Ok(key);
+            return Ok(Some(key));
         }
     }
     println!("\n{env_name} required.");
@@ -284,7 +299,7 @@ fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<String> {
     if key.is_empty() {
         bail!("{env_name} is required to continue");
     }
-    Ok(key)
+    Ok(Some(key))
 }
 
 fn mask_key(key: &str) -> String {
@@ -371,7 +386,7 @@ fn write_env_file(
     provider: Provider,
     main_model: &str,
     aux_model: &str,
-    api_key: &str,
+    api_key: Option<&str>,
     telegram: Option<&TelegramSetup>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -385,7 +400,12 @@ fn write_env_file(
     body.push_str(&format!("LLM_PROVIDER={}\n", provider.id()));
     body.push_str(&format!("LLM_MODEL={main_model}\n"));
     body.push_str(&format!("LLM_MODEL_AUX={aux_model}\n"));
-    body.push_str(&format!("{}={}\n\n", provider.key_env(), api_key));
+    match api_key {
+        Some(key) => body.push_str(&format!("{}={key}\n\n", provider.key_env())),
+        None => body.push_str(
+            "# Using ChatGPT Plus/Pro OAuth — tokens in ~/.lethe/credentials/\n\n",
+        ),
+    }
     if let Some(telegram) = telegram {
         body.push_str("# Telegram bot\n");
         body.push_str(&format!("TELEGRAM_BOT_TOKEN={}\n", telegram.bot_token));
@@ -435,12 +455,16 @@ async fn smoke_test(
     provider: Provider,
     main_model: &str,
     aux_model: &str,
-    api_key: &str,
+    api_key: Option<&str>,
 ) -> Result<()> {
     // Apply the new config in-process so the smoke test reflects what the
-    // user will actually run with on the next invocation.
+    // user will actually run with on the next invocation. When the user
+    // picked the OAuth path, leave the api-key env var alone — the
+    // OpenAI OAuth client picks tokens up from the credentials file.
     unsafe {
-        std::env::set_var(provider.key_env(), api_key);
+        if let Some(key) = api_key {
+            std::env::set_var(provider.key_env(), key);
+        }
         std::env::set_var("LLM_PROVIDER", provider.id());
         std::env::set_var("LLM_MODEL", main_model);
         std::env::set_var("LLM_MODEL_AUX", aux_model);
