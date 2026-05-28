@@ -61,7 +61,7 @@ fn thinking_line(tick: u64) -> Line<'static> {
             "thinking…",
             Style::default()
                 .fg(Color::Yellow)
-                .add_modifier(Modifier::DIM),
+                ,
         ),
     ])
 }
@@ -93,7 +93,7 @@ fn render_item(item: &TranscriptItem, width: u16, lines: &mut Vec<Line<'static>>
         TranscriptItem::Notice { content, .. } => {
             lines.push(Line::from(Span::styled(
                 format!("· {content}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )));
         }
     }
@@ -167,11 +167,11 @@ fn render_tool(call: &ToolCall, lines: &mut Vec<Line<'static>>) {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             call.args_preview.clone(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
     }
     if !trailer.is_empty() {
-        spans.push(Span::styled(trailer, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(trailer, Style::default().fg(Color::Gray)));
     }
     lines.push(Line::from(spans));
 

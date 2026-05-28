@@ -65,7 +65,7 @@ pub fn focus_border(app: &AppState, pane: Pane) -> Block<'_> {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     };
     Block::default().borders(Borders::ALL).border_style(style)
 }

@@ -73,7 +73,7 @@ impl RenderState {
                 self.block_break();
                 self.current.push(Span::styled(
                     "▍ ",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 ));
             }
             Tag::Link { .. } => {}

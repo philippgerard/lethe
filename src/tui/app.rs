@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -242,7 +242,7 @@ fn make_editor() -> TextArea<'static> {
     editor.set_block(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(Color::Gray)),
     );
     editor.set_cursor_line_style(Style::default());
     editor.set_placeholder_text("Ask anything. /help for commands. @ to insert a workspace file.");
@@ -260,8 +260,31 @@ async fn handle_terminal_event(
         CtEvent::Key(key) if key.kind == KeyEventKind::Press => {
             handle_key(key, app, editor, autocomplete, cmd_tx).await
         }
+        CtEvent::Mouse(mouse) => {
+            handle_mouse(mouse, app);
+            false
+        }
         CtEvent::Resize(_, _) => false,
         _ => false,
+    }
+}
+
+/// Mouse wheel always scrolls the transcript; click-to-focus is left to
+/// the keyboard so click drag-selects in the user's terminal still work
+/// for copy/paste.
+fn handle_mouse(mouse: MouseEvent, app: &mut AppState) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => scroll_transcript(app, 3, true),
+        MouseEventKind::ScrollDown => scroll_transcript(app, 3, false),
+        _ => {}
+    }
+}
+
+fn scroll_transcript(app: &mut AppState, lines: u16, up: bool) {
+    if up {
+        app.transcript_scroll = app.transcript_scroll.saturating_add(lines);
+    } else {
+        app.transcript_scroll = app.transcript_scroll.saturating_sub(lines);
     }
 }
 
@@ -293,17 +316,41 @@ async fn handle_key(
                 return false;
             }
         }
+        // Scroll the transcript regardless of focus — these don't
+        // overlap with anything in the editor or text pane.
+        KeyCode::PageUp => {
+            scroll_transcript(app, 10, true);
+            return false;
+        }
+        KeyCode::PageDown => {
+            scroll_transcript(app, 10, false);
+            return false;
+        }
+        KeyCode::Up if ctrl => {
+            scroll_transcript(app, 2, true);
+            return false;
+        }
+        KeyCode::Down if ctrl => {
+            scroll_transcript(app, 2, false);
+            return false;
+        }
+        KeyCode::Home if ctrl => {
+            app.transcript_scroll = u16::MAX;
+            return false;
+        }
+        KeyCode::End if ctrl => {
+            app.transcript_scroll = 0;
+            return false;
+        }
         _ => {}
     }
 
     if app.focused_pane != Pane::Editor {
-        match (key.code, ctrl) {
-            (KeyCode::Up, _) => app.transcript_scroll = app.transcript_scroll.saturating_add(2),
-            (KeyCode::Down, _) => app.transcript_scroll = app.transcript_scroll.saturating_sub(2),
-            (KeyCode::PageUp, _) => app.transcript_scroll = app.transcript_scroll.saturating_add(20),
-            (KeyCode::PageDown, _) => {
-                app.transcript_scroll = app.transcript_scroll.saturating_sub(20)
-            }
+        match key.code {
+            KeyCode::Up => scroll_transcript(app, 2, true),
+            KeyCode::Down => scroll_transcript(app, 2, false),
+            KeyCode::Home => app.transcript_scroll = u16::MAX,
+            KeyCode::End => app.transcript_scroll = 0,
             _ => {}
         }
         return false;

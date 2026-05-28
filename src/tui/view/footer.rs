@@ -56,13 +56,13 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             message.clone(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ));
     }
     spans.push(Span::raw("    "));
     spans.push(Span::styled(
         "Tab cycle · Ctrl-B sidebar · Ctrl-C quit · /help",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

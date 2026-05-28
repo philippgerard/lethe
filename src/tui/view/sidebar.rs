@@ -34,7 +34,7 @@ fn draw_actors(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if app.actors.is_empty() {
         lines.push(Line::from(Span::styled(
             "no actors",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
     } else {
         // Group parents first, then children under them.
@@ -77,7 +77,7 @@ fn actor_line(actor: &ActorRow, indent: bool) -> Line<'static> {
         "terminated" => match actor.outcome.as_deref() {
             Some("success") => Color::Green,
             Some("failure" | "killed" | "max_turns") => Color::Red,
-            _ => Color::DarkGray,
+            _ => Color::Gray,
         },
         _ => Color::Gray,
     };
@@ -101,7 +101,7 @@ fn actor_line(actor: &ActorRow, indent: bool) -> Line<'static> {
         Span::raw(" "),
         Span::styled(
             short_id(&actor.id),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
     ])
 }
@@ -124,7 +124,7 @@ fn draw_todos(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if app.todos.is_empty() {
         lines.push(Line::from(Span::styled(
             "no todos",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
     } else {
         for todo in &app.todos {
@@ -141,12 +141,12 @@ fn todo_line(todo: &TodoRow) -> Line<'static> {
             "▣",
             Style::default()
                 .fg(Color::Green)
-                .add_modifier(Modifier::DIM),
+                ,
         ),
         "cancelled" => (
             "▢",
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(Color::Gray)
                 .add_modifier(Modifier::CROSSED_OUT),
         ),
         _ => ("▢", Style::default().fg(Color::Yellow)),
@@ -155,7 +155,7 @@ fn todo_line(todo: &TodoRow) -> Line<'static> {
         "high" => Style::default()
             .fg(Color::Red)
             .add_modifier(Modifier::BOLD),
-        "low" => Style::default().fg(Color::DarkGray),
+        "low" => Style::default().fg(Color::Gray),
         _ => Style::default().fg(Color::Gray),
     };
     let due = todo
@@ -168,6 +168,6 @@ fn todo_line(todo: &TodoRow) -> Line<'static> {
         Span::raw(" "),
         Span::styled(format!("{:>4} ", todo.priority), priority_style),
         Span::raw(todo.title.clone()),
-        Span::styled(due, Style::default().fg(Color::DarkGray)),
+        Span::styled(due, Style::default().fg(Color::Gray)),
     ])
 }
