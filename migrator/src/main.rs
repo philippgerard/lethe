@@ -1,8 +1,8 @@
 //! `lethe-migrate` — one-shot migrator from Lethe's legacy LanceDB
 //! storage to the SQLite-vec storage shipped in v0.19.0+. See
-//! `../../MIGRATION-SPEC.md` for the contract this implements.
+//! `../../MIGRATION.md` for the user-facing workflow.
 //!
-//! Exit codes (per spec §9):
+//! Exit codes:
 //!   0  success and verification passed
 //!   1  usage / argument error
 //!   2  source data missing or unreadable

@@ -4,7 +4,7 @@ One-shot migrator from Lethe's legacy LanceDB storage (v0.18.0 and earlier) to t
 
 This is a **standalone Cargo project**, intentionally not a workspace member of the parent `lethe` crate — the migrator pulls in the LanceDB and Arrow stacks that Lethe itself has dropped, and we don't want either side to inherit the other's dependency tree. The empty `[workspace]` table at the top of `Cargo.toml` keeps Cargo from walking up.
 
-The full data contract — old/new schemas, row mapping, edge cases, verification — is in [`../MIGRATION-SPEC.md`](../MIGRATION-SPEC.md). This README is just usage.
+For the user-facing migration workflow see [`../MIGRATION.md`](../MIGRATION.md). The data contract (old/new schemas, row mapping, edge cases, verification) lives in the migrator source.
 
 ## Build
 

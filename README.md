@@ -7,7 +7,7 @@
 
 Lethe is a long-running personal AI assistant with a brain-inspired cognitive architecture: cortex, hippocampus, brainstem, and a default-mode network running as cooperating actors. She has continuous memory across sessions, notices things on her own, delegates to focused subagents, and can read her own source — propose changes to it, restart herself with new logic. Lives on your machine as a systemd service. Persists across reboots, models, hardware upgrades.
 
-**Written in Rust** as a single static binary. No Python runtime, no virtualenv pinball, no dependency drift between hosts. Fast cold-start, predictable memory, no GC pauses during a tool loop. The runtime ships as one ~50 MB executable plus a small migrator for legacy data. Uses `genai` as the universal LLM router and intentionally has no web console.
+Written in Rust as a single ~50 MB static binary. Routes LLM traffic through `genai`. Intentionally has no web console.
 
 ## Quickstart
 
@@ -57,7 +57,7 @@ Sanity-check an existing setup any time with `lethe check` — it pings the mode
        v                +----------------+
  Memory Stack                            |
  markdown blocks,                       v
- notes, LanceDB archive,       DMN + heartbeat
+ notes, SQLite-vec index,     DMN + heartbeat
  message history              background thought
                         |
                         v
@@ -87,8 +87,6 @@ cp .env.example .env
 cargo build --release
 target/release/lethe check
 ```
-
-The LanceDB dependency builds protobuf bindings, so the host needs `protoc` and protobuf headers available.
 
 Native installer:
 
@@ -199,7 +197,7 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `OPENAI_AUTH_TOKEN` | Optional OpenAI OAuth access token (raw) | unset |
 | `LETHE_OPENAI_OAUTH_TOKENS` | Optional OpenAI OAuth token file | `$CREDENTIALS_DIR/openai_oauth_tokens.json` |
 | `EXA_API_KEY` | Exa search/fetch tools | unset |
-| `LETHE_SEMANTIC_SEARCH_ENABLED` | Enable LanceDB vector search | `true` |
+| `LETHE_SEMANTIC_SEARCH_ENABLED` | Enable vector recall (fallback is keyword search) | `true` |
 | `LETHE_EMBEDDING_PROVIDER` | `fastembed` or `hash` | `fastembed` |
 | `LETHE_EMBEDDING_MODEL` | FastEmbed model id | `Snowflake/snowflake-arctic-embed-m-v2.0` |
 | `ACTORS_ENABLED` | Enable actor/subagent system | `true` |
@@ -225,9 +223,9 @@ Lethe stores runtime state under the workspace and data directories:
 - `$MEMORY_DIR/lethe-memory.db` -- SQLite-vec database with `memory` (archival + notes, with `note-<uuid>` and `mem-<uuid>` ids), `message_history`, and their `*_vec` virtual siblings for embedding search.
 - SQLite database at `$DB_PATH` -- todos.
 
-The legacy LanceDB layout at `$MEMORY_DIR/lancedb/` is what `lethe-migrate` reads from when upgrading a pre-0.19 install — see the *Migrating from v0.18* section below.
-
 Core memory block defaults and prompt templates are embedded into the binary, so `lethe check` and first startup work without copying prompt files into the workspace.
+
+Upgrading from a pre-0.19 install? See [`MIGRATION.md`](MIGRATION.md) for the one-shot `lethe-migrate` workflow that moves legacy LanceDB data into the new layout.
 
 ## Backup & Restore
 
@@ -248,37 +246,6 @@ lethe restore archive.tgz --yes          # skip prompts (for scripts / non-TTY)
 ```
 
 Restore prompts before overwriting an existing **workspace** and again before overwriting an existing **`.env`** — declining either keeps the local copy intact. Memory and history are restored unconditionally (that is the point of restoring).
-
-## Migrating from v0.18 (LanceDB → SQLite-vec)
-
-v0.19 moved memory storage from LanceDB to SQLite-vec. If you ran a pre-0.19 Lethe, use the one-shot `lethe-migrate` tool to copy your `archival_memory`, `message_history`, and `notes` into the new layout.
-
-`install.sh` and binary release tarballs ship `lethe-migrate` alongside `lethe`, so if you installed Lethe through the installer you already have it at `~/.lethe/bin/lethe-migrate`. Source builders can build it explicitly with `cargo build --release --manifest-path migrator/Cargo.toml` — it's a standalone Cargo project so the Arrow/LanceDB stack stays out of the main `lethe` build.
-
-**Recommended workflow** (no destructive step until you've verified):
-
-```bash
-# 1. Dry-run: writes to lethe-memory.db.dryrun, runs full verification.
-lethe-migrate \
-  --lancedb-dir  ~/.lethe/data/memory/lancedb \
-  --sqlite-path  ~/.lethe/data/memory/lethe-memory.db \
-  --dry-run
-
-# 2. Inspect the dry-run file if you want, then run for real.
-lethe-migrate \
-  --lancedb-dir  ~/.lethe/data/memory/lancedb \
-  --sqlite-path  ~/.lethe/data/memory/lethe-memory.db
-
-# 3. Smoke-test the new storage.
-lethe check
-lethe memory recall -m "<something you remember>"
-
-# 4. The old LanceDB directory is never touched. After step 3 looks good,
-#    back it up, move it, or delete it — the migrator prints the full
-#    path on success.
-```
-
-Flags: `--dry-run`, `--force` (overwrite an existing destination), `--embedding-dim N` (override the 768-dim guard if you used a non-default embedding model). Exit codes and the full data contract are in [`migrator/README.md`](migrator/) and [`MIGRATION-SPEC.md`](MIGRATION-SPEC.md).
 
 ## Logging
 
