@@ -23,6 +23,24 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+# Container-first deployments run their own copy of the binary baked into
+# the image, so updating the host binary doesn't touch the running
+# container. If one is present, tell the user how to roll the new version in.
+post_update_notice() {
+    local has_container=0
+    if [ -f "$HOME/.config/systemd/user/lethe-container.service" ] \
+       || [ -f "$HOME/Library/LaunchAgents/com.lethe.container.plist" ]; then
+        has_container=1
+    elif command -v podman >/dev/null 2>&1 && podman container exists lethe 2>/dev/null; then
+        has_container=1
+    fi
+    if [ "$has_container" = "1" ]; then
+        echo ""
+        warn "A container deployment is still running the previous version."
+        warn "Roll the update into it with:  $BIN_DIR/lethe container up --rebuild"
+    fi
+}
+
 detect_release_target() {
     local os arch
     os="$(uname -s)"
@@ -81,6 +99,7 @@ install_release_binary() {
 }
 
 if [ "${LETHE_UPDATE_FROM_SOURCE:-0}" != "1" ] && install_release_binary; then
+    post_update_notice
     exit 0
 fi
 
@@ -109,3 +128,4 @@ cp "$INSTALL_DIR/target/release/lethe" "$BIN_DIR/lethe"
 chmod +x "$BIN_DIR/lethe"
 
 success "Updated $BIN_DIR/lethe"
+post_update_notice

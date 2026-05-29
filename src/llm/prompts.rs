@@ -101,32 +101,74 @@ fn prompt_file_name(name: &str) -> String {
     }
 }
 
+/// Prompt templates that ship with an embedded default AND are loaded through
+/// [`PromptStore`]. A file at `<workspace>/prompts/<name>.md` (or
+/// `<config_dir>/prompts/`) overrides each of these at load time — they are
+/// exactly the set `lethe prompts export` writes out for editing. Prompts that
+/// are `include_str!`'d directly into other modules are compiled in and are
+/// not overridable, so they are intentionally absent here.
+pub const EMBEDDED_PROMPTS: &[(&str, &str)] = &[
+    (
+        "agent_instructions",
+        include_str!("../../config/prompts/agent_instructions.md"),
+    ),
+    (
+        "llm_summarize",
+        include_str!("../../config/prompts/llm_summarize.md"),
+    ),
+    (
+        "llm_summarize_update",
+        include_str!("../../config/prompts/llm_summarize_update.md"),
+    ),
+    (
+        "llm_summarize_system",
+        include_str!("../../config/prompts/llm_summarize_system.md"),
+    ),
+    (
+        "notification_review",
+        include_str!("../../config/prompts/notification_review.md"),
+    ),
+    (
+        "heartbeat_message",
+        include_str!("../../config/prompts/heartbeat_message.md"),
+    ),
+    (
+        "heartbeat_message_full",
+        include_str!("../../config/prompts/heartbeat_message_full.md"),
+    ),
+    (
+        "heartbeat_summarize",
+        include_str!("../../config/prompts/heartbeat_summarize.md"),
+    ),
+    (
+        "llm_heartbeat_system",
+        include_str!("../../config/prompts/llm_heartbeat_system.md"),
+    ),
+    (
+        "hippocampus_relevance",
+        include_str!("../../config/prompts/hippocampus_relevance.md"),
+    ),
+    (
+        "hippocampus_analyze",
+        include_str!("../../config/prompts/hippocampus_analyze.md"),
+    ),
+    (
+        "notes_extract",
+        include_str!("../../config/prompts/notes_extract.md"),
+    ),
+];
+
+/// The overridable prompt templates as `(name, embedded_text)` pairs.
+pub fn embedded_prompts() -> &'static [(&'static str, &'static str)] {
+    EMBEDDED_PROMPTS
+}
+
 fn embedded_prompt(name: &str) -> Option<&'static str> {
-    match name.trim_end_matches(".md") {
-        "agent_instructions" => Some(include_str!("../../config/prompts/agent_instructions.md")),
-        "llm_summarize" => Some(include_str!("../../config/prompts/llm_summarize.md")),
-        "llm_summarize_update" => {
-            Some(include_str!("../../config/prompts/llm_summarize_update.md"))
-        }
-        "llm_summarize_system" => {
-            Some(include_str!("../../config/prompts/llm_summarize_system.md"))
-        }
-        "notification_review" => Some(include_str!("../../config/prompts/notification_review.md")),
-        "heartbeat_message" => Some(include_str!("../../config/prompts/heartbeat_message.md")),
-        "heartbeat_message_full" => Some(include_str!(
-            "../../config/prompts/heartbeat_message_full.md"
-        )),
-        "heartbeat_summarize" => Some(include_str!("../../config/prompts/heartbeat_summarize.md")),
-        "llm_heartbeat_system" => {
-            Some(include_str!("../../config/prompts/llm_heartbeat_system.md"))
-        }
-        "hippocampus_relevance" => Some(include_str!(
-            "../../config/prompts/hippocampus_relevance.md"
-        )),
-        "hippocampus_analyze" => Some(include_str!("../../config/prompts/hippocampus_analyze.md")),
-        "notes_extract" => Some(include_str!("../../config/prompts/notes_extract.md")),
-        _ => None,
-    }
+    let key = name.trim_end_matches(".md");
+    EMBEDDED_PROMPTS
+        .iter()
+        .find(|(n, _)| *n == key)
+        .map(|(_, text)| *text)
 }
 
 #[cfg(test)]

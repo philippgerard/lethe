@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+#
+# Regenerate the animated ASCII avatar (src/cli/avatar_frames.ansi).
+#
+# Pipeline:
+#   1. Veo (Gemini API) image-to-video from lethe-website/lethe-avatar.png —
+#      the wireframe woman with her hair flowing. Needs GEMINI_API_KEY and the
+#      `google-genai` Python SDK (`pip install google-genai`).
+#   2. ffmpeg extracts ~28 evenly-spaced frames, cropped to the head.
+#   3. chafa converts each frame to truecolor Unicode symbols.
+#   4. Frames are concatenated, separated by form-feed (\f), into the .ansi
+#      file that `src/cli/avatar.rs` embeds and plays.
+#
+# Re-run only when you want to refresh the animation; the committed
+# avatar_frames.ansi is what ships, so this is not part of the build.
+#
+# Usage: scripts/gen-avatar-frames [path/to/clip.mp4]
+#   With no argument, generates a fresh clip via Veo into /tmp/lethe-veo.mp4.
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+SRC_IMG="$ROOT/../lethe-website/lethe-avatar.png"
+MP4="${1:-/tmp/lethe-veo.mp4}"
+OUT="$ROOT/src/cli/avatar_frames.ansi"
+CROP="crop=in_w*0.82:in_h:(in_w-in_w*0.82)/2:0"
+
+command -v ffmpeg  >/dev/null || { echo "ffmpeg required"; exit 1; }
+command -v chafa   >/dev/null || { echo "chafa required (dnf/apt install chafa)"; exit 1; }
+command -v magick  >/dev/null || { echo "ImageMagick (magick) required"; exit 1; }
+
+if [ ! -f "$MP4" ]; then
+    echo "Generating video with Veo (Gemini API)…"
+    SRC_IMG="$SRC_IMG" OUT_MP4="$MP4" python3 - <<'PY'
+import os, time
+from google import genai
+from google.genai import types
+key = os.environ.get("GEMINI_API_KEY", "").strip()
+assert key, "set GEMINI_API_KEY"
+client = genai.Client(api_key=key)
+prompt = (
+  "A minimalist single-line teal wireframe illustration of a woman's head in "
+  "profile on a pure black background. Her long hair is drawn with fine glowing "
+  "teal contour lines that drift and flow gently and continuously, like strands "
+  "moving in a soft breeze. The head stays perfectly still; no camera movement — "
+  "only the hair lines ripple and flow. Keep the exact delicate teal-on-black "
+  "wireframe art style. Seamless loop."
+)
+op = client.models.generate_videos(
+    model="veo-3.1-generate-preview", prompt=prompt,
+    image=types.Image(image_bytes=open(os.environ["SRC_IMG"], "rb").read(), mime_type="image/png"),
+    config=types.GenerateVideosConfig(aspect_ratio="16:9", resolution="720p", number_of_videos=1),
+)
+while not op.done:
+    time.sleep(10); op = client.operations.get(op)
+v = op.response.generated_videos[0].video
+client.files.download(file=v); v.save(os.environ["OUT_MP4"])
+print("saved", os.environ["OUT_MP4"])
+PY
+fi
+
+echo "Extracting frames + converting with chafa…"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+ffmpeg -y -loglevel error -i "$MP4" -vf "${CROP},select=not(mod(n\,7))" -vsync 0 "$TMP/f%03d.png"
+
+: > "$OUT"
+first=1
+for f in "$TMP"/f*.png; do
+    [ $first -eq 1 ] || printf '\f' >> "$OUT"
+    first=0
+    # Black background -> transparent so chafa's --fg-only render shows the
+    # terminal's own background (no baked black), keeping only the teal lines.
+    magick "$f" -fuzz 10% -transparent black "$TMP/t.png"
+    chafa --format symbols --colors full --fg-only --size 44x22 "$TMP/t.png" \
+        | sed -e 's/\x1b\[?25l//g' -e 's/\x1b\[?25h//g' >> "$OUT"
+done
+echo "Wrote $OUT ($(wc -c < "$OUT") bytes, $(($(grep -c $'\f' "$OUT")+1)) frames)"

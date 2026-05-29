@@ -35,8 +35,7 @@ use crate::config::Settings;
 const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/";
 const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/";
 const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/";
-pub(crate) const ANTHROPIC_OAUTH_TOKEN_URL: &str =
-    "https://console.anthropic.com/v1/oauth/token";
+pub(crate) const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 pub(crate) const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_CODE_VERSION: &str = "2.1.117";
@@ -301,9 +300,7 @@ impl LlmRouter {
             return oauth
                 .exec_chat_request_stream(model, request, &options, on_delta)
                 .await
-                .with_context(|| {
-                    format!("LLM streaming chat request failed for model {model}")
-                });
+                .with_context(|| format!("LLM streaming chat request failed for model {model}"));
         }
         if let Some(oauth) = &self.anthropic_oauth
             && should_use_anthropic_oauth(model, &self.config)
@@ -311,9 +308,7 @@ impl LlmRouter {
             return oauth
                 .exec_chat_request_stream(model, request, &options, on_delta)
                 .await
-                .with_context(|| {
-                    format!("LLM streaming chat request failed for model {model}")
-                });
+                .with_context(|| format!("LLM streaming chat request failed for model {model}"));
         }
         // Non-streaming fallback (genai-native path). Emit one delta with
         // the full text so streaming clients still see it via on_delta.
@@ -498,7 +493,9 @@ impl AnthropicOAuthClient {
             .await
         {
             Ok(response) => Ok(response),
-            Err(AnthropicOAuthError::RateLimited { .. } | AnthropicOAuthError::Transient { .. }) => {
+            Err(
+                AnthropicOAuthError::RateLimited { .. } | AnthropicOAuthError::Transient { .. },
+            ) => {
                 // Pre-stream failure (rate limit / network blip before we
                 // got bytes back) — let the non-streaming path retry and
                 // surface the full text in one delta.
@@ -1108,8 +1105,7 @@ pub fn llm_auth_mode_for_settings(settings: &Settings) -> String {
 }
 
 fn auth_mode_for_model(model: &str, config: &LlmRouterConfig) -> String {
-    if should_use_openai_oauth(model, config)
-        && crate::llm::openai_oauth::openai_oauth_available()
+    if should_use_openai_oauth(model, config) && crate::llm::openai_oauth::openai_oauth_available()
     {
         return "openai_oauth".to_string();
     }
@@ -1135,7 +1131,7 @@ fn auth_mode_for_model(model: &str, config: &LlmRouterConfig) -> String {
     }
 }
 
-fn anthropic_oauth_available() -> bool {
+pub fn anthropic_oauth_available() -> bool {
     env::var("ANTHROPIC_AUTH_TOKEN")
         .map(|token| !token.trim().is_empty())
         .unwrap_or(false)
@@ -1640,10 +1636,7 @@ impl AnthropicStreamState {
                 }
             }
             "content_block_start" => {
-                let index = payload
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let block = payload.get("content_block").cloned().unwrap_or(Value::Null);
                 let kind = block
                     .get("type")
@@ -1681,10 +1674,7 @@ impl AnthropicStreamState {
                 }
             }
             "content_block_delta" => {
-                let index = payload
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0) as usize;
+                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let delta = payload.get("delta").cloned().unwrap_or(Value::Null);
                 let delta_type = delta
                     .get("type")
@@ -1801,9 +1791,7 @@ impl AnthropicStreamState {
             }
         }
         let requested = normalize_anthropic_model(&self.requested_model);
-        let provider = self
-            .provider_model
-            .unwrap_or_else(|| requested.clone());
+        let provider = self.provider_model.unwrap_or_else(|| requested.clone());
         ChatResponse {
             content: MessageContent::from_parts(parts),
             reasoning_content: None,

@@ -9,12 +9,12 @@ use thiserror::Error;
 use crate::memory::message_metadata::{MessageKind, MessageVisibility, annotate_value};
 
 mod formatting;
-pub use formatting::{
-    image_mime_type_from_path, is_emoji_only_reply, split_telegram_messages, telegram_parse_mode,
-};
 use formatting::{
     error_payload, expand_tilde, filename_from_url, image_extension_for_mime,
-    is_invalid_reaction_error, safe_file_name,
+    is_invalid_reaction_error, markdown_to_telegram_html, safe_file_name,
+};
+pub use formatting::{
+    image_mime_type_from_path, is_emoji_only_reply, split_telegram_messages, telegram_parse_mode,
 };
 
 #[derive(Debug, Error)]
@@ -80,16 +80,21 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> TelegramResult<i64> {
-        // Try Markdown first so **bold**, `code`, etc. render. Telegram returns
-        // 400 with a parse error when the markdown is malformed (unbalanced
-        // backticks, stray brackets); fall back to plain text in that case so
-        // the user still sees the message.
-        match self.send_message_with_mode(chat_id, text, Some("Markdown")).await {
+        // Convert the model's GitHub-flavored markdown to Telegram's HTML
+        // subset so **bold**, lists, `code`, and links actually render.
+        // Legacy `Markdown` mode only understands single-`*` and chokes on
+        // GitHub markdown, silently degrading to literal asterisks. If HTML
+        // still fails to parse, fall back to the original plain text.
+        let html = markdown_to_telegram_html(text);
+        match self
+            .send_message_with_mode(chat_id, &html, Some("HTML"))
+            .await
+        {
             Ok(id) => Ok(id),
             Err(error) if is_parse_entity_error(&error) => {
                 tracing::warn!(
                     error = %error,
-                    "Telegram rejected Markdown parse, retrying as plain text"
+                    "Telegram rejected HTML parse, retrying as plain text"
                 );
                 self.send_message_with_mode(chat_id, text, None).await
             }
@@ -707,7 +712,6 @@ impl IncomingTelegramSticker {
     }
 }
 
-
 impl IncomingTelegramReaction {
     pub fn content(&self) -> String {
         format!(
@@ -1268,7 +1272,6 @@ pub fn set_message_reaction_blocking(
         Err(error) => Err(error),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

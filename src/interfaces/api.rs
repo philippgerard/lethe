@@ -21,7 +21,7 @@ use crate::actor::ActorEvent;
 use crate::agent::{Agent, TurnRequest};
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
-use crate::llm::models::{available_providers, provider_for_model};
+use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
 use crate::scheduler::brainstem::{BrainstemEmission, BrainstemHandle};
 use crate::todos::{TodoFilter, TodoPriority, TodoStatus};
@@ -739,9 +739,20 @@ async fn model_post(
     if let Some(response) = require_auth(&state, &headers) {
         return response;
     }
+    // Normalize bare OpenRouter ids (`vendor/model` -> `openrouter/vendor/model`)
+    // against the configured provider, matching the persisted `lethe model` path.
+    let provider = state.settings.llm.llm_provider.trim();
+    let model = body
+        .model
+        .as_deref()
+        .map(|id| normalize_model_id(provider, id));
+    let model_aux = body
+        .model_aux
+        .as_deref()
+        .map(|id| normalize_model_id(provider, id));
     let changed = match state
         .agent
-        .reconfigure_models(body.model.as_deref(), body.model_aux.as_deref())
+        .reconfigure_models(model.as_deref(), model_aux.as_deref())
     {
         Ok(changed) => changed,
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),

@@ -5,25 +5,38 @@
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 ![Swiss Made Software](https://img.shields.io/badge/swiss%20made-software-red?style=flat-square&labelColor=FF0000&logoColor=white)
 
-Lethe is a long-running personal AI assistant with a brain-inspired cognitive architecture: cortex, hippocampus, brainstem, and a default-mode network running as cooperating actors. She has continuous memory across sessions, notices things on her own, delegates to focused subagents, and can read her own source — propose changes to it, restart herself with new logic. Lives on your machine as a systemd service. Persists across reboots, models, hardware upgrades.
+Lethe is a long-running personal AI assistant with a brain-inspired cognitive architecture: cortex, hippocampus, brainstem, and a default-mode network running as cooperating actors. She has continuous memory across sessions, notices things on her own, delegates to focused subagents, and can read her own source — propose changes to it, restart herself with new logic. Lives on your machine as an isolated, rootless container (or, with `--yolo`, natively as a systemd/launchd service). Persists across reboots, models, hardware upgrades.
 
 Written in Rust as a single ~50 MB static binary. Routes LLM traffic through `genai`. Intentionally has no web console.
 
 ## Quickstart
 
 ```bash
-# 1. Build (or download a binary from Releases)
-cargo build --release
-install -m 755 target/release/lethe ~/.local/bin/lethe
-
-# 2. Set up — interactive prompts for provider, model, API key, workspace
-lethe init
-
-# 3. Chat
-lethe chat -m "hello"
+# Download the latest release and run the setup wizard
+curl -fsSL https://lethe.gg/install | bash
 ```
 
-`lethe init` writes `~/.lethe/config/.env`, seeds the workspace and core memory blocks, and runs a smoke test against the LLM and embedding pipeline before declaring success. If you'd rather configure by hand, copy `.env.example` and edit. The first turn that uses recall/notes triggers a one-time ~150MB download of the embedding runtime and model (progress is shown).
+The installer drops a prebuilt binary at `~/.lethe/bin/lethe` and hands off to `lethe init`, which walks you through provider, model, API key, and identity — then deploys Lethe as an **isolated, rootless container** (the default: Podman on Linux, Apple Container on macOS, installed for you if missing). Pass `--yolo` to skip the container and run natively on the host instead.
+
+Prefer to build from source?
+
+```bash
+git clone https://github.com/atemerev/lethe.git
+cd lethe
+cargo build --release
+install -m 755 target/release/lethe ~/.local/bin/lethe
+lethe init            # add --yolo for a native (uncontained) setup
+```
+
+`lethe init` writes `~/.lethe/config/.env`, seeds the workspace and core memory blocks, and runs a smoke test against the LLM and embedding pipeline before declaring success. It runs **non-interactively** when stdin isn't a terminal (Docker/CI): pass `--provider`/`--model`/`--aux-model` and supply the key via the provider's env var (e.g. `OPENROUTER_API_KEY`). If you'd rather configure by hand, copy `.env.example` and edit. The first turn that uses recall/notes triggers a one-time ~150MB download of the embedding runtime and model (progress is shown).
+
+Then check on her:
+
+```bash
+lethe                 # status: version + current config (no live probes)
+lethe check           # live health check (LLM + embeddings)
+lethe chat -m "hello" # one-off message straight to the model
+```
 
 To sign in (or re-auth) a single provider without re-running the full wizard, use `lethe login`:
 
@@ -108,39 +121,52 @@ Browser automation uses the external `agent-browser` CLI when browser tools are 
 
 ## Running
 
-CLI check is the default when `LETHE_MODE` is unset:
+Lethe's default home is an isolated, rootless container managed as a background service — `lethe init` sets that up for you. The CLI drives and inspects the whole deployment.
+
+**Deploy & manage**
 
 ```bash
-target/release/lethe check
+lethe run                      # run in the foreground here (Ctrl-C to stop); --yolo for native
+lethe service install --now    # install + start the background service (systemd user unit / launchd agent)
+lethe service status           # platform, unit path, live status
+lethe container up             # build image (if needed), create the container, install + start the service
+lethe container status         # engine, container state, shared mounts
+lethe container logs -f        # follow the container logs
+lethe container shell          # root shell inside the running container
+lethe container up --rebuild   # rebuild the image and recreate the container
+lethe container down           # stop the container
+lethe uninstall                # remove the service/container (add --purge to also delete ~/.lethe)
 ```
 
-Recommended deployment: a single `lethe api` process hosts the HTTP/SSE
-transport **and** the Telegram poller (when `TELEGRAM_BOT_TOKEN` is set)
-in the same address space, sharing one Agent, one actor registry, and
-one Brainstem (the sole source of heartbeats / proactive emissions —
-transports just subscribe and forward).
+Share extra host directories with the container via `lethe container up --mount host[:container]` (repeatable; persisted).
+
+**Reach her**
 
 ```bash
-LETHE_API_TOKEN=change-me target/release/lethe api
-# or override the port:
-target/release/lethe api --port 1373
+lethe transport list                       # API + Telegram channels and their status
+lethe transport api --port 1373 --token    # configure the local HTTP API (powers the TUI); --token mints a fresh one
+lethe transport telegram --enable          # configure + enable the Telegram bot
 ```
 
-API mode binds to `LETHE_API_HOST` (`127.0.0.1` by default) on
-`LETHE_API_PORT` (`1373`). Use a reverse proxy for remote access.
+Under the hood a single `lethe api` process hosts the HTTP/SSE transport **and** the Telegram poller (when `TELEGRAM_BOT_TOKEN` is set) in the same address space, sharing one Agent, one actor registry, and one Brainstem (the sole source of heartbeats / proactive emissions — transports just subscribe and forward). API mode binds to `LETHE_API_HOST` (`127.0.0.1` by default) on `LETHE_API_PORT` (`1373`); use a reverse proxy for remote access.
 
-The standalone subcommands still work when you want a single transport:
+**Configure on the fly**
 
 ```bash
-target/release/lethe telegram run    # Telegram poller only
-target/release/lethe tui              # connect a TUI to a running api
+lethe status                   # version + current config, secrets censored (this is also the bare `lethe`)
+lethe identity set --name "…"  # change who she is (name + persona); `lethe identity edit` opens $EDITOR
+lethe model                    # show current model + catalog; `lethe model <id>` or `--pick` to change
+lethe login anthropic          # (re-)auth a single provider
+lethe completions fish         # print a shell completion script
 ```
+
+Add `--config <PATH>` to any command to point at a different `.env`. Low-level/debug subcommands (`memory`, `fs`, `sh`, `todo`, `agent`, …) are hidden but still work — `lethe help <command>`.
 
 ### Terminal UI
 
 ```bash
-target/release/lethe tui                                # local API
-target/release/lethe tui --url http://host:1373 --token $LETHE_API_TOKEN
+lethe tui                                       # local API
+lethe tui --url http://host:1373 --token $LETHE_API_TOKEN
 ```
 
 Inline tool cards, an actors/todos sidebar, streaming assistant text
@@ -188,6 +214,8 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 |----------|-------------|---------|
 | `LETHE_MODE` | `cli`, `telegram`, or `api` | `cli` |
 | `LETHE_HOME` | Runtime root | `~/.lethe` |
+| `LETHE_AGENT_NAME` | Assistant name (see `lethe identity`) | `lethe` |
+| `LETHE_CONFIG_FILE` | Config `.env` path (also `--config`) | `$LETHE_HOME/config/.env` |
 | `WORKSPACE_DIR` | Workspace directory | `$LETHE_HOME/workspace` |
 | `MEMORY_DIR` | Memory data directory | `$LETHE_HOME/data/memory` |
 | `DB_PATH` | SQLite todo database path | `$LETHE_HOME/data/lethe.db` |

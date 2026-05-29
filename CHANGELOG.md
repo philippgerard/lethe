@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.22.0 - Container-first CLI
+
+- **Isolated container by default**: `lethe init` now deploys Lethe
+  into a rootless container (Podman on Linux, Apple Container on macOS,
+  auto-installed if missing) and registers it as a background service.
+  Pass `--yolo` for the old native, uncontained install. New
+  `lethe container` subcommands — `up` (build image, create container,
+  install + start the service), `down`, `status`, `logs [-f]`, `shell`,
+  `rebuild`, `build` — plus repeatable, persisted `--mount host[:container]`
+  shares.
+- **Service management**: `lethe service install [--now] [--force]`,
+  `status`, and `uninstall` write/inspect/remove the systemd user unit
+  (Linux) or launchd agent (macOS).
+- **New top-level commands**: `lethe install` (alias for `init`),
+  `lethe uninstall [--purge]` (teardown; `--purge` also deletes `~/.lethe`,
+  always confirmed), `lethe run [--yolo]` (foreground), `lethe status`
+  (version + censored config — now what bare `lethe` prints in CLI mode),
+  `lethe identity {show,set,reset,edit}` (name + persona),
+  `lethe transport {list,api,telegram}` (configure how you reach her),
+  `lethe model [<id>] [--aux <id>] [--pick]`, `lethe prompts {export,list}`,
+  and `lethe completions <shell>`.
+- **Non-interactive `init`**: when stdin isn't a terminal (Docker/CI),
+  `init` reads `--provider`/`--model`/`--aux-model` and the key from the
+  provider's env var, with no prompts.
+- **Global `--config <PATH>`** flag on every command to point at a
+  different `.env` (also honored via `LETHE_CONFIG_FILE`).
+- **TUI `/model`**: `/model <id>` now switches the running agent's model
+  live via `POST /model` (with feedback in the transcript); bare `/model`
+  shows the current model. Bare OpenRouter ids are normalized
+  (`vendor/model` → `openrouter/vendor/model`) server-side, matching the
+  persisted `lethe model` path.
+- **Release workflow**: the one-shot `lethe-migrate` build moved to its
+  own `migrator-v*`-tagged workflow so the main release no longer pulls
+  LanceDB/Arrow into its build; main release builds now use the `mold`
+  linker.
+
 ## 0.21.2 - Release packaging fix
 
 - **Fix `scripts/package-migrator`**: referenced `MIGRATION-SPEC.md`,

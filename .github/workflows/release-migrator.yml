@@ -1,17 +1,20 @@
-name: Release
+name: Release migrator
 
+# `lethe-migrate` is a one-shot legacy tool (migrates v0.18 LanceDB storage to
+# the current SQLite-vec storage). It pulls LanceDB + Arrow + DataFusion — by
+# far the heaviest compile in the repo — and it almost never changes. So it is
+# decoupled from the main release: it builds only when its own `migrator-v*`
+# tag is pushed, or when triggered by hand. Normal `v*` lethe releases skip it
+# entirely (which is most of why they were slow).
 on:
   push:
     tags:
-      - "v*"
+      - "migrator-v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
-# Incremental compilation only helps repeated local builds; in CI it just
-# bloats the cache. Turning it off keeps the rust-cache small enough to avoid
-# eviction (which is what forces cold rebuilds).
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: "10"
@@ -19,17 +22,12 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
+    name: Build migrator ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux gnu builds pin to ubuntu-24.04 (glibc 2.39) because the
-          # prebuilt ort/onnxruntime binaries pulled in by fastembed require
-          # `__isoc23_strtol*` symbols introduced in glibc 2.39. End-user
-          # floor: Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL/Rocky 10+.
-          # macOS binaries link only system libs and stay portable per arch.
           - name: linux-x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -48,34 +46,31 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Only the `lethe` workspace — the migrator (LanceDB/Arrow/DataFusion)
-      # builds in its own workflow so its multi-GB target tree never evicts
-      # this cache. See .github/workflows/release-migrator.yml.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: .
+          workspaces: migrator
           cache-on-failure: "true"
 
       - name: Install native dependencies
         run: ${{ matrix.deps }}
 
-      - name: Build lethe
-        run: cargo build --release --locked --bin lethe
+      - name: Build lethe-migrate
+        run: cargo build --release --locked --manifest-path migrator/Cargo.toml
 
-      - name: Package lethe
+      - name: Package lethe-migrate
         env:
           LETHE_RELEASE_TARGET: ${{ matrix.target }}
-        run: scripts/package-release
+        run: scripts/package-migrator
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lethe-${{ matrix.name }}
+          name: lethe-migrate-${{ matrix.name }}
           path: |
             dist/*.tar.gz
             dist/*.sha256
 
   publish:
-    name: Publish GitHub Release
+    name: Publish migrator release
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')

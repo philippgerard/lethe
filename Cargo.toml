@@ -1,6 +1,6 @@
 [package]
 name = "lethe"
-version = "0.21.2"
+version = "0.22.0"
 edition = "2024"
 description = "Autonomous executive assistant with local memory and LLM"
 license = "MIT"
@@ -20,6 +20,7 @@ axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
 crossterm = { version = "0.28", features = ["event-stream"] }
 dotenvy = "0.15"
 eventsource-stream = "0.2"
@@ -35,6 +36,7 @@ rand = "0.9"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 regex = "1.12"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls", "stream"] }
+rpassword = "7.3"
 rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -50,6 +52,25 @@ walkdir = "2.5"
 
 [dev-dependencies]
 tempfile = "3.23"
+
+# Strip symbols from release binaries — roughly halves the ~56 MB binary
+# (mostly the statically-linked ONNX runtime + bundled sqlite). `strip` is
+# essentially free at build time; LTO is intentionally omitted so CI release
+# builds stay fast. Debug builds are unaffected.
+[profile.release]
+strip = true
+
+# Dev build speed: the default `debug = 2` produced a ~370 MB debug binary
+# (mostly dependency debuginfo), and linking that much DWARF dominates every
+# incremental rebuild. Keep line tables for our own code (so backtraces still
+# point at files/lines) but drop debuginfo for dependencies — we almost never
+# step into ort/tokio/ratatui internals. Shrinks the binary and the link step
+# dramatically with no effect on dependency *runtime* behavior.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 # Local fork of genai 0.5.3 that adds CacheControl::Persistent for Anthropic
 # 1h prompt-cache TTL. See vendor/genai/LETHE_FORK.md for the patch surface.

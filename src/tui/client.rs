@@ -125,6 +125,35 @@ impl LetheClient {
         Ok(info)
     }
 
+    /// Switch the running agent's main model (POST /model). Reconfigures the
+    /// live session; persistence to `.env` is a separate `lethe model`.
+    pub async fn set_model(&self, model: &str) -> Result<ModelInfo> {
+        let url = format!("{}/model", self.base_url);
+        let response = self
+            .auth(self.http.post(url).json(&json!({ "model": model })))
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            // Surface the server's `{"error": ...}` body — `error_for_status`
+            // alone discards it, leaving a useless bare status code.
+            let body = response.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|detail| !detail.is_empty())
+                .unwrap_or_else(|| body.trim().to_string());
+            return Err(anyhow!("server returned {status}: {detail}"));
+        }
+        let info = response.json::<ModelInfo>().await?;
+        Ok(info)
+    }
+
     pub async fn cancel(&self, chat_id: i64) -> Result<()> {
         let url = format!("{}/cancel", self.base_url);
         let _ = self

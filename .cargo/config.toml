@@ -1,0 +1,14 @@
+# Use the mold linker on Linux. Lethe's binary statically links the ONNX
+# runtime (fastembed) and sqlite, so the link step is large and dominates
+# incremental rebuilds; mold links it several times faster than GNU ld.
+#
+# Requires `mold` on the build host:
+#   Fedora/RHEL : sudo dnf install mold
+#   Debian/Ubuntu: sudo apt-get install mold
+# CI installs it in the release workflows. macOS is left on its (already fast)
+# default linker.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

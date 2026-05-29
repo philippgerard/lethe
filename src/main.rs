@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use lethe::config::{RuntimeMode, Settings};
 use lethe::tools::shell::DEFAULT_TIMEOUT_SECONDS;
 use std::fs::{File, OpenOptions};
@@ -11,95 +11,229 @@ use tracing_subscriber::EnvFilter;
 mod cli;
 
 #[derive(Debug, Parser)]
-#[command(author, version, about)]
+#[command(author, version, about, after_help = AFTER_HELP)]
 struct Cli {
+    /// Path to the config `.env` file. Overrides the default
+    /// `~/.lethe/config/.env` (and the `LETHE_HOME`-derived location).
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
+const AFTER_HELP: &str = "\
+Getting started:
+  lethe init       First-time setup: provider, model, API key.
+  lethe            Show version + current config (no subcommand).
+  lethe check      Live health check (LLM + embeddings).
+  lethe chat -m \"hi\"   Send a one-off message.
+
+Config lives in ~/.lethe/config/.env (override with --config or LETHE_HOME).
+Low-level/debug subcommands (memory, fs, sh, todo, agent, …) are hidden but
+still work — run `lethe help <command>` for any of them.";
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Interactive setup: pick provider + model + API key, write
-    /// ~/.lethe/config/.env, seed the workspace, run a smoke test.
-    Init,
-    /// Sign in to an LLM provider. Subscription paths (ChatGPT
-    /// Plus/Pro, Claude Pro/Max) store OAuth tokens under
-    /// `~/.lethe/credentials/`; API-key paths (OpenRouter, plus the
-    /// API-key alternative on the OAuth-capable providers) write the
-    /// key to `~/.lethe/config/.env`. Either way, `LLM_PROVIDER` and
-    /// the model defaults are aligned to the chosen provider.
+    /// First-time setup: provider, model, API key, workspace.
+    ///
+    /// Interactive by default (and sets up an isolated container unless
+    /// --yolo). Runs non-interactively when stdin is not a terminal
+    /// (Docker/CI): pass --provider/--model/--aux-model and supply the key via
+    /// the provider's env var (e.g. OPENROUTER_API_KEY).
+    Init {
+        /// Provider id: openrouter | anthropic | openai. Skips the prompt.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Main model id. Skips the prompt (defaults to the catalog top pick).
+        #[arg(long)]
+        model: Option<String>,
+        /// Auxiliary model id (cheap background calls). Defaults to the catalog pick.
+        #[arg(long)]
+        aux_model: Option<String>,
+        /// Accept defaults without prompting where a value can be inferred.
+        #[arg(long)]
+        yes: bool,
+        /// Native (uncontained) install — runs Lethe directly on the host with
+        /// full access. Default is an isolated container.
+        #[arg(long)]
+        yolo: bool,
+    },
+    /// Alias for `init` — first-time setup. Defaults to a contained install;
+    /// pass --yolo for a native one.
+    Install {
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        aux_model: Option<String>,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        yolo: bool,
+    },
+    /// Interactive teardown: remove the service (and container), optionally
+    /// purge data with --purge.
+    Uninstall {
+        /// Don't prompt for the service/container removal steps.
+        #[arg(long)]
+        yes: bool,
+        /// Also delete ~/.lethe (config, memory, workspace). Still confirmed.
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Run Lethe in the foreground in this terminal (Ctrl-C to stop).
+    ///
+    /// Defaults to the isolated container (builds/creates it on first run);
+    /// `--yolo` runs natively on the host instead. For a background service,
+    /// use `lethe service install` / `lethe container up` instead.
+    Run {
+        /// Run natively on the host instead of in the container.
+        #[arg(long)]
+        yolo: bool,
+    },
+    /// Configure how you reach Lethe: the API (powers the TUI) and chat
+    /// channels like Telegram. With no subcommand, lists them and their status.
+    Transport {
+        #[command(subcommand)]
+        command: Option<TransportCommand>,
+    },
+    /// Run Lethe in an isolated, rootless container (the default deployment).
+    Container {
+        #[command(subcommand)]
+        command: ContainerCommand,
+    },
+    /// Show version + current config (provider, models, which keys are set,
+    /// with secrets censored). The default action when run with no subcommand.
+    Status,
+    /// View or change who the assistant is (name + persona). With no
+    /// subcommand, prints the current identity.
+    Identity {
+        #[command(subcommand)]
+        command: Option<IdentityCommand>,
+    },
+    /// Show or change the LLM model. With no argument, shows the current
+    /// main/aux models and the catalog for your provider.
+    Model {
+        /// New main model id (catalog id or any custom id). Omit to show.
+        model: Option<String>,
+        /// Set the auxiliary model id (cheap background calls).
+        #[arg(long)]
+        aux: Option<String>,
+        /// Interactively pick the main + aux models from the catalog.
+        #[arg(long)]
+        pick: bool,
+    },
+    /// Install / uninstall / inspect the background service
+    /// (systemd user unit on Linux, launchd agent on macOS).
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    /// Print a shell completion script (bash, zsh, fish, ...).
+    Completions {
+        /// Target shell.
+        shell: clap_complete::Shell,
+    },
+    /// Sign in to an LLM provider (API key, or subscription OAuth).
+    ///
+    /// Subscription paths (ChatGPT Plus/Pro, Claude Pro/Max) store OAuth tokens
+    /// under `~/.lethe/credentials/`; API-key paths write the key to
+    /// `~/.lethe/config/.env`. Either way, `LLM_PROVIDER` and the model
+    /// defaults are aligned to the chosen provider.
     Login {
         #[command(subcommand)]
         command: LoginCommand,
     },
-    /// Validate the Rust runtime configuration and embedded prompt access.
+    /// Live health check: confirm the model and embeddings actually respond.
     Check,
     /// Print a prompt template after workspace/config/embedded resolution.
+    #[command(hide = true)]
     Prompt { name: String },
+    /// Export the built-in prompt templates to ~/.lethe for editing, or list
+    /// where each currently resolves from.
+    Prompts {
+        #[command(subcommand)]
+        command: PromptsCommand,
+    },
     /// Seed core memory block files from embedded defaults if they are missing.
+    #[command(hide = true)]
     InitMemory,
     /// Inspect and initialize unified memory state.
+    #[command(hide = true)]
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
     },
     /// Run local filesystem tools.
+    #[command(hide = true)]
     Fs {
         #[command(subcommand)]
         command: FsCommand,
     },
     /// Run local shell tools.
+    #[command(hide = true)]
     Sh {
         #[command(subcommand)]
         command: ShCommand,
     },
     /// Run web search and fetch tools.
+    #[command(hide = true)]
     Web {
         #[command(subcommand)]
         command: WebCommand,
     },
     /// Transcribe a local audio file through the configured STT provider.
+    #[command(hide = true)]
     Transcribe {
         file_path: String,
         #[arg(long)]
         mime_type: Option<String>,
     },
     /// Manage persistent todos stored in the local SQLite database.
+    #[command(hide = true)]
     Todo {
         #[command(subcommand)]
         command: TodoCommand,
     },
     /// Manage persistent markdown notes.
+    #[command(hide = true)]
     Note {
         #[command(subcommand)]
         command: NoteCommand,
     },
     /// Manage long-term archival memory.
+    #[command(hide = true)]
     Archive {
         #[command(subcommand)]
         command: ArchiveCommand,
     },
     /// Manage durable conversation message history.
+    #[command(hide = true)]
     Messages {
         #[command(subcommand)]
         command: MessageCommand,
     },
     /// Run the persisted local agent loop.
+    #[command(hide = true)]
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
     },
     /// Run heartbeat prompt and proactive-check helpers.
+    #[command(hide = true)]
     Heartbeat {
         #[command(subcommand)]
         command: HeartbeatCommand,
     },
     /// Run Telegram transport commands.
+    #[command(hide = true)]
     Telegram {
         #[command(subcommand)]
         command: cli::telegram_loop::TelegramCommand,
     },
     /// Run the authenticated HTTP API server.
+    #[command(hide = true)]
     Api {
         #[arg(long)]
         port: Option<u16>,
@@ -114,7 +248,7 @@ enum Command {
         #[arg(long, env = "LETHE_API_TOKEN")]
         token: Option<String>,
     },
-    /// Send a single user message through the configured universal LLM router.
+    /// Send one message straight to the model and print the reply (no memory or tools).
     Chat {
         #[arg(short, long)]
         message: String,
@@ -148,6 +282,143 @@ pub enum LoginCommand {
     Anthropic,
     /// Sign in to OpenRouter (API key only — no subscription path).
     Openrouter,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PromptsCommand {
+    /// Write the built-in (overridable) prompts to <workspace>/prompts/.
+    /// Existing files are kept unless --force is given.
+    Export {
+        /// Overwrite files that already exist.
+        #[arg(long)]
+        force: bool,
+        /// Target directory (default: <workspace>/prompts).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// List the overridable prompts and where each currently resolves from.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IdentityCommand {
+    /// Print the current name + identity (persona) block.
+    Show,
+    /// Set the assistant's name and (optionally) rewrite its persona.
+    Set {
+        /// Name to use (skips the name prompt). LETHE_AGENT_NAME.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Restore the embedded default Lethe identity.
+    Reset {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Open the identity block in $EDITOR.
+    Edit,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TransportCommand {
+    /// List transports and their status.
+    List,
+    /// Configure + enable the Telegram bot (token, allowed users).
+    Telegram {
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Configure the local HTTP API (powers the TUI). Enabled by default.
+    Api {
+        #[arg(long)]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+        /// Set the API port.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Generate a fresh API token.
+        #[arg(long)]
+        token: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContainerCommand {
+    /// Build the image (if needed), create the persistent container, and
+    /// install + start the service.
+    Up {
+        /// Rebuild the image and recreate the container (drops installed software).
+        #[arg(long)]
+        rebuild: bool,
+        /// Extra host dir to share: `host[:container]`. Repeatable; persisted.
+        #[arg(long = "mount")]
+        mount: Vec<String>,
+        /// Enable + start without the confirmation prompt.
+        #[arg(long)]
+        now: bool,
+        /// Print the engine commands without running them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Build the image from the repo Containerfile instead of a release binary.
+        #[arg(long)]
+        from_source: bool,
+        /// Bake the heavy toolset (ffmpeg/python/build-essential/…) into the
+        /// image. Default is a lean image; the agent installs the rest on demand.
+        #[arg(long)]
+        with_tools: bool,
+    },
+    /// Stop the container (via the service if installed).
+    Down,
+    /// Open a root shell inside the running container.
+    Shell,
+    /// Rebuild the image and recreate the container (resets installed software).
+    Rebuild {
+        #[arg(long)]
+        dry_run: bool,
+        /// Bake the heavy toolset into the rebuilt image.
+        #[arg(long)]
+        with_tools: bool,
+    },
+    /// Show engine, container state, and shared mounts.
+    Status,
+    /// Show (or follow) the container logs.
+    Logs {
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Build the image only.
+    Build {
+        #[arg(long)]
+        from_source: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// Bake the heavy toolset into the image.
+        #[arg(long)]
+        with_tools: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Write the service unit and (optionally) enable + start it.
+    Install {
+        /// Overwrite an existing unit. Does not stop the running service.
+        #[arg(long)]
+        force: bool,
+        /// Enable + start immediately without the confirmation prompt.
+        #[arg(long)]
+        now: bool,
+    },
+    /// Stop, disable, and remove the service unit.
+    Uninstall {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show the detected platform, unit path, and live status.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -503,32 +774,84 @@ pub enum HeartbeatCommand {
     },
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let settings = Settings::from_env();
-    if let Some(log_path) = init_logging(&settings) {
-        tracing::info!(path = %log_path.display(), "logging initialized");
-    } else {
-        tracing::info!("logging initialized without file output");
-    }
+    // Parse before loading settings so a global `--config` can redirect
+    // where `Settings::from_env` reads the `.env` from.
     let cli = Cli::parse();
+    if let Some(path) = &cli.config {
+        // SAFETY: single-threaded startup, before any tasks are spawned.
+        unsafe { std::env::set_var("LETHE_CONFIG_FILE", path) };
+    }
+
+    let settings = Settings::from_env();
+    // Debug-level so one-shot CLI commands (status, completions, identity)
+    // stay quiet on stderr; bump RUST_LOG=debug to see it.
+    if let Some(log_path) = init_logging(&settings) {
+        tracing::debug!(path = %log_path.display(), "logging initialized");
+    } else {
+        tracing::debug!("logging initialized without file output");
+    }
     let command = match cli.command {
         Some(command) => command,
-        None => default_command_for_mode(&settings.mode),
+        // Bare `lethe` in CLI mode is a fast status view (no live probes);
+        // api/telegram modes still launch their server.
+        None => match settings.mode {
+            RuntimeMode::Cli => return status(&settings),
+            _ => default_command_for_mode(&settings.mode),
+        },
     };
     use cli::handlers as h;
     match command {
-        Command::Init => cli::init::run().await,
+        Command::Init {
+            provider,
+            model,
+            aux_model,
+            yes,
+            yolo,
+        }
+        | Command::Install {
+            provider,
+            model,
+            aux_model,
+            yes,
+            yolo,
+        } => {
+            cli::init::run(cli::init::InitArgs {
+                provider,
+                model,
+                aux_model,
+                yes,
+                yolo,
+            })
+            .await
+        }
+        Command::Uninstall { yes, purge } => cli::uninstall::run(&settings, yes, purge),
+        Command::Run { yolo } => {
+            if yolo {
+                h::api_command(None).await
+            } else {
+                cli::container::run_foreground(&settings)
+            }
+        }
+        Command::Transport { command } => cli::transport::run(&settings, command),
+        Command::Container { command } => cli::container::run(&settings, command),
+        Command::Status => status(&settings),
+        Command::Identity { command } => cli::identity::run(&settings, command),
+        Command::Model { model, aux, pick } => cli::model::run(&settings, model, aux, pick),
+        Command::Service { command } => cli::service::run(&settings, command),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut io::stdout());
+            Ok(())
+        }
         Command::Login { command } => match command {
             LoginCommand::Openai => {
-                if lethe::llm::oauth_env::prompt_subscription_or_api(
-                    "OpenAI",
-                    "ChatGPT Plus/Pro",
-                )? {
+                if lethe::llm::oauth_env::prompt_subscription_or_api("OpenAI", "ChatGPT Plus/Pro")?
+                {
                     lethe::llm::openai_oauth::run_device_login().await?;
-                    let (main, aux) =
-                        lethe::llm::oauth_env::prompt_provider_models("openai")?;
+                    let (main, aux) = lethe::llm::oauth_env::prompt_provider_models("openai")?;
                     lethe::llm::oauth_env::update_env_after_oauth_login(
                         "openai",
                         main.as_deref(),
@@ -544,13 +867,10 @@ async fn main() -> Result<()> {
                 }
             }
             LoginCommand::Anthropic => {
-                if lethe::llm::oauth_env::prompt_subscription_or_api(
-                    "Anthropic",
-                    "Claude Pro/Max",
-                )? {
+                if lethe::llm::oauth_env::prompt_subscription_or_api("Anthropic", "Claude Pro/Max")?
+                {
                     lethe::llm::anthropic_oauth::run_device_login().await?;
-                    let (main, aux) =
-                        lethe::llm::oauth_env::prompt_provider_models("anthropic")?;
+                    let (main, aux) = lethe::llm::oauth_env::prompt_provider_models("anthropic")?;
                     lethe::llm::oauth_env::update_env_after_oauth_login(
                         "anthropic",
                         main.as_deref(),
@@ -573,6 +893,7 @@ async fn main() -> Result<()> {
         },
         Command::Check => h::check().await,
         Command::Prompt { name } => h::print_prompt(&name),
+        Command::Prompts { command } => cli::prompts::run(&settings, command),
         Command::InitMemory => h::init_memory(),
         Command::Memory { command } => h::memory_command(command).await,
         Command::Fs { command } => h::fs_command(command),
@@ -687,6 +1008,86 @@ fn init_logging(settings: &Settings) -> Option<PathBuf> {
     Some(log_path)
 }
 
+/// Fast, side-effect-free status view: version, the resolved config path,
+/// and the current config with secrets censored. When no config file exists
+/// yet, nudge the user to `lethe init` instead. This is what bare `lethe`
+/// runs in CLI mode — no model download, no network, no SQLite open.
+fn status(settings: &Settings) -> Result<()> {
+    use cli::util::secret_status;
+
+    let mut lines: Vec<String> = vec![format!("lethe {}", env!("CARGO_PKG_VERSION"))];
+    let config_file = &settings.paths.config_file;
+    if !config_file.exists() {
+        lines.push(String::new());
+        lines.push(format!("No config found at {}", config_file.display()));
+        lines.push("Run `lethe init` to set up a provider, model and API key.".to_string());
+        // Animate the avatar alongside the text, then leave it on screen.
+        cli::avatar::play_above(&lines);
+        return Ok(());
+    }
+
+    let llm = &settings.llm;
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let anthropic_token = std::env::var("ANTHROPIC_AUTH_TOKEN").unwrap_or_default();
+
+    lines.push(format!("  config:    {}", config_file.display()));
+    lines.push(format!(
+        "  home:      {}",
+        settings.paths.lethe_home.display()
+    ));
+    lines.push(format!(
+        "  workspace: {}",
+        settings.paths.workspace_dir.display()
+    ));
+    lines.push(format!("  mode:      {:?}", settings.mode));
+    lines.push(format!("  identity:  {}", settings.agent_name));
+    lines.push(format!("  provider:  {}", marker(&llm.llm_provider)));
+    lines.push(format!("  model:     {}", marker(&llm.llm_model)));
+    lines.push(format!("  aux model: {}", settings.effective_aux_model()));
+    lines.push(format!(
+        "  auth:      {}",
+        lethe::llm::llm_auth_mode_for_settings(settings)
+    ));
+    lines.push("  keys:".to_string());
+    for (label, value) in [
+        ("OPENROUTER_API_KEY", llm.openrouter_api_key.as_str()),
+        ("ANTHROPIC_API_KEY", anthropic_key.as_str()),
+        ("ANTHROPIC_AUTH_TOKEN", anthropic_token.as_str()),
+        ("OPENAI_API_KEY", llm.openai_api_key.as_str()),
+    ] {
+        lines.push(format!("    {label:<20} {}", secret_status(value)));
+    }
+    lines.push(format!(
+        "  telegram:  {}",
+        if settings.telegram.bot_token.trim().is_empty() {
+            "not set".to_string()
+        } else {
+            format!(
+                "configured ({} allowed user id(s))",
+                settings.telegram.allowed_user_ids.len()
+            )
+        }
+    ));
+    lines.push(format!(
+        "  api token: {}",
+        secret_status(&settings.api.token)
+    ));
+    lines.push(String::new());
+    lines.push("Run `lethe check` for a live health check (LLM + embeddings).".to_string());
+
+    cli::avatar::play_above(&lines);
+    Ok(())
+}
+
+/// Render a config string for the status view: `(not set)` when empty.
+fn marker(value: &str) -> String {
+    if value.trim().is_empty() {
+        "(not set)".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn default_command_for_mode(mode: &RuntimeMode) -> Command {
     match mode {
         RuntimeMode::Api => Command::Api { port: None },
@@ -699,8 +1100,6 @@ fn default_command_for_mode(mode: &RuntimeMode) -> Command {
         RuntimeMode::Cli => Command::Check,
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

@@ -82,6 +82,19 @@ pub fn context_limit_for_model(model_id: &str) -> Option<u64> {
     map.get(key).copied()
 }
 
+/// OpenRouter model ids are namespaced (`openrouter/<vendor>/<model>`); prepend
+/// the prefix when a bare id is given for the OpenRouter provider so a short id
+/// like `moonshotai/kimi-k2` still resolves. Ids for other providers,
+/// already-prefixed OpenRouter ids, and empty input pass through unchanged.
+pub fn normalize_model_id(provider: &str, id: &str) -> String {
+    let trimmed = id.trim();
+    if provider == "openrouter" && !trimmed.is_empty() && !trimmed.starts_with("openrouter/") {
+        format!("openrouter/{trimmed}")
+    } else {
+        id.to_string()
+    }
+}
+
 pub fn provider_for_model(model_id: &str) -> Option<&'static str> {
     let model_id = model_id.trim();
     if model_id.is_empty() {
@@ -159,6 +172,21 @@ mod tests {
                 .iter()
                 .any(|entry| entry.model_id().starts_with("openrouter/"))
         );
+    }
+
+    #[test]
+    fn normalize_prefixes_bare_openrouter_ids_once() {
+        assert_eq!(
+            normalize_model_id("openrouter", "moonshotai/kimi-k2.6"),
+            "openrouter/moonshotai/kimi-k2.6"
+        );
+        assert_eq!(
+            normalize_model_id("openrouter", "openrouter/anthropic/claude-opus-4.7"),
+            "openrouter/anthropic/claude-opus-4.7"
+        );
+        assert_eq!(normalize_model_id("anthropic", "claude-opus-4-8"), "claude-opus-4-8");
+        // Empty input must not become a bare "openrouter/" prefix.
+        assert_eq!(normalize_model_id("openrouter", "  "), "  ");
     }
 
     #[test]

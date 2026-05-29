@@ -3,9 +3,10 @@
 # Lethe Rust installer.
 # Usage: curl -fsSL https://lethe.gg/install | bash
 #
-# Downloads the prebuilt `lethe` and (when available) `lethe-migrate`
-# binaries for the current platform, then hands off to `lethe init`
-# for provider / model / API-key setup. Falls back to a source build
+# Downloads the prebuilt `lethe` (and, when available, `lethe-migrate`)
+# binary for the current platform, then hands off to `lethe init` for
+# provider / model / API-key setup and an isolated rootless container
+# deployment (or a native one with --yolo). Falls back to a source build
 # when no binary asset matches the host (or `LETHE_INSTALL_FROM_SOURCE=1`).
 #
 # Env knobs:
@@ -238,7 +239,7 @@ main() {
     fi
     echo "  Config:    $ENV_FILE"
     echo ""
-    echo "Next:  $BIN_DIR/lethe check"
+    echo "Next:  $BIN_DIR/lethe status   ·   $BIN_DIR/lethe check"
 }
 
 main "$@"

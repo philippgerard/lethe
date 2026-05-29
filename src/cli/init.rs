@@ -1,81 +1,148 @@
-//! Interactive `lethe init` wizard. Ports the working flow from the Python
-//! main branch's `install.sh` (`prompt_provider`, `prompt_model`,
-//! `prompt_api_key`, `setup_config`) into a single Rust command that:
+//! Interactive `lethe init` wizard:
 //!
-//! 1. Detects any LLM keys already in the environment (and the existing
-//!    `~/.lethe/config/.env` if one exists).
-//! 2. Walks the user through provider / model / key / Telegram choices.
-//! 3. Writes `~/.lethe/config/.env` and seeds the workspace + default memory
-//!    blocks.
-//! 4. Runs a smoke test (model ping + embedding probe).
-//! 5. Tells them what to run next.
+//! 1. Asks who the assistant should be (custom identity, or keep the default
+//!    Lethe persona).
+//! 2. Detects any LLM keys already in the environment / config `.env`.
+//! 3. Walks the user through provider / model / key / API-token choices.
+//!    Provider + models can be supplied via flags to skip prompts.
+//! 4. Merges the result into the config `.env` (preserving every other key
+//!    and comment), seeds the workspace + default memory blocks, applies a
+//!    custom identity/human intro.
+//! 5. Runs a smoke test, offers to install a background service, and prints
+//!    what to run next.
 //!
-//! TTY-aware: refuses to prompt over a non-terminal stdin (use the env
-//! variables directly in scripted contexts).
+//! When stdin is not a terminal (Docker / CI) it runs non-interactively:
+//! provider from `--provider`/`LLM_PROVIDER`, key from the provider's env
+//! var, models from flags or the catalog defaults.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use lethe::config::Settings;
-use lethe::llm::models::model_catalog;
+use lethe::llm::models::{ModelEntry, model_catalog};
 use lethe::llm::{LlmMessage, LlmRouter, LlmRouterConfig};
-use lethe::memory::{BlockManager, MemoryStore};
+use lethe::memory::MemoryStore;
 
-/// Top-level entry point.
-pub async fn run() -> Result<()> {
-    if !io::stdin().is_terminal() {
-        bail!(
-            "`lethe init` needs an interactive terminal. \
-             Set env vars manually (see .env.example) or pipe a config into a file."
-        );
+use crate::cli::identity;
+use crate::cli::util::{
+    confirm, mask_secret, prompt_line, prompt_secret, read_multiline, upsert_env,
+};
+
+/// Flags accepted by `lethe init`. All optional — the interactive flow
+/// prompts for anything not supplied; the non-interactive flow requires
+/// at least a resolvable provider + key.
+#[derive(Debug, Default)]
+pub struct InitArgs {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub aux_model: Option<String>,
+    pub yes: bool,
+    /// Native (uncontained) install. Default is an isolated container.
+    pub yolo: bool,
+}
+
+/// Top-level entry point. Dispatches on whether we have a real terminal.
+pub async fn run(args: InitArgs) -> Result<()> {
+    if io::stdin().is_terminal() {
+        run_interactive(args).await
+    } else {
+        run_noninteractive(args).await
     }
+}
 
-    print_header();
+// =============================================================================
+// Interactive flow
+// =============================================================================
 
+async fn run_interactive(args: InitArgs) -> Result<()> {
     let settings = Settings::from_env();
-    let lethe_home = settings.paths.lethe_home.clone();
-    let env_path = lethe_home.join("config").join(".env");
+    let env_path = settings.paths.config_file.clone();
     let existing_env = read_existing_env(&env_path);
 
-    println!("Lethe will store config + state under:");
-    println!("  {}\n", lethe_home.display());
+    // Animate the avatar above the setup header (visible while it plays).
+    let header = vec![
+        "Lethe — guided setup".to_string(),
+        "────────────────────".to_string(),
+        String::new(),
+        "Stores config + state under:".to_string(),
+        format!("  {}", settings.paths.lethe_home.display()),
+        format!("Config file: {}", env_path.display()),
+    ];
+    crate::cli::avatar::play_above(&header);
+    println!();
+
+    // If a usable config already exists, offer a quick exit instead of
+    // walking the whole flow every time.
+    if env_path.exists() && !settings.llm.llm_model.trim().is_empty() {
+        let provider = if settings.llm.llm_provider.trim().is_empty() {
+            "?".to_string()
+        } else {
+            settings.llm.llm_provider.clone()
+        };
+        println!(
+            "You already have a config (provider {provider}, model {}).",
+            settings.llm.llm_model
+        );
+        let go = prompt_line("Reconfigure it? [y/N]: ")?;
+        if !go.trim().to_ascii_lowercase().starts_with('y') {
+            println!("Nothing changed. Run `lethe check` to verify, or `lethe chat -m \"hi\"`.");
+            return Ok(());
+        }
+        println!();
+    }
+
+    // -- Identity (who the assistant is) — asked first ----------------------
+    let identity = identity::prompt_identity(&settings.agent_name)?;
 
     let detected = detect_keys(&existing_env);
     if !detected.is_empty() {
-        println!("Found existing API keys for: {}\n", detected.join(", "));
+        println!("\nFound existing API keys for: {}", detected.join(", "));
     }
 
     // -- Provider -----------------------------------------------------------
-    let provider = prompt_provider(&detected)?;
+    let provider = match args.provider.as_deref() {
+        Some(p) => Provider::from_id(p)
+            .ok_or_else(|| anyhow!("unknown --provider `{p}` (use openrouter|anthropic|openai)"))?,
+        None => prompt_provider(&detected)?,
+    };
     info(&format!("Using {}", provider.label()));
 
     // -- Models -------------------------------------------------------------
-    let (main_model, aux_model) = prompt_models(provider)?;
+    let (main_model, aux_model) = resolve_models(provider, &args)?;
     info(&format!("Main: {main_model}"));
     info(&format!("Aux:  {aux_model}"));
 
-    // -- API key (or OAuth for ChatGPT Plus/Pro) ----------------------------
+    // -- API key (or subscription OAuth) ------------------------------------
     let api_key = prompt_api_key(provider, &existing_env).await?;
 
-    // -- Optional Telegram --------------------------------------------------
+    // -- Optional HTTP API / TUI token --------------------------------------
+    let api_token = prompt_api_token(&existing_env)?;
+
+    // -- Optional Telegram (always skippable) -------------------------------
     let telegram = prompt_telegram(&existing_env)?;
 
-    // -- Optional human-block intro ----------------------------------------
+    // -- Optional human-block intro -----------------------------------------
     let human_intro = prompt_human_intro()?;
 
-    // -- Persist ------------------------------------------------------------
-    write_env_file(
+    // -- Persist (merge — never clobbers other keys) ------------------------
+    write_config(
         &env_path,
         provider,
         &main_model,
         &aux_model,
         api_key.as_deref(),
+        api_token.as_deref(),
+        identity.as_ref().map(|i| i.name.as_str()),
         telegram.as_ref(),
     )?;
-    info(&format!("Wrote {}", env_path.display()));
+    info(&format!("Updated {}", env_path.display()));
 
     seed_workspace(&settings)?;
+    if let Some(setup) = &identity {
+        identity::apply_identity(&settings, setup)?;
+        info(&format!("Identity set to {}", setup.name));
+    }
     if let Some(text) = human_intro {
         seed_human_block(&settings, &text)?;
     }
@@ -85,16 +152,115 @@ pub async fn run() -> Result<()> {
     println!("\nRunning smoke test...");
     smoke_test(provider, &main_model, &aux_model, api_key.as_deref()).await?;
 
-    println!();
-    success("Setup complete.");
-    println!();
-    println!("Next steps:");
-    println!("  lethe chat -m \"hello\"     # one-off chat");
-    println!("  lethe                       # default mode (cli)");
-    if telegram.is_some() {
-        println!("  lethe telegram run          # start Telegram bot");
+    // -- Deploy: isolated container (default) or native (--yolo) ------------
+    deploy(&settings, args.yolo)?;
+
+    print_next_steps(api_token.is_some(), args.yolo, telegram.is_some());
+    Ok(())
+}
+
+/// Set up how Lethe runs: an isolated rootless container by default (so the
+/// agent can install software without touching the host), or directly on the
+/// host with `--yolo`.
+fn deploy(settings: &Settings, yolo: bool) -> Result<()> {
+    if yolo {
+        crate::cli::service::offer_install(settings)?;
+        return Ok(());
     }
-    println!("  lethe check                 # health check any time");
+    println!("\nDeployment: isolated container (default; rootless, root-inside).");
+    println!("  The agent can install software without touching your host — only the");
+    println!("  directories you share are visible. `--yolo` would install natively instead.");
+    if !confirm("  Set up the container now? [Y/n]: ", true)? {
+        println!("  Skipped. Run `lethe container up` later, or re-run with --yolo for native.");
+        return Ok(());
+    }
+    crate::cli::container::prompt_and_save_mounts(settings)?;
+    crate::cli::container::up(
+        settings,
+        crate::cli::container::UpArgs {
+            rebuild: false,
+            extra_mounts: vec![],
+            now: false,
+            dry_run: false,
+            from_source: false,
+            with_tools: false,
+        },
+    )
+}
+
+// =============================================================================
+// Non-interactive flow (Docker / CI)
+// =============================================================================
+
+async fn run_noninteractive(args: InitArgs) -> Result<()> {
+    let settings = Settings::from_env();
+    let env_path = settings.paths.config_file.clone();
+
+    // Provider: --provider flag, else LLM_PROVIDER from the environment.
+    let provider_id = args
+        .provider
+        .clone()
+        .or_else(|| non_empty(&settings.llm.llm_provider));
+    let Some(provider_id) = provider_id else {
+        bail!(
+            "`lethe init` has no terminal here (non-interactive). \
+             Pass --provider <openrouter|anthropic|openai> or set LLM_PROVIDER."
+        );
+    };
+    let provider = Provider::from_id(&provider_id).ok_or_else(|| {
+        anyhow!("unknown provider `{provider_id}` (use openrouter|anthropic|openai)")
+    })?;
+
+    // Key: from the provider's env var, or (subscription) existing OAuth tokens.
+    let key_from_env = std::env::var(provider.key_env())
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let api_key = match (provider, key_from_env) {
+        (_, Some(key)) => Some(key),
+        (Provider::Anthropic, None) if lethe::llm::anthropic_oauth_available() => None,
+        (Provider::OpenAI, None) if lethe::llm::openai_oauth::openai_oauth_available() => None,
+        _ => bail!(
+            "No credentials for {}. Set {} in the environment before running \
+             `lethe init` non-interactively.",
+            provider.label(),
+            provider.key_env()
+        ),
+    };
+
+    // Models: flag → existing env → catalog default.
+    let main_model = args
+        .model
+        .clone()
+        .or_else(|| non_empty(&settings.llm.llm_model))
+        .or_else(|| default_model_for(provider, "main"))
+        .ok_or_else(|| anyhow!("no main model resolved; pass --model"))?;
+    let aux_model = args
+        .aux_model
+        .clone()
+        .or_else(|| non_empty(&settings.llm.llm_model_aux))
+        .or_else(|| default_model_for(provider, "aux"))
+        .unwrap_or_else(|| main_model.clone());
+
+    write_config(
+        &env_path,
+        provider,
+        &main_model,
+        &aux_model,
+        api_key.as_deref(),
+        None,
+        None,
+        None,
+    )?;
+    println!("Wrote {}", env_path.display());
+    seed_workspace(&settings)?;
+    println!(
+        "Provider: {}  Main: {main_model}  Aux: {aux_model}",
+        provider.label()
+    );
+    println!("Running smoke test...");
+    smoke_test(provider, &main_model, &aux_model, api_key.as_deref()).await?;
+    println!("Done. Run `lethe check` to verify.");
     Ok(())
 }
 
@@ -124,6 +290,14 @@ impl Provider {
             Provider::OpenAI => "openai",
         }
     }
+    fn from_id(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "openrouter" => Some(Provider::OpenRouter),
+            "anthropic" => Some(Provider::Anthropic),
+            "openai" => Some(Provider::OpenAI),
+            _ => None,
+        }
+    }
     fn key_env(self) -> &'static str {
         match self {
             Provider::OpenRouter => "OPENROUTER_API_KEY",
@@ -136,6 +310,14 @@ impl Provider {
             Provider::OpenRouter => "https://openrouter.ai/keys",
             Provider::Anthropic => "https://console.anthropic.com/settings/keys",
             Provider::OpenAI => "https://platform.openai.com/api-keys",
+        }
+    }
+    /// Subscription label for the OAuth path, if the provider has one.
+    fn subscription_label(self) -> Option<&'static str> {
+        match self {
+            Provider::Anthropic => Some("Claude Pro/Max"),
+            Provider::OpenAI => Some("ChatGPT Plus/Pro"),
+            Provider::OpenRouter => None,
         }
     }
 }
@@ -160,11 +342,20 @@ fn detect_keys(existing_env: &EnvMap) -> Vec<&'static str> {
 }
 
 fn prompt_provider(detected: &[&'static str]) -> Result<Provider> {
-    println!("Select your LLM provider:\n");
+    println!("\nSelect your LLM provider:\n");
     let entries = [
-        (Provider::OpenRouter, "OpenRouter (recommended — single key, every major model)"),
-        (Provider::Anthropic, "Anthropic (API key or Claude subscription token)"),
-        (Provider::OpenAI, "OpenAI (API key)"),
+        (
+            Provider::OpenRouter,
+            "OpenRouter (recommended — single key, every major model)",
+        ),
+        (
+            Provider::Anthropic,
+            "Anthropic (API key or Claude Pro/Max subscription)",
+        ),
+        (
+            Provider::OpenAI,
+            "OpenAI (API key or ChatGPT Plus/Pro subscription)",
+        ),
     ];
     for (idx, (provider, desc)) in entries.iter().enumerate() {
         let badge = if detected.contains(&provider.key_env()) {
@@ -200,10 +391,9 @@ fn prompt_provider(detected: &[&'static str]) -> Result<Provider> {
 // Model selection
 // =============================================================================
 
-fn prompt_models(provider: Provider) -> Result<(String, String)> {
+fn resolve_models(provider: Provider, args: &InitArgs) -> Result<(String, String)> {
     let catalog = model_catalog();
     let provider_entry = catalog.get(provider.id());
-
     let main_entries = provider_entry
         .and_then(|p| p.get("main"))
         .cloned()
@@ -213,14 +403,43 @@ fn prompt_models(provider: Provider) -> Result<(String, String)> {
         .cloned()
         .unwrap_or_default();
 
-    println!("\nMain model (handles user-facing turns):");
-    let main = pick_model("main", &main_entries)?;
-    println!("\nAuxiliary model (cheap calls — summarization, heartbeat, background):");
-    let aux = pick_model("aux", &aux_entries)?;
+    let main = match &args.model {
+        Some(m) => m.clone(),
+        None if args.yes => default_model(&main_entries).ok_or_else(|| {
+            anyhow!(
+                "no catalog default for {} main model; pass --model",
+                provider.id()
+            )
+        })?,
+        None => {
+            println!("\nMain model (handles user-facing turns):");
+            pick_model("main", &main_entries)?
+        }
+    };
+    let aux = match &args.aux_model {
+        Some(m) => m.clone(),
+        None if args.yes => default_model(&aux_entries).unwrap_or_else(|| main.clone()),
+        None => {
+            println!("\nAuxiliary model (cheap calls — summarization, heartbeat, background):");
+            pick_model("aux", &aux_entries)?
+        }
+    };
     Ok((main, aux))
 }
 
-fn pick_model(label: &str, entries: &[lethe::llm::models::ModelEntry]) -> Result<String> {
+fn default_model(entries: &[ModelEntry]) -> Option<String> {
+    entries.first().map(|e| e.model_id().to_string())
+}
+
+fn default_model_for(provider: Provider, kind: &str) -> Option<String> {
+    model_catalog()
+        .get(provider.id())
+        .and_then(|p| p.get(kind))
+        .and_then(|v| v.first())
+        .map(|e| e.model_id().to_string())
+}
+
+fn pick_model(label: &str, entries: &[ModelEntry]) -> Result<String> {
     if entries.is_empty() {
         let raw = prompt_line(&format!("  {label} model id: "))?;
         let raw = raw.trim();
@@ -259,19 +478,24 @@ fn pick_model(label: &str, entries: &[lethe::llm::models::ModelEntry]) -> Result
 // API key
 // =============================================================================
 
-/// Returns `None` when the user picked a no-API-key auth path (currently
-/// only ChatGPT Plus/Pro OAuth for the OpenAI provider). Caller must
-/// skip writing the API key into the .env in that case.
+/// Returns `None` when the user picked a no-API-key auth path (subscription
+/// OAuth for OpenAI or Anthropic). Caller skips writing an API key then —
+/// the OAuth tokens live in `~/.lethe/credentials/`.
 async fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<Option<String>> {
     let env_name = provider.key_env();
 
-    if provider == Provider::OpenAI {
-        println!("\nOpenAI sign-in options:");
-        println!("  1) API key (platform.openai.com)");
-        println!("  2) ChatGPT Plus/Pro subscription (browser sign-in)");
+    // Subscription path, where the provider supports one.
+    if let Some(subscription) = provider.subscription_label() {
+        println!("\n{} sign-in options:", provider.label());
+        println!("  1) API key ({})", provider.key_url());
+        println!("  2) {subscription} subscription (browser sign-in)");
         let choice = prompt_line("Choose [1-2, default=1]: ")?;
         if choice.trim() == "2" {
-            lethe::llm::openai_oauth::run_device_login().await?;
+            match provider {
+                Provider::OpenAI => lethe::llm::openai_oauth::run_device_login().await?,
+                Provider::Anthropic => lethe::llm::anthropic_oauth::run_device_login().await?,
+                Provider::OpenRouter => unreachable!("openrouter has no subscription path"),
+            }
             return Ok(None);
         }
     }
@@ -286,7 +510,7 @@ async fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<Opt
                 .cloned()
         });
     if let Some(key) = existing {
-        println!("\nFound existing {env_name}: {}", mask_key(&key));
+        println!("\nFound existing {env_name}: {}", mask_secret(&key));
         let answer = prompt_line("Use it? [Y/n]: ")?;
         if !answer.trim().to_ascii_lowercase().starts_with('n') {
             return Ok(Some(key));
@@ -294,7 +518,7 @@ async fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<Opt
     }
     println!("\n{env_name} required.");
     println!("  Get one at: {}", provider.key_url());
-    let key = prompt_line(&format!("  Paste {env_name}: "))?;
+    let key = prompt_secret(&format!("  Paste {env_name} (input hidden): "))?;
     let key = key.trim().to_string();
     if key.is_empty() {
         bail!("{env_name} is required to continue");
@@ -302,14 +526,37 @@ async fn prompt_api_key(provider: Provider, existing_env: &EnvMap) -> Result<Opt
     Ok(Some(key))
 }
 
-fn mask_key(key: &str) -> String {
-    let trimmed = key.trim();
-    if trimmed.len() <= 12 {
-        return "<short-key>".to_string();
+// =============================================================================
+// Optional HTTP API / TUI token
+// =============================================================================
+
+fn prompt_api_token(existing_env: &EnvMap) -> Result<Option<String>> {
+    println!("\nOptional: HTTP API + terminal UI (`lethe tui`, `lethe api`)");
+    println!("  These need a bearer token (LETHE_API_TOKEN). Skip for CLI-only use.");
+    let yes_no = prompt_line("  Enable API/TUI now? [y/N]: ")?;
+    if !yes_no.trim().to_ascii_lowercase().starts_with('y') {
+        return Ok(None);
     }
-    let head: String = trimmed.chars().take(8).collect();
-    let tail: String = trimmed.chars().rev().take(4).collect::<String>().chars().rev().collect();
-    format!("{head}…{tail}")
+    if let Some(existing) = existing_env
+        .get("LETHE_API_TOKEN")
+        .filter(|v| !v.trim().is_empty())
+    {
+        println!(
+            "  Found existing LETHE_API_TOKEN: {}",
+            mask_secret(existing)
+        );
+        let keep = prompt_line("  Keep it? [Y/n]: ")?;
+        if !keep.trim().to_ascii_lowercase().starts_with('n') {
+            return Ok(Some(existing.clone()));
+        }
+    }
+    let token = generate_token();
+    println!("  Generated a new LETHE_API_TOKEN (saved to your config).");
+    Ok(Some(token))
+}
+
+fn generate_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 // =============================================================================
@@ -321,39 +568,47 @@ struct TelegramSetup {
     allowed_user_ids: String,
 }
 
+/// Optional, always skippable. Returns `None` when the user declines (the
+/// default) — CLI / TUI / HTTP-API users just press Enter past it.
 fn prompt_telegram(existing_env: &EnvMap) -> Result<Option<TelegramSetup>> {
-    println!("\nOptional: Telegram bot setup");
-    println!("  Skip this if you only want CLI or HTTP API access.");
-    let yes_no = prompt_line("  Configure Telegram now? [y/N]: ")?;
-    if !yes_no.trim().to_ascii_lowercase().starts_with('y') {
+    println!("\nOptional: Telegram bot");
+    println!("  Skip this if you only want CLI, TUI, or HTTP API access.");
+    if !confirm("  Set up a Telegram bot now? [y/N]: ", false)? {
         return Ok(None);
     }
     let existing_token = existing_env.get("TELEGRAM_BOT_TOKEN").cloned();
     let token = match existing_token.as_deref().filter(|v| !v.trim().is_empty()) {
         Some(value) => {
-            println!("  Found existing TELEGRAM_BOT_TOKEN: {}", mask_key(value));
-            let keep = prompt_line("  Use it? [Y/n]: ")?;
-            if keep.trim().to_ascii_lowercase().starts_with('n') {
-                prompt_line("  Paste new bot token: ")?
+            println!(
+                "  Found existing TELEGRAM_BOT_TOKEN: {}",
+                mask_secret(value)
+            );
+            if confirm("  Use it? [Y/n]: ", true)? {
+                value.to_string()
+            } else {
+                prompt_secret("  Paste new bot token (input hidden): ")?
                     .trim()
                     .to_string()
-            } else {
-                value.to_string()
             }
         }
         None => {
             println!("  Get a bot token from @BotFather (https://t.me/BotFather).");
-            prompt_line("  Paste TELEGRAM_BOT_TOKEN: ")?
+            prompt_secret("  Paste TELEGRAM_BOT_TOKEN (input hidden): ")?
                 .trim()
                 .to_string()
         }
     };
     if token.is_empty() {
+        println!("  No token entered — skipping Telegram.");
         return Ok(None);
     }
-    let allowed = prompt_line("  Allowed Telegram user ids (comma-separated, or blank for any): ")?
+    let allowed = prompt_line("  Allowed Telegram user ids (comma-separated, blank for any): ")?
         .trim()
         .to_string();
+    if allowed.is_empty() {
+        warn("No allowed ids set — ANYONE who finds the bot can talk to your assistant.");
+        warn("Lock it down later via TELEGRAM_ALLOWED_USER_IDS (your numeric Telegram id).");
+    }
     Ok(Some(TelegramSetup {
         bot_token: token,
         allowed_user_ids: allowed,
@@ -366,66 +621,50 @@ fn prompt_telegram(existing_env: &EnvMap) -> Result<Option<TelegramSetup>> {
 
 fn prompt_human_intro() -> Result<Option<String>> {
     println!("\nOptional: tell Lethe about yourself");
-    println!("  This seeds the `human` memory block — anything you want the assistant");
-    println!("  to remember from turn one (your name, preferences, role). Leave blank to skip.");
-    let answer = prompt_line("  > ")?;
-    let answer = answer.trim();
-    if answer.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(answer.to_string()))
-    }
+    println!("  Seeds the `human` memory block — anything you want the assistant to");
+    println!("  remember from turn one (name, preferences, role).");
+    read_multiline(&["  Type one or more lines; finish with an empty line. Leave blank to skip."])
 }
 
 // =============================================================================
 // Persistence
 // =============================================================================
 
-fn write_env_file(
+#[allow(clippy::too_many_arguments)]
+fn write_config(
     path: &Path,
     provider: Provider,
     main_model: &str,
     aux_model: &str,
     api_key: Option<&str>,
+    api_token: Option<&str>,
+    agent_name: Option<&str>,
     telegram: Option<&TelegramSetup>,
 ) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("creating config dir at {}", parent.display())
-        })?;
+    let mut updates: Vec<(String, String)> = vec![
+        ("LLM_PROVIDER".into(), provider.id().into()),
+        ("LLM_MODEL".into(), main_model.into()),
+        ("LLM_MODEL_AUX".into(), aux_model.into()),
+    ];
+    if let Some(key) = api_key {
+        updates.push((provider.key_env().into(), key.into()));
     }
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S %Z");
-    let mut body = String::new();
-    body.push_str(&format!("# Lethe configuration — generated by `lethe init` on {now}\n\n"));
-    body.push_str(&format!("LLM_PROVIDER={}\n", provider.id()));
-    body.push_str(&format!("LLM_MODEL={main_model}\n"));
-    body.push_str(&format!("LLM_MODEL_AUX={aux_model}\n"));
-    match api_key {
-        Some(key) => body.push_str(&format!("{}={key}\n\n", provider.key_env())),
-        None => body.push_str(
-            "# Using ChatGPT Plus/Pro OAuth — tokens in ~/.lethe/credentials/\n\n",
-        ),
+    if let Some(token) = api_token {
+        updates.push(("LETHE_API_TOKEN".into(), token.into()));
     }
-    if let Some(telegram) = telegram {
-        body.push_str("# Telegram bot\n");
-        body.push_str(&format!("TELEGRAM_BOT_TOKEN={}\n", telegram.bot_token));
-        if !telegram.allowed_user_ids.is_empty() {
-            body.push_str(&format!(
-                "TELEGRAM_ALLOWED_USER_IDS={}\n",
-                telegram.allowed_user_ids
+    if let Some(name) = agent_name {
+        updates.push(("LETHE_AGENT_NAME".into(), name.into()));
+    }
+    if let Some(tg) = telegram {
+        updates.push(("TELEGRAM_BOT_TOKEN".into(), tg.bot_token.clone()));
+        if !tg.allowed_user_ids.trim().is_empty() {
+            updates.push((
+                "TELEGRAM_ALLOWED_USER_IDS".into(),
+                tg.allowed_user_ids.clone(),
             ));
         }
-        body.push('\n');
     }
-    body.push_str("# Add more knobs from .env.example (background subsystems, paths, etc.)\n");
-    std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
-    // Lock the file to user-read/write only — it contains API secrets.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    upsert_env(path, &updates)
 }
 
 fn seed_workspace(settings: &Settings) -> Result<()> {
@@ -437,14 +676,7 @@ fn seed_workspace(settings: &Settings) -> Result<()> {
 }
 
 fn seed_human_block(settings: &Settings, text: &str) -> Result<()> {
-    let blocks_dir = settings.paths.workspace_dir.join("memory");
-    let manager = BlockManager::new(&blocks_dir)
-        .with_context(|| format!("opening blocks dir {}", blocks_dir.display()))?;
-    manager.init_embedded_defaults()?;
-    manager
-        .update("human", Some(text), None)
-        .with_context(|| "writing seed text to human block")?;
-    Ok(())
+    identity::write_block(settings, "human", text)
 }
 
 // =============================================================================
@@ -459,8 +691,8 @@ async fn smoke_test(
 ) -> Result<()> {
     // Apply the new config in-process so the smoke test reflects what the
     // user will actually run with on the next invocation. When the user
-    // picked the OAuth path, leave the api-key env var alone — the
-    // OpenAI OAuth client picks tokens up from the credentials file.
+    // picked an OAuth path, leave the api-key env var alone — the OAuth
+    // client picks tokens up from the credentials file.
     unsafe {
         if let Some(key) = api_key {
             std::env::set_var(provider.key_env(), key);
@@ -512,21 +744,32 @@ fn read_existing_env(path: &Path) -> EnvMap {
         .collect()
 }
 
-fn prompt_line(prompt: &str) -> Result<String> {
-    print!("{prompt}");
-    io::stdout().flush().ok();
-    let stdin = io::stdin();
-    let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .with_context(|| "reading stdin")?;
-    Ok(line.trim_end_matches('\n').trim_end_matches('\r').to_string())
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn print_header() {
-    println!("Lethe — guided setup");
-    println!("--------------------\n");
+fn print_next_steps(api: bool, yolo: bool, telegram: bool) {
+    println!();
+    success("Setup complete.");
+    println!();
+    println!("Next steps:");
+    println!("  lethe chat -m \"hello\"     # one-off chat");
+    println!("  lethe                       # show version + config");
+    println!("  lethe identity              # view / change who your assistant is");
+    if api {
+        println!("  lethe tui                   # terminal UI (uses your API token)");
+    }
+    if telegram {
+        println!("  lethe telegram run          # start the Telegram bot");
+    }
+    if yolo {
+        println!("  lethe service install       # run Lethe in the background (native)");
+    } else {
+        println!("  lethe container shell       # root shell inside the container");
+        println!("  lethe container status      # container + service state");
+    }
+    println!("  lethe check                 # live health check any time");
 }
 
 fn info(message: &str) {
@@ -541,3 +784,15 @@ fn warn(message: &str) {
     println!("! {message}");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_from_id_roundtrip() {
+        assert_eq!(Provider::from_id("openrouter"), Some(Provider::OpenRouter));
+        assert_eq!(Provider::from_id("ANTHROPIC"), Some(Provider::Anthropic));
+        assert_eq!(Provider::from_id(" openai "), Some(Provider::OpenAI));
+        assert_eq!(Provider::from_id("nope"), None);
+    }
+}

@@ -25,6 +25,11 @@ impl RuntimeMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Paths {
     pub lethe_home: PathBuf,
+    /// The `.env` file the runtime loads config from. Defaults to
+    /// `<lethe_home>/config/.env`; overridable with `LETHE_CONFIG_FILE`
+    /// (which the `--config` CLI flag sets). Stored so `status`, `check`,
+    /// and `init` all report and operate on the same path.
+    pub config_file: PathBuf,
     pub config_dir: PathBuf,
     pub workspace_dir: PathBuf,
     pub memory_dir: PathBuf,
@@ -71,14 +76,16 @@ impl LlmConfig {
             || std::env::var("ANTHROPIC_API_KEY")
                 .ok()
                 .is_some_and(|value| !value.trim().is_empty())
-            || std::env::var("ANTHROPIC_AUTH_TOKEN")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty());
+            // Subscription OAuth (Claude Pro/Max, ChatGPT Plus/Pro): tokens
+            // live in ~/.lethe/credentials/, not in an env var. Without this
+            // an OAuth-only setup would wrongly report "no auth".
+            || crate::llm::anthropic_oauth_available()
+            || crate::llm::openai_oauth::openai_oauth_available();
         if !has_auth {
             return Err(format!(
                 "No LLM auth key configured for model `{}`. Run `lethe init`,\n\
                  or set one of: OPENROUTER_API_KEY, ANTHROPIC_API_KEY,\n\
-                 OPENAI_API_KEY (or ANTHROPIC_AUTH_TOKEN for Claude Code subscribers).",
+                 OPENAI_API_KEY (or sign in to a subscription with `lethe login`).",
                 self.llm_model
             ));
         }
@@ -105,6 +112,9 @@ impl LlmConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TelegramConfig {
+    /// Whether the Telegram transport is started by `lethe run`/`lethe api`.
+    /// Defaults to "a bot token is configured" when `TELEGRAM_ENABLED` is unset.
+    pub enabled: bool,
     pub bot_token: String,
     pub allowed_user_ids: Vec<i64>,
     pub transcription_enabled: bool,
@@ -112,6 +122,9 @@ pub struct TelegramConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ApiServerConfig {
+    /// Whether the HTTP/SSE API transport is served. On by default — the TUI
+    /// (`lethe tui`) connects to it. Disable with `API_ENABLED=false`.
+    pub enabled: bool,
     pub token: String,
     pub host: String,
     pub port: u16,
@@ -154,13 +167,20 @@ impl Settings {
         let _ = dotenvy::dotenv();
 
         let lethe_home = env_path("LETHE_HOME").unwrap_or_else(default_lethe_home);
-        let _ = dotenvy::from_path(lethe_home.join("config").join(".env"));
+        // Explicit `--config`/`LETHE_CONFIG_FILE` wins; else the
+        // home-relative default. `dotenvy` never overrides vars already
+        // present in the process environment, so an explicit `--config`
+        // still layers under anything the shell exported.
+        let config_file =
+            env_path("LETHE_CONFIG_FILE").unwrap_or_else(|| lethe_home.join("config").join(".env"));
+        let _ = dotenvy::from_path(&config_file);
         let workspace_dir =
             env_path("WORKSPACE_DIR").unwrap_or_else(|| lethe_home.join("workspace"));
         let data_dir = lethe_home.join("data");
         let memory_dir = env_path("MEMORY_DIR").unwrap_or_else(|| data_dir.join("memory"));
 
         let paths = Paths {
+            config_file,
             config_dir: env_path("LETHE_CONFIG_DIR").unwrap_or_else(|| PathBuf::from("config")),
             workspace_dir: workspace_dir.clone(),
             memory_dir: memory_dir.clone(),
@@ -177,11 +197,18 @@ impl Settings {
             agent_name: env_string("LETHE_AGENT_NAME", "lethe"),
             mode: RuntimeMode::parse(env_string("LETHE_MODE", "cli")),
             telegram: TelegramConfig {
+                // Back-compat: when TELEGRAM_ENABLED is unset, "enabled" means
+                // a bot token is present (the pre-flag behavior).
+                enabled: env_bool(
+                    "TELEGRAM_ENABLED",
+                    !env_string("TELEGRAM_BOT_TOKEN", "").is_empty(),
+                ),
                 bot_token: env_string("TELEGRAM_BOT_TOKEN", ""),
                 allowed_user_ids: env_i64_list("TELEGRAM_ALLOWED_USER_IDS"),
                 transcription_enabled: env_bool("TELEGRAM_TRANSCRIPTION_ENABLED", true),
             },
             api: ApiServerConfig {
+                enabled: env_bool("API_ENABLED", true),
                 token: env_string("LETHE_API_TOKEN", ""),
                 host: env_string("LETHE_API_HOST", "127.0.0.1"),
                 port: env_u16("LETHE_API_PORT", 1373),
@@ -298,6 +325,7 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
         mode: RuntimeMode::Cli,
         paths: Paths {
             lethe_home: root.to_path_buf(),
+            config_file: root.join("config/.env"),
             config_dir: root.join("config"),
             workspace_dir: root.join("workspace"),
             memory_dir: root.join("data/memory"),
@@ -318,11 +346,13 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
             llm_max_output: 8_000,
         },
         telegram: TelegramConfig {
+            enabled: false,
             bot_token: String::new(),
             allowed_user_ids: vec![],
             transcription_enabled: true,
         },
         api: ApiServerConfig {
+            enabled: true,
             token: String::new(),
             host: "127.0.0.1".to_string(),
             port: 1373,

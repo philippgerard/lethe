@@ -1,7 +1,8 @@
 {
   "_note": "Per-model context window in tokens. Used to auto-derive the compaction budget. Falls back to LLM_CONTEXT_LIMIT env var (default 100k) when the model id is not present here. Update when a new model ships or when a model id is renamed.",
-  "_updated": "2026-05-25",
+  "_updated": "2026-05-29",
 
+  "claude-opus-4-8": 200000,
   "claude-opus-4-7": 200000,
   "claude-opus-4-6": 200000,
   "claude-opus-4-5": 200000,

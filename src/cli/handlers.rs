@@ -16,6 +16,7 @@ use lethe::conversation::transcription::{
 use lethe::llm::prompts::{PromptSource, PromptStore};
 use lethe::llm::{LlmMessage, LlmRouter, LlmRouterConfig, llm_auth_mode_for_settings};
 use lethe::memory::BlockManager;
+use lethe::memory::MemoryStore;
 use lethe::memory::archival::ArchivalMemory;
 use lethe::memory::message_metadata::{
     MessageKind, MessageVisibility, metadata_value as message_metadata_value,
@@ -26,7 +27,6 @@ use lethe::memory::recall::{Hippocampus, HippocampusConfig};
 use lethe::scheduler::curator::MemoryCurator;
 use lethe::scheduler::heartbeat::{Heartbeat, HeartbeatConfig, render_summary_prompt};
 use lethe::scheduler::proactive::{ActiveReminder, format_active_reminders};
-use lethe::memory::MemoryStore;
 use lethe::todos::{NewTodo, TodoFilter, TodoManager, TodoPriority, TodoStatus, TodoUpdate};
 use lethe::tools::filesystem::FileTools;
 use lethe::tools::shell::ShellTools;
@@ -61,7 +61,9 @@ pub(crate) async fn api_command(port: Option<u16>) -> Result<()> {
         brainstem.clone(),
     ));
 
-    let telegram_enabled = !settings.telegram.bot_token.trim().is_empty();
+    // Start only the enabled transports (see `lethe transport`).
+    let telegram_enabled =
+        settings.telegram.enabled && !settings.telegram.bot_token.trim().is_empty();
     let telegram_task = if telegram_enabled {
         let agent = agent.clone();
         let settings = settings.clone();
@@ -77,13 +79,15 @@ pub(crate) async fn api_command(port: Option<u16>) -> Result<()> {
         None
     };
 
-    let api_result = lethe::interfaces::api::serve_with_agent(
-        settings,
-        port,
-        Some(agent),
-        brainstem,
-    )
-    .await;
+    let api_result = if settings.api.enabled {
+        lethe::interfaces::api::serve_with_agent(settings, port, Some(agent), brainstem).await
+    } else {
+        // API transport disabled — no HTTP/SSE (and no TUI). Keep the
+        // background brainstem and any chat transports running until Ctrl-C.
+        tracing::info!("http api disabled (API_ENABLED=false); running background + chat only");
+        let _ = tokio::signal::ctrl_c().await;
+        Ok(())
+    };
 
     if let Some(task) = telegram_task {
         task.abort();
@@ -96,9 +100,8 @@ pub(crate) async fn api_command(port: Option<u16>) -> Result<()> {
 
 pub(crate) async fn tui_command(url: Option<String>, token: Option<String>) -> Result<()> {
     let settings = Settings::from_env();
-    let base_url = url.unwrap_or_else(|| {
-        format!("http://{}:{}", settings.api.host, settings.api.port)
-    });
+    let base_url =
+        url.unwrap_or_else(|| format!("http://{}:{}", settings.api.host, settings.api.port));
     // Order: explicit --token > non-empty LETHE_API_TOKEN env > value
     // from ~/.lethe/config/.env. Treat an empty-string env var as
     // unset so a stale `export LETHE_API_TOKEN=` in the user's shell
@@ -110,9 +113,7 @@ pub(crate) async fn tui_command(url: Option<String>, token: Option<String>) -> R
             (!configured.is_empty()).then_some(configured)
         })
         .ok_or_else(|| {
-            anyhow!(
-                "LETHE_API_TOKEN is required. Set it in ~/.lethe/config/.env or pass --token."
-            )
+            anyhow!("LETHE_API_TOKEN is required. Set it in ~/.lethe/config/.env or pass --token.")
         })?;
     lethe::tui::run(lethe::tui::app::TuiOptions {
         base_url,
@@ -131,11 +132,12 @@ pub(crate) async fn check() -> Result<()> {
     let store = prompt_store(&settings);
     let prompt = store.load("agent_instructions", "");
 
-    println!("Lethe Rust runtime");
+    println!("Lethe Rust runtime {}", env!("CARGO_PKG_VERSION"));
     println!("  mode: {:?}", settings.mode);
     println!("  home: {}", settings.paths.lethe_home.display());
     println!("  workspace: {}", settings.paths.workspace_dir.display());
-    println!("  config: {}", settings.paths.config_dir.display());
+    println!("  config_file: {}", settings.paths.config_file.display());
+    println!("  config_dir: {}", settings.paths.config_dir.display());
     println!("  llm_model: {}", empty_marker(&settings.llm.llm_model));
     println!(
         "  llm_model_aux: {}",
@@ -190,10 +192,9 @@ pub(crate) async fn check() -> Result<()> {
     } else {
         let embedder = memory.archival.embedder().clone();
         match embedder.embed_query("lethe check probe") {
-            Ok(vector) if !vector.is_empty() => println!(
-                "  [OK]   embeddings — produced {}-dim vector",
-                vector.len()
-            ),
+            Ok(vector) if !vector.is_empty() => {
+                println!("  [OK]   embeddings — produced {}-dim vector", vector.len())
+            }
             Ok(_) => println!("  [FAIL] embeddings — returned empty vector"),
             Err(error) => {
                 println!("  [FAIL] embeddings: {error}");
@@ -426,8 +427,13 @@ pub(crate) async fn agent_command(command: AgentCommand) -> Result<()> {
     let options = AgentOptions {
         use_hippocampus: !matches!(
             &command,
-            AgentCommand::Chat { no_recall: true, .. }
-                | AgentCommand::Prepare { no_recall: true, .. }
+            AgentCommand::Chat {
+                no_recall: true,
+                ..
+            } | AgentCommand::Prepare {
+                no_recall: true,
+                ..
+            }
         ),
         ..Default::default()
     };
@@ -633,8 +639,9 @@ pub(crate) async fn memory_command(command: MemoryCommand) -> Result<()> {
         }
         MemoryCommand::Curate { force } => {
             let curator = MemoryCurator::new(settings.paths.memory_dir.join("curator_state.json"));
-            let router =
-                lethe::llm::client::LlmRouter::new(lethe::llm::client::LlmRouterConfig::from_settings(&settings));
+            let router = lethe::llm::client::LlmRouter::new(
+                lethe::llm::client::LlmRouterConfig::from_settings(&settings),
+            );
             let stats = curator.run_pass(&store, &router, force).await?;
             println!("{}", serde_json::to_string_pretty(&stats)?);
         }

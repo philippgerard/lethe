@@ -7,14 +7,15 @@ use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
-pub fn render(input: &str, width: u16) -> Text<'static> {
+pub fn render(input: &str, _width: u16) -> Text<'static> {
+    // Wrapping is handled by the ratatui Paragraph widget downstream, so the
+    // width hint isn't needed here.
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TABLES);
     let parser = Parser::new_ext(input, options);
 
     let mut state = RenderState::default();
-    state.wrap_width = width.max(20);
 
     for event in parser {
         match event {
@@ -33,14 +34,22 @@ pub fn render(input: &str, width: u16) -> Text<'static> {
         }
     }
     state.finish_line();
+
+    // Inset every line by a couple of spaces so assistant output reads as a
+    // distinct, gently-indented block in the transcript.
+    for line in &mut state.lines {
+        line.spans.insert(0, Span::raw(INDENT));
+    }
     Text::from(state.lines)
 }
+
+/// Leading indent applied to each rendered line.
+const INDENT: &str = "  ";
 
 #[derive(Default)]
 struct RenderState {
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
-    wrap_width: u16,
     in_code_block: bool,
     list_depth: u16,
     heading: Option<HeadingLevel>,
@@ -55,7 +64,10 @@ impl RenderState {
                 self.block_break();
                 self.heading = Some(level);
             }
-            Tag::Paragraph => self.block_break(),
+            // Single newline between paragraphs (no blank line). The previous
+            // paragraph's End already closed the line, so this is a no-op when
+            // there's nothing pending.
+            Tag::Paragraph => self.break_line(),
             Tag::CodeBlock(_) => {
                 self.block_break();
                 self.in_code_block = true;
@@ -64,17 +76,14 @@ impl RenderState {
             Tag::Item => {
                 self.break_line();
                 let indent = "  ".repeat(self.list_depth.saturating_sub(1) as usize);
-                self.current
-                    .push(Span::raw(format!("{indent}• ")));
+                self.current.push(Span::raw(format!("{indent}• ")));
             }
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::BlockQuote(_) => {
                 self.block_break();
-                self.current.push(Span::styled(
-                    "▍ ",
-                    Style::default().fg(Color::Gray),
-                ));
+                self.current
+                    .push(Span::styled("▍ ", Style::default().fg(Color::Gray)));
             }
             Tag::Link { .. } => {}
             _ => {}

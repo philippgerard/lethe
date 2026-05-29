@@ -215,10 +215,22 @@ async fn drive(
                             Ok(todos) => app.replace_todos(todos),
                             Err(error) => tracing::warn!(error = %error, "list_todos failed"),
                         },
-                        AppCommand::SwitchModel(_) => {
-                            // Stub: future /model POST. Refresh display.
-                            if let Ok(info) = client.model().await {
-                                app.set_model(info.model, info.provider);
+                        AppCommand::SwitchModel(name) => {
+                            // Reconfigures the live session only; persisting to
+                            // `.env` is a separate `lethe model <id>`.
+                            match client.set_model(&name).await {
+                                Ok(info) => {
+                                    let label = if info.provider.is_empty() {
+                                        info.model.clone()
+                                    } else {
+                                        format!("{} · {}", info.provider, info.model)
+                                    };
+                                    app.set_model(info.model, info.provider);
+                                    app.push_notice(format!("switched model → {label}"));
+                                }
+                                Err(error) => {
+                                    app.push_notice(format!("model switch failed: {error}"));
+                                }
                             }
                         }
                         AppCommand::Quit => break,
@@ -548,7 +560,12 @@ async fn handle_slash_command(
             let _ = cmd_tx.send(AppCommand::RefreshActors).await;
         }
         SlashCommand::ModelShow => {
-            app.push_notice(format!("model: {} / {}", app.provider, app.model));
+            let label = if app.provider.is_empty() {
+                app.model.clone()
+            } else {
+                format!("{} · {}", app.provider, app.model)
+            };
+            app.push_notice(format!("model: {label}  ·  switch with /model <id>"));
         }
         SlashCommand::Model(name) => {
             let _ = cmd_tx.send(AppCommand::SwitchModel(name)).await;
