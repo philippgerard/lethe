@@ -353,6 +353,9 @@ pub enum ContainerCommand {
         /// Rebuild the image and recreate the container (drops installed software).
         #[arg(long)]
         rebuild: bool,
+        /// Replace an existing service unit if one is already installed.
+        #[arg(long)]
+        force: bool,
         /// Extra host dir to share: `host[:container]`. Repeatable; persisted.
         #[arg(long = "mount")]
         mount: Vec<String>,
@@ -378,6 +381,9 @@ pub enum ContainerCommand {
     Rebuild {
         #[arg(long)]
         dry_run: bool,
+        /// Replace an existing service unit if one is already installed.
+        #[arg(long)]
+        force: bool,
         /// Bake the heavy toolset into the rebuilt image.
         #[arg(long)]
         with_tools: bool,

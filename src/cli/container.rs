@@ -389,6 +389,7 @@ pub fn run(settings: &Settings, command: ContainerCommand) -> Result<()> {
     match command {
         ContainerCommand::Up {
             rebuild,
+            force,
             mount,
             now,
             dry_run,
@@ -398,6 +399,7 @@ pub fn run(settings: &Settings, command: ContainerCommand) -> Result<()> {
             settings,
             UpArgs {
                 rebuild,
+                force,
                 extra_mounts: mount,
                 now,
                 dry_run,
@@ -409,11 +411,13 @@ pub fn run(settings: &Settings, command: ContainerCommand) -> Result<()> {
         ContainerCommand::Shell => shell(settings),
         ContainerCommand::Rebuild {
             dry_run,
+            force,
             with_tools,
         } => up(
             settings,
             UpArgs {
                 rebuild: true,
+                force,
                 extra_mounts: vec![],
                 now: true,
                 dry_run,
@@ -440,6 +444,7 @@ pub fn run(settings: &Settings, command: ContainerCommand) -> Result<()> {
 
 pub struct UpArgs {
     pub rebuild: bool,
+    pub force: bool,
     pub extra_mounts: Vec<String>,
     pub now: bool,
     pub dry_run: bool,
@@ -491,7 +496,7 @@ pub fn up(settings: &Settings, args: UpArgs) -> Result<()> {
         println!("Container '{CONTAINER_NAME}' already exists (keeping its installed software).");
     }
 
-    install_service(engine, args.now, args.dry_run)?;
+    install_service(engine, args.now, args.dry_run, args.force)?;
     if !args.dry_run {
         service::write_deployment(settings, "container");
         println!();
@@ -685,7 +690,7 @@ fn build_from_source(engine: Engine, dry_run: bool, with_tools: bool) -> Result<
     eng(engine, &refs, dry_run)
 }
 
-fn install_service(engine: Engine, now: bool, dry_run: bool) -> Result<()> {
+fn install_service(engine: Engine, now: bool, dry_run: bool, force: bool) -> Result<()> {
     let platform = service::detect();
     match platform.manager {
         service::Manager::Systemd => {
@@ -700,7 +705,7 @@ fn install_service(engine: Engine, now: bool, dry_run: bool) -> Result<()> {
                 println!("$ systemctl --user enable --now lethe.service");
                 return Ok(());
             }
-            service::guard_existing(&path, false)?;
+            service::guard_existing(&path, force)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -727,7 +732,7 @@ fn install_service(engine: Engine, now: bool, dry_run: bool) -> Result<()> {
                 );
                 return Ok(());
             }
-            service::guard_existing(&path, false)?;
+            service::guard_existing(&path, force)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }

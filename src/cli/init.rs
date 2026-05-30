@@ -179,6 +179,7 @@ fn deploy(settings: &Settings, yolo: bool) -> Result<()> {
         settings,
         crate::cli::container::UpArgs {
             rebuild: false,
+            force: false,
             extra_mounts: vec![],
             now: false,
             dry_run: false,
