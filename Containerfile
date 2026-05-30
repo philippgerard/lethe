@@ -1,4 +1,4 @@
-FROM rust:slim AS builder
+FROM rust:1.96-slim AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -13,7 +13,6 @@ RUN apt-get update \
 WORKDIR /opt/lethe
 
 COPY Cargo.toml Cargo.lock ./
-COPY .cargo/ ./cargo
 COPY config/ config/
 COPY src/ src/
 COPY vendor/ vendor/
