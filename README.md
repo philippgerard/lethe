@@ -20,6 +20,8 @@ The installer drops a prebuilt binary at `~/.lethe/bin/lethe` and hands off to `
 
 Prefer to build from source?
 
+> Linux linker note: check `.cargo/config.toml` first. If it points at `mold`, install it before building (`sudo dnf install mold` or `sudo apt-get install mold`) or adjust the linker setting for your system.
+
 ```bash
 git clone https://github.com/atemerev/lethe.git
 cd lethe
