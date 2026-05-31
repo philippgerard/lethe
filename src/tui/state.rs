@@ -117,7 +117,7 @@ impl AppState {
             model: String::from("(unknown)"),
             provider: String::new(),
             prompt_tokens: None,
-            max_context: 200_000,
+            max_context: 128_000,
             status_message: None,
             sidebar_visible: true,
             transcript_scroll: 0,
@@ -544,22 +544,12 @@ fn push_segment(segments: &mut Vec<String>, current: &mut Vec<&str>) {
     current.clear();
 }
 
-/// Coarse context-window estimates so the footer's `x/y` gauge means
-/// something. Conservative; the real cap is provider/model specific and
-/// updated on rare model changes.
-fn guess_context_window(model: &str) -> u64 {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("opus") || lower.contains("sonnet") || lower.contains("haiku") {
-        200_000
-    } else if lower.contains("gpt-4o") || lower.contains("gpt-4.1") {
-        128_000
-    } else if lower.contains("gpt-5") {
-        400_000
-    } else if lower.contains("gemini") {
-        1_000_000
-    } else {
-        128_000
-    }
+/// Context window for the footer's `x/y` gauge. Capped at 128k by policy
+/// (see `config/model_context_limits.json`): even when a model supports
+/// more, auto-compaction keeps history below 128k, so the gauge tracks the
+/// effective working window, not the model's theoretical maximum.
+fn guess_context_window(_model: &str) -> u64 {
+    128_000
 }
 
 #[cfg(test)]
