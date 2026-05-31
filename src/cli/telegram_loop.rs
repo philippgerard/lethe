@@ -466,6 +466,7 @@ fn telegram_process_callback(
                     last_message_id: metadata_i64(&context.metadata, "message_id"),
                     guard: Some(guard.clone()),
                     dry_run: false,
+                    sent_messages: Some(client.sent_message_log()),
                 }),
                 observer: Some(Arc::new(TelegramTypingObserver::new(
                     settings.telegram.bot_token.clone(),
@@ -624,6 +625,7 @@ async fn handle_telegram_turn(
             last_message_id: Some(message_id),
             guard: Some(guard.clone()),
             dry_run: false,
+            sent_messages: Some(client.sent_message_log()),
         }),
         observer: Some(Arc::new(TelegramTypingObserver::new(
             settings.telegram.bot_token.clone(),
@@ -751,6 +753,7 @@ async fn process_telegram_actor_updates(
             last_message_id: None,
             guard: Some(guard.clone()),
             dry_run: false,
+            sent_messages: Some(client.sent_message_log()),
         }),
         observer: Some(Arc::new(TelegramTypingObserver::new(
             settings.telegram.bot_token.clone(),
@@ -1110,10 +1113,40 @@ async fn process_telegram_once(
                 continue;
             }
             last_chat_id = Some(reaction.chat_id);
-            agent
-                .memory()
-                .messages
-                .add(MessageRole::User, &reaction.content(), Some(reaction.metadata()))?;
+            match client.recent_sent_message(reaction.chat_id, reaction.message_id) {
+                Some(sent) => {
+                    // The reaction landed on one of Lethe's own messages. Run a
+                    // real turn so she can answer — but the prompt makes silence
+                    // the default, and an empty reply sends nothing.
+                    handle_telegram_turn(
+                        client,
+                        agent,
+                        settings,
+                        options,
+                        conversation_manager,
+                        process_callback.clone(),
+                        TelegramTurnInput {
+                            chat_id: reaction.chat_id,
+                            user_id: reaction.user_id,
+                            message_id: reaction.message_id,
+                            content: reaction.self_message_prompt(&sent.text),
+                            metadata: Some(reaction.self_message_metadata(&sent.text)),
+                            attachments: Vec::new(),
+                        },
+                    )
+                    .await?;
+                }
+                None => {
+                    // Reaction on a message Lethe didn't send (the user's own
+                    // message, or one predating this process): file it into
+                    // memory without replying, as before.
+                    agent.memory().messages.add(
+                        MessageRole::User,
+                        &reaction.content(),
+                        Some(reaction.metadata()),
+                    )?;
+                }
+            }
             processed += 1;
         }
     }

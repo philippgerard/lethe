@@ -309,6 +309,7 @@ fn exposes_and_executes_telegram_tools_when_context_is_present() {
                 last_message_id: Some(42),
                 guard: Some(guard.clone()),
                 dry_run: true,
+                sent_messages: None,
             }),
             ..ToolRuntime::default()
         },

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,11 +32,63 @@ pub enum TelegramError {
 
 pub type TelegramResult<T> = Result<T, TelegramError>;
 
+/// Number of recently-sent outgoing messages we remember per process so that we
+/// can recognise reactions placed on Lethe's *own* messages.
+const SENT_MESSAGE_LOG_CAPACITY: usize = 256;
+/// Cap the stored excerpt of each outgoing message — we only need enough to
+/// remind the model what it said, not the whole payload.
+const SENT_MESSAGE_EXCERPT_CHARS: usize = 400;
+
+/// A message Lethe sent on Telegram, kept just long enough to attribute later
+/// reactions back to it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SentMessage {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub text: String,
+}
+
+/// Bounded ring of [`SentMessage`]s. Telegram's `message_reaction` updates never
+/// say who authored the reacted message, so we track our own outgoing messages
+/// and match reactions against them.
+#[derive(Debug, Default)]
+pub struct SentMessageLog {
+    entries: VecDeque<SentMessage>,
+}
+
+impl SentMessageLog {
+    pub fn record(&mut self, chat_id: i64, message_id: i64, text: &str) {
+        // A message_id is unique within a chat; drop any stale entry so an edit
+        // or resend updates rather than duplicates.
+        self.entries
+            .retain(|entry| !(entry.chat_id == chat_id && entry.message_id == message_id));
+        self.entries.push_back(SentMessage {
+            chat_id,
+            message_id,
+            text: truncate_excerpt(text, SENT_MESSAGE_EXCERPT_CHARS),
+        });
+        while self.entries.len() > SENT_MESSAGE_LOG_CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    pub fn find(&self, chat_id: i64, message_id: i64) -> Option<SentMessage> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.chat_id == chat_id && entry.message_id == message_id)
+            .cloned()
+    }
+}
+
+pub type SharedSentMessageLog = Arc<Mutex<SentMessageLog>>;
+
 #[derive(Clone)]
 pub struct TelegramClient {
     token: String,
     allowed_user_ids: Vec<i64>,
     http: reqwest::Client,
+    sent_messages: SharedSentMessageLog,
 }
 
 impl TelegramClient {
@@ -48,11 +101,34 @@ impl TelegramClient {
             token,
             allowed_user_ids,
             http: reqwest::Client::new(),
+            sent_messages: Arc::new(Mutex::new(SentMessageLog::default())),
         })
     }
 
     pub fn user_allowed(&self, user_id: i64) -> bool {
         self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(&user_id)
+    }
+
+    /// A shared handle to this client's outgoing-message log, so other send
+    /// paths (e.g. the tool egress) can record into the same history the
+    /// reaction handler reads from.
+    pub fn sent_message_log(&self) -> SharedSentMessageLog {
+        Arc::clone(&self.sent_messages)
+    }
+
+    fn remember_sent_message(&self, chat_id: i64, message_id: i64, text: &str) {
+        if let Ok(mut log) = self.sent_messages.lock() {
+            log.record(chat_id, message_id, text);
+        }
+    }
+
+    /// Look up a message Lethe recently sent in this chat — used to tell whether
+    /// an incoming reaction landed on one of her own messages.
+    pub fn recent_sent_message(&self, chat_id: i64, message_id: i64) -> Option<SentMessage> {
+        self.sent_messages
+            .lock()
+            .ok()
+            .and_then(|log| log.find(chat_id, message_id))
     }
 
     pub async fn get_updates(
@@ -86,20 +162,24 @@ impl TelegramClient {
         // GitHub markdown, silently degrading to literal asterisks. If HTML
         // still fails to parse, fall back to the original plain text.
         let html = markdown_to_telegram_html(text);
-        match self
+        let message_id = match self
             .send_message_with_mode(chat_id, &html, Some("HTML"))
             .await
         {
-            Ok(id) => Ok(id),
+            Ok(id) => id,
             Err(error) if is_parse_entity_error(&error) => {
                 tracing::warn!(
                     error = %error,
                     "Telegram rejected HTML parse, retrying as plain text"
                 );
-                self.send_message_with_mode(chat_id, text, None).await
+                self.send_message_with_mode(chat_id, text, None).await?
             }
-            Err(error) => Err(error),
-        }
+            Err(error) => return Err(error),
+        };
+        // Remember our own outgoing messages so a later reaction on this message
+        // can be recognised as a reaction to something Lethe said.
+        self.remember_sent_message(chat_id, message_id, text);
+        Ok(message_id)
     }
 
     async fn send_message_with_mode(
@@ -735,6 +815,54 @@ impl IncomingTelegramReaction {
             "telegram",
         )
     }
+
+    /// Turn prompt used when the reaction landed on one of Lethe's own messages.
+    /// It hands her the reacted text and makes silence the default: she replies
+    /// only when a reply genuinely adds something.
+    pub fn self_message_prompt(&self, reacted_text: &str) -> String {
+        let excerpt = truncate_excerpt(reacted_text, SENT_MESSAGE_EXCERPT_CHARS);
+        format!(
+            "[Telegram] The user reacted {emoji} to your earlier message:\n\"{excerpt}\"\n\n\
+             This is a reaction to something you said, not a new request. Most reactions are just \
+             lightweight acknowledgement and need no answer. Reply only if a reply is genuinely \
+             warranted — for example the reaction implies a question, disagreement, surprise, or \
+             clearly invites you to continue. If a reply would add nothing, return an empty \
+             message and stay silent. A single emoji is fine when a small acknowledgement fits.",
+            emoji = self.emojis.join(" "),
+            excerpt = excerpt,
+        )
+    }
+
+    /// Metadata for the memory record of a reaction on Lethe's own message,
+    /// enriched with what she had said so the moment stays legible in recall.
+    pub fn self_message_metadata(&self, reacted_text: &str) -> serde_json::Value {
+        annotate_value(
+            json!({
+                "source": "telegram_reaction",
+                "chat_id": self.chat_id,
+                "user_id": self.user_id,
+                "message_id": self.message_id,
+                "reaction_new": self.emojis,
+                "self_message": true,
+                "reacted_message_excerpt": truncate_excerpt(reacted_text, SENT_MESSAGE_EXCERPT_CHARS),
+            }),
+            MessageVisibility::UserVisible,
+            MessageKind::TelegramReaction,
+            "telegram",
+        )
+    }
+}
+
+/// Collapse whitespace and clamp `text` to at most `max_chars` characters,
+/// appending an ellipsis when truncated. Used for outgoing-message excerpts.
+fn truncate_excerpt(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut truncated: String = collapsed.chars().take(max_chars).collect();
+    truncated.push('…');
+    truncated
 }
 
 #[derive(Debug, Deserialize)]
@@ -949,6 +1077,22 @@ pub struct TelegramToolContext {
     pub last_message_id: Option<i64>,
     pub guard: Option<SharedTelegramTurnGuard>,
     pub dry_run: bool,
+    /// Shared outgoing-message log (from the polling [`TelegramClient`]) so that
+    /// messages Lethe sends via tools are also attributable to later reactions.
+    pub sent_messages: Option<SharedSentMessageLog>,
+}
+
+impl TelegramToolContext {
+    fn remember_sent_message(&self, message_id: i64, text: &str) {
+        if message_id <= 0 {
+            return;
+        }
+        if let Some(log) = &self.sent_messages
+            && let Ok(mut log) = log.lock()
+        {
+            log.record(self.chat_id, message_id, text);
+        }
+    }
 }
 
 impl crate::tools::registry::MessageEgress for TelegramToolContext {
@@ -980,12 +1124,15 @@ impl TelegramToolContext {
             .unwrap();
         }
         match send_message_blocking(&self.token, self.chat_id, text, parse_mode) {
-            Ok(message_id) => serde_json::to_string_pretty(&json!({
-                "success": true,
-                "message_id": message_id,
-                "chat_id": self.chat_id,
-            }))
-            .unwrap(),
+            Ok(message_id) => {
+                self.remember_sent_message(message_id, text);
+                serde_json::to_string_pretty(&json!({
+                    "success": true,
+                    "message_id": message_id,
+                    "chat_id": self.chat_id,
+                }))
+                .unwrap()
+            }
             Err(error) => error_payload(&error.to_string()),
         }
     }
@@ -1013,14 +1160,17 @@ impl TelegramToolContext {
             send_file_path_blocking(&self.token, self.chat_id, &plan, caption)
         };
         match result {
-            Ok(message_id) => serde_json::to_string_pretty(&json!({
-                "success": true,
-                "type": plan.send_type.as_str(),
-                "filename": plan.filename,
-                "chat_id": self.chat_id,
-                "message_id": message_id,
-            }))
-            .unwrap(),
+            Ok(message_id) => {
+                self.remember_sent_message(message_id, caption);
+                serde_json::to_string_pretty(&json!({
+                    "success": true,
+                    "type": plan.send_type.as_str(),
+                    "filename": plan.filename,
+                    "chat_id": self.chat_id,
+                    "message_id": message_id,
+                }))
+                .unwrap()
+            }
             Err(error) => error_payload(&error.to_string()),
         }
     }
@@ -1326,6 +1476,66 @@ mod tests {
     }
 
     #[test]
+    fn sent_message_log_records_and_matches_recent_messages() {
+        let client = TelegramClient::new("token", vec![7]).unwrap();
+        assert!(client.recent_sent_message(100, 5).is_none());
+
+        client.remember_sent_message(100, 5, "hello there");
+        let found = client.recent_sent_message(100, 5).expect("recorded message");
+        assert_eq!(found.chat_id, 100);
+        assert_eq!(found.message_id, 5);
+        assert_eq!(found.text, "hello there");
+
+        // message_id is matched per-chat.
+        assert!(client.recent_sent_message(101, 5).is_none());
+    }
+
+    #[test]
+    fn sent_message_log_evicts_oldest_beyond_capacity() {
+        let mut log = SentMessageLog::default();
+        for id in 0..(SENT_MESSAGE_LOG_CAPACITY as i64 + 10) {
+            log.record(1, id, "msg");
+        }
+        // The earliest entries fall out of the bounded ring.
+        assert!(log.find(1, 0).is_none());
+        assert!(log.find(1, 9).is_none());
+        // The most recent ones are retained.
+        assert!(
+            log.find(1, SENT_MESSAGE_LOG_CAPACITY as i64 + 9)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn self_message_prompt_includes_emoji_and_silence_guidance() {
+        let reaction = IncomingTelegramReaction {
+            update_id: 1,
+            chat_id: 100,
+            user_id: 7,
+            message_id: 5,
+            emojis: vec!["🔥".to_string()],
+        };
+        let prompt = reaction.self_message_prompt("a message I sent earlier");
+        assert!(prompt.contains("🔥"));
+        assert!(prompt.contains("a message I sent earlier"));
+        assert!(prompt.contains("stay silent"));
+
+        let metadata = reaction.self_message_metadata("a message I sent earlier");
+        assert_eq!(metadata["self_message"], true);
+        assert_eq!(
+            metadata["reacted_message_excerpt"],
+            "a message I sent earlier"
+        );
+    }
+
+    #[test]
+    fn truncate_excerpt_collapses_whitespace_and_clamps() {
+        assert_eq!(truncate_excerpt("  a\n\n b   c ", 100), "a b c");
+        let long = "x".repeat(10);
+        assert_eq!(truncate_excerpt(&long, 4), "xxxx…");
+    }
+
+    #[test]
     fn parses_voice_update_for_transcription() {
         let raw = r#"{
             "update_id": 44,
@@ -1557,6 +1767,7 @@ mod tests {
             last_message_id: Some(42),
             guard: Some(guard.clone()),
             dry_run: true,
+            sent_messages: None,
         };
 
         let payload = context.react("🔥", 77);
@@ -1639,6 +1850,7 @@ mod tests {
             last_message_id: Some(42),
             guard: None,
             dry_run: true,
+            sent_messages: None,
         };
 
         let message: serde_json::Value =
