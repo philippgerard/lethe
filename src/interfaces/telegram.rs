@@ -394,17 +394,22 @@ impl TelegramUpdate {
         if data.is_empty() {
             return None;
         }
-        let message = callback.message.as_ref()?;
+        // `message` is absent for presses on messages older than ~48h or
+        // otherwise inaccessible. We can still answer the callback and route the
+        // press: in a private chat the chat id equals the user id, so fall back
+        // to that and leave `message_id` unset (no inline keyboard to remove).
+        let message = callback.message.as_ref();
+        let chat_id = message.map_or(user.id, |message| message.chat.id);
+        let message_id = message.map(|message| message.message_id);
         let button_text = message
-            .reply_markup
-            .as_ref()
+            .and_then(|message| message.reply_markup.as_ref())
             .and_then(|markup| markup.inline_button_text_for_callback_data(data));
         Some(IncomingTelegramCallback {
             update_id: self.update_id,
             callback_query_id: callback.id.clone(),
-            chat_id: message.chat.id,
+            chat_id,
             user_id: user.id,
-            message_id: Some(message.message_id),
+            message_id,
             data: data.to_string(),
             button_text,
         })
@@ -598,10 +603,6 @@ pub enum ReplyKeyboardButton {
 pub struct KeyboardButton {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon_custom_emoji_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub style: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_users: Option<KeyboardButtonRequestUsers>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_chat: Option<KeyboardButtonRequestChat>,
@@ -625,10 +626,6 @@ pub struct InlineKeyboardMarkup {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InlineKeyboardButton {
     pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub icon_custom_emoji_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -734,7 +731,7 @@ impl TelegramReplyMarkup {
             .inline_keyboard
             .iter()
             .flat_map(|row| row.iter())
-            .find(|button| button.callback_data.as_deref() == Some(data))
+            .find(|button| button.callback_data.as_deref().map(str::trim) == Some(data))
             .map(|button| button.text.clone())
     }
 
@@ -2641,6 +2638,29 @@ mod tests {
         assert_eq!(metadata["callback_answered"], true);
         assert_eq!(metadata["callback_consumed"], true);
         assert_eq!(metadata["callback_reply_markup_removed"], true);
+    }
+
+    #[test]
+    fn parses_callback_query_without_message_falls_back_to_user_chat() {
+        // Telegram omits `message` for presses on messages older than ~48h.
+        // The press must still be routable (private chat id == user id) and the
+        // callback still answerable, rather than silently dropped.
+        let raw = r#"{
+            "update_id": 50,
+            "callback_query": {
+                "id": "cb-2",
+                "from": {"id": 7},
+                "data": "start_now"
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(raw).unwrap();
+        let incoming = update.incoming_callback().unwrap();
+        assert_eq!(incoming.callback_query_id, "cb-2");
+        assert_eq!(incoming.chat_id, 7);
+        assert_eq!(incoming.user_id, 7);
+        assert_eq!(incoming.message_id, None);
+        assert_eq!(incoming.data, "start_now");
+        assert_eq!(incoming.button_text, None);
     }
 
     #[test]

@@ -1005,11 +1005,13 @@ async fn process_telegram_once(
             last_chat_id = Some(incoming.chat_id);
             if pending_reply_keyboard_matches(incoming.chat_id, incoming.user_id, &incoming.text) {
                 match client.remove_reply_keyboard(incoming.chat_id).await {
-                    Ok(_) => forget_pending_reply_keyboard_match(
-                        incoming.chat_id,
-                        incoming.user_id,
-                        &incoming.text,
-                    ),
+                    Ok(_) => {
+                        forget_pending_reply_keyboard_match(
+                            incoming.chat_id,
+                            incoming.user_id,
+                            &incoming.text,
+                        );
+                    }
                     Err(error) => tracing::warn!(
                         error = %error,
                         chat_id = incoming.chat_id,

@@ -8,7 +8,13 @@ use crate::tools::spec::{ToolCategory, ToolDef, ToolExecutor, p_bool, p_int, p_s
 fn exec_telegram_send_message(registry: &ToolRegistry<'_>, args: &Value) -> String {
     match registry.message_egress() {
         Some(egress) => {
-            let reply_markup_json = string_arg(args, "reply_markup_json");
+            // Accept `reply_markup_json` as either a JSON string (the documented
+            // form) or a raw object/array — models frequently emit the latter.
+            let reply_markup_json = match args.get("reply_markup_json") {
+                Some(Value::String(text)) => text.clone(),
+                Some(value) if !value.is_null() => value.to_string(),
+                _ => String::new(),
+            };
             egress.send_message(
                 &string_arg(args, "text"),
                 &string_arg_default(args, "parse_mode", ""),
