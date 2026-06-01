@@ -1050,7 +1050,11 @@ mod tests {
             .await
             .unwrap();
 
-        let message_payload = context.send_message("progress", "html");
+        let message_payload = context.send_message(
+            "progress",
+            "html",
+            Some(r#"{"inline_keyboard":[[{"text":"Start","callback_data":"start"}]]}"#),
+        );
         let message: Value = serde_json::from_str(&message_payload).unwrap();
         assert_eq!(message["success"], true);
         let event = receiver.recv().await.unwrap();
@@ -1058,6 +1062,10 @@ mod tests {
         assert_eq!(event.data["content"], "progress");
         assert_eq!(event.data["parse_mode"], "HTML");
         assert_eq!(event.data["message_id"], 1);
+        assert_eq!(
+            event.data["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Start"
+        );
 
         let reaction_payload = context.react("✅", 0);
         let reaction: Value = serde_json::from_str(&reaction_payload).unwrap();

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde_json::{Value, json};
 
-use crate::interfaces::telegram::{TelegramFilePlan, telegram_parse_mode};
+use crate::interfaces::telegram::{TelegramFilePlan, parse_reply_markup_json, telegram_parse_mode};
 
 use super::payload::tool_error_payload;
 
@@ -33,8 +33,13 @@ impl fmt::Debug for ClientToolContext {
 }
 
 impl super::MessageEgress for ClientToolContext {
-    fn send_message(&self, text: &str, parse_mode: &str) -> String {
-        Self::send_message(self, text, parse_mode)
+    fn send_message(
+        &self,
+        text: &str,
+        parse_mode: &str,
+        reply_markup_json: Option<&str>,
+    ) -> String {
+        Self::send_message(self, text, parse_mode, reply_markup_json)
     }
     fn send_file(&self, file_path_or_url: &str, caption: &str, as_document: bool) -> String {
         Self::send_file(self, file_path_or_url, caption, as_document)
@@ -58,31 +63,47 @@ impl ClientToolContext {
         }
     }
 
-    pub fn send_message(&self, text: &str, parse_mode: &str) -> String {
+    pub fn send_message(
+        &self,
+        text: &str,
+        parse_mode: &str,
+        reply_markup_json: Option<&str>,
+    ) -> String {
         let text = text.trim();
         if text.is_empty() {
             return tool_error_payload("Client message text is required.");
         }
+        let reply_markup = match reply_markup_json.map(parse_reply_markup_json).transpose() {
+            Ok(value) => value.flatten(),
+            Err(error) => return tool_error_payload(&error),
+        };
         let message_id = self.next_message_id();
         let parse_mode = telegram_parse_mode(parse_mode);
+        let mut data = json!({
+            "content": text,
+            "parse_mode": parse_mode,
+            "message_id": message_id,
+            "intermediate": true,
+        });
+        if let Some(reply_markup) = &reply_markup {
+            data["reply_markup"] = json!(reply_markup);
+        }
         if !(self.emit)(ClientToolEvent {
             event: "text".to_string(),
-            data: json!({
-                "content": text,
-                "parse_mode": parse_mode,
-                "message_id": message_id,
-                "intermediate": true,
-            }),
+            data,
         }) {
             return tool_error_payload("Client event receiver is unavailable.");
         }
-        serde_json::to_string_pretty(&json!({
+        let mut payload = json!({
             "success": true,
             "message_id": message_id,
             "chat_id": self.chat_id,
             "parse_mode": parse_mode,
-        }))
-        .unwrap()
+        });
+        if let Some(reply_markup) = &reply_markup {
+            payload["reply_markup"] = json!(reply_markup);
+        }
+        serde_json::to_string_pretty(&payload).unwrap()
     }
 
     pub fn send_file(&self, file_path_or_url: &str, caption: &str, as_document: bool) -> String {

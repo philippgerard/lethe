@@ -306,6 +306,7 @@ fn exposes_and_executes_telegram_tools_when_context_is_present() {
             telegram: Some(TelegramToolContext {
                 token: "token".to_string(),
                 chat_id: 99,
+                user_id: Some(7),
                 last_message_id: Some(42),
                 guard: Some(guard.clone()),
                 dry_run: true,
@@ -326,11 +327,25 @@ fn exposes_and_executes_telegram_tools_when_context_is_present() {
 
     let message_payload = registry.execute(
         "telegram_send_message",
-        &json!({"text": "hello", "parse_mode": "html"}),
+        &json!({
+            "text": "hello",
+            "parse_mode": "html",
+            "reply_markup_json": r#"{"inline_keyboard":[[{"text":"Start","callback_data":"start"}]]}"#
+        }),
     );
     let message: serde_json::Value = serde_json::from_str(&message_payload).unwrap();
     assert_eq!(message["success"], true);
     assert_eq!(message["parse_mode"], "HTML");
+    assert_eq!(
+        message["reply_markup"]["inline_keyboard"][0][0]["text"],
+        "Start"
+    );
+
+    let invalid_markup = registry.execute(
+        "telegram_send_message",
+        &json!({"text": "hello", "reply_markup_json": r#"{"inline_keyboard":[[{"text":"Bad"}]]}"#}),
+    );
+    assert!(invalid_markup.contains("exactly one action"));
 
     let file_payload = registry.execute(
         "telegram_send_file",
@@ -388,12 +403,18 @@ fn client_tool_context_exposes_telegram_tools_as_events() {
 
     let message_payload = registry.execute(
         "telegram_send_message",
-        &json!({"text": "progress", "parse_mode": "markdown"}),
+        &json!({
+            "text": "progress",
+            "parse_mode": "markdown",
+            "reply_markup_json": r#"{"keyboard":[["Yes","No"]],"resize_keyboard":true}"#
+        }),
     );
     let message: serde_json::Value = serde_json::from_str(&message_payload).unwrap();
     assert_eq!(message["success"], true);
     assert_eq!(message["message_id"], 1);
     assert_eq!(message["chat_id"], 7);
+    assert_eq!(message["reply_markup"]["keyboard"][0][0], "Yes");
+    assert_eq!(message["reply_markup"]["one_time_keyboard"], true);
 
     let file_payload = registry.execute(
         "telegram_send_file",
@@ -418,6 +439,8 @@ fn client_tool_context_exposes_telegram_tools_as_events() {
     assert_eq!(events[0].data["content"], "progress");
     assert_eq!(events[0].data["parse_mode"], "MarkdownV2");
     assert_eq!(events[0].data["message_id"], 1);
+    assert_eq!(events[0].data["reply_markup"]["keyboard"][0][1], "No");
+    assert_eq!(events[0].data["reply_markup"]["one_time_keyboard"], true);
     assert_eq!(events[1].event, "file");
     assert_eq!(events[1].data["type"], "document");
     assert_eq!(events[1].data["path"], "https://example.com/report.pdf");

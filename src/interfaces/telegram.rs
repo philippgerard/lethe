@@ -1,13 +1,15 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::memory::message_metadata::{MessageKind, MessageVisibility, annotate_value};
+use crate::memory::message_metadata::{
+    MessageKind, MessageVisibility, annotate_map, annotate_value,
+};
 
 mod formatting;
 use formatting::{
@@ -91,6 +93,9 @@ pub struct TelegramClient {
     sent_messages: SharedSentMessageLog,
 }
 
+const TELEGRAM_ALLOWED_UPDATES: &str = "[\"message\",\"message_reaction\",\"callback_query\"]";
+const PENDING_REPLY_KEYBOARD_TTL: Duration = Duration::from_secs(30 * 60);
+
 impl TelegramClient {
     pub fn new(token: impl Into<String>, allowed_user_ids: Vec<i64>) -> TelegramResult<Self> {
         let token = token.into();
@@ -138,10 +143,7 @@ impl TelegramClient {
     ) -> TelegramResult<Vec<TelegramUpdate>> {
         let mut request = self.http.get(self.method_url("getUpdates")).query(&[
             ("timeout", timeout_seconds.to_string()),
-            (
-                "allowed_updates",
-                "[\"message\",\"message_reaction\"]".to_string(),
-            ),
+            ("allowed_updates", TELEGRAM_ALLOWED_UPDATES.to_string()),
         ]);
         if let Some(offset) = offset {
             request = request.query(&[("offset", offset.to_string())]);
@@ -156,6 +158,21 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: &str) -> TelegramResult<i64> {
+        self.send_message_with_reply_markup(chat_id, text, None)
+            .await
+    }
+
+    pub async fn send_message_with_reply_markup(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<&TelegramReplyMarkup>,
+    ) -> TelegramResult<i64> {
+        let reply_markup = reply_markup.map(TelegramReplyMarkup::with_send_defaults);
+        let reply_markup = reply_markup.as_ref();
+        if let Some(reply_markup) = reply_markup {
+            reply_markup.validate().map_err(TelegramError::Api)?;
+        }
         // Convert the model's GitHub-flavored markdown to Telegram's HTML
         // subset so **bold**, lists, `code`, and links actually render.
         // Legacy `Markdown` mode only understands single-`*` and chokes on
@@ -163,7 +180,7 @@ impl TelegramClient {
         // still fails to parse, fall back to the original plain text.
         let html = markdown_to_telegram_html(text);
         let message_id = match self
-            .send_message_with_mode(chat_id, &html, Some("HTML"))
+            .send_message_with_mode(chat_id, &html, Some("HTML"), reply_markup)
             .await
         {
             Ok(id) => id,
@@ -172,7 +189,8 @@ impl TelegramClient {
                     error = %error,
                     "Telegram rejected HTML parse, retrying as plain text"
                 );
-                self.send_message_with_mode(chat_id, text, None).await?
+                self.send_message_with_mode(chat_id, text, None, reply_markup)
+                    .await?
             }
             Err(error) => return Err(error),
         };
@@ -187,6 +205,7 @@ impl TelegramClient {
         chat_id: i64,
         text: &str,
         parse_mode: Option<&str>,
+        reply_markup: Option<&TelegramReplyMarkup>,
     ) -> TelegramResult<i64> {
         // Telegram returns 400 with a structured `{ok:false, description:"..."}`
         // body when markdown parsing fails. Skip `error_for_status()` so the
@@ -200,6 +219,7 @@ impl TelegramClient {
                 text,
                 parse_mode,
                 disable_web_page_preview: true,
+                reply_markup,
             })
             .send()
             .await?
@@ -254,6 +274,58 @@ impl TelegramClient {
         }
     }
 
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+        show_alert: bool,
+    ) -> TelegramResult<bool> {
+        let response = self
+            .http
+            .post(self.method_url("answerCallbackQuery"))
+            .json(&AnswerCallbackQueryRequest {
+                callback_query_id,
+                text,
+                show_alert,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TelegramResponse<bool>>()
+            .await?;
+        response.into_result()
+    }
+
+    pub async fn remove_reply_keyboard(&self, chat_id: i64) -> TelegramResult<i64> {
+        let markup = TelegramReplyMarkup::ReplyKeyboardRemove(TelegramReplyKeyboardRemove {
+            remove_keyboard: true,
+            selective: None,
+        });
+        self.send_message_with_reply_markup(chat_id, "✓", Some(&markup))
+            .await
+    }
+
+    pub async fn remove_inline_keyboard(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> TelegramResult<bool> {
+        let response = self
+            .http
+            .post(self.method_url("editMessageReplyMarkup"))
+            .json(&EditMessageReplyMarkupRequest {
+                chat_id,
+                message_id,
+                reply_markup: None,
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<TelegramResponse<serde_json::Value>>()
+            .await?;
+        response.into_result().map(|_| true)
+    }
+
     pub async fn get_file(&self, file_id: &str) -> TelegramResult<TelegramFileInfo> {
         let response = self
             .http
@@ -294,6 +366,8 @@ pub struct TelegramUpdate {
     pub message: Option<TelegramMessage>,
     #[serde(default)]
     pub message_reaction: Option<TelegramReactionUpdate>,
+    #[serde(default)]
+    pub callback_query: Option<TelegramCallbackQuery>,
 }
 
 impl TelegramUpdate {
@@ -310,6 +384,29 @@ impl TelegramUpdate {
             user_id: from.id,
             message_id: message.message_id,
             text: text.to_string(),
+        })
+    }
+
+    pub fn incoming_callback(&self) -> Option<IncomingTelegramCallback> {
+        let callback = self.callback_query.as_ref()?;
+        let user = callback.from.as_ref()?;
+        let data = callback.data.as_deref()?.trim();
+        if data.is_empty() {
+            return None;
+        }
+        let message = callback.message.as_ref()?;
+        let button_text = message
+            .reply_markup
+            .as_ref()
+            .and_then(|markup| markup.inline_button_text_for_callback_data(data));
+        Some(IncomingTelegramCallback {
+            update_id: self.update_id,
+            callback_query_id: callback.id.clone(),
+            chat_id: message.chat.id,
+            user_id: user.id,
+            message_id: Some(message.message_id),
+            data: data.to_string(),
+            button_text,
         })
     }
 
@@ -440,6 +537,460 @@ impl TelegramUpdate {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TelegramCallbackQuery {
+    pub id: String,
+    #[serde(default)]
+    pub from: Option<TelegramUser>,
+    #[serde(default)]
+    pub message: Option<TelegramMessage>,
+    #[serde(default)]
+    pub data: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TelegramReplyKeyboardRemove {
+    pub remove_keyboard: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selective: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TelegramForceReply {
+    pub force_reply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_field_placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selective: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TelegramReplyMarkup {
+    InlineKeyboardMarkup(InlineKeyboardMarkup),
+    ReplyKeyboardMarkup(ReplyKeyboardMarkup),
+    ReplyKeyboardRemove(TelegramReplyKeyboardRemove),
+    ForceReply(TelegramForceReply),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplyKeyboardMarkup {
+    pub keyboard: Vec<Vec<ReplyKeyboardButton>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_persistent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize_keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_time_keyboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_field_placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selective: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReplyKeyboardButton {
+    Text(String),
+    Button(KeyboardButton),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardButton {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_custom_emoji_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_users: Option<KeyboardButtonRequestUsers>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_chat: Option<KeyboardButtonRequestChat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_managed_bot: Option<KeyboardButtonRequestManagedBot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_contact: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_location: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_poll: Option<KeyboardButtonPollType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_app: Option<WebAppInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InlineKeyboardMarkup {
+    pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InlineKeyboardButton {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_custom_emoji_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_app: Option<WebAppInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_url: Option<LoginUrl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query_current_chat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_inline_query_chosen_chat: Option<SwitchInlineQueryChosenChat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_text: Option<CopyTextButton>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_game: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebAppInfo {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LoginUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_write_access: Option<bool>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardButtonPollType {
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub poll_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardButtonRequestUsers {
+    pub request_id: i64,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardButtonRequestChat {
+    pub request_id: i64,
+    pub chat_is_channel: bool,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardButtonRequestManagedBot {
+    pub request_id: i64,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SwitchInlineQueryChosenChat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CopyTextButton {
+    pub text: String,
+}
+
+impl TelegramReplyMarkup {
+    pub fn reply_keyboard_button_texts(&self) -> Vec<String> {
+        match self {
+            Self::ReplyKeyboardMarkup(markup) => markup
+                .keyboard
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|button| match button {
+                    ReplyKeyboardButton::Text(text) => text,
+                    ReplyKeyboardButton::Button(button) => &button.text,
+                })
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn inline_button_text_for_callback_data(&self, data: &str) -> Option<String> {
+        let Self::InlineKeyboardMarkup(markup) = self else {
+            return None;
+        };
+        markup
+            .inline_keyboard
+            .iter()
+            .flat_map(|row| row.iter())
+            .find(|button| button.callback_data.as_deref() == Some(data))
+            .map(|button| button.text.clone())
+    }
+
+    fn with_send_defaults(&self) -> Self {
+        let mut markup = self.clone();
+        markup.apply_reply_keyboard_defaults();
+        markup
+    }
+
+    fn apply_reply_keyboard_defaults(&mut self) {
+        if let Self::ReplyKeyboardMarkup(markup) = self
+            && markup.one_time_keyboard.is_none()
+        {
+            markup.one_time_keyboard = Some(true);
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::InlineKeyboardMarkup(markup) => {
+                validate_keyboard_rows(&markup.inline_keyboard, |button| button.validate())
+            }
+            Self::ReplyKeyboardMarkup(markup) => {
+                validate_placeholder(markup.input_field_placeholder.as_deref())?;
+                validate_keyboard_rows(&markup.keyboard, |button| button.validate())
+            }
+            Self::ReplyKeyboardRemove(_) => Ok(()),
+            Self::ForceReply(markup) => {
+                validate_placeholder(markup.input_field_placeholder.as_deref())
+            }
+        }
+    }
+}
+
+impl InlineKeyboardButton {
+    fn validate(&self) -> Result<(), String> {
+        validate_button_text(&self.text)?;
+        let action_count = [
+            self.url.is_some(),
+            self.callback_data.is_some(),
+            self.web_app.is_some(),
+            self.login_url.is_some(),
+            self.switch_inline_query.is_some(),
+            self.switch_inline_query_current_chat.is_some(),
+            self.switch_inline_query_chosen_chat.is_some(),
+            self.copy_text.is_some(),
+            self.callback_game.is_some(),
+            self.pay.unwrap_or(false),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+        if action_count != 1 {
+            return Err(
+                "Inline keyboard buttons must contain exactly one action field.".to_string(),
+            );
+        }
+        if let Some(data) = &self.callback_data {
+            let len = data.len();
+            if !(1..=64).contains(&len) {
+                return Err("callback_data must be 1-64 UTF-8 bytes.".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ReplyKeyboardButton {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Text(text) => validate_button_text(text),
+            Self::Button(button) => button.validate(),
+        }
+    }
+}
+
+impl KeyboardButton {
+    fn validate(&self) -> Result<(), String> {
+        validate_button_text(&self.text)?;
+        let action_count = [
+            self.request_users.is_some(),
+            self.request_chat.is_some(),
+            self.request_managed_bot.is_some(),
+            self.request_contact.unwrap_or(false),
+            self.request_location.unwrap_or(false),
+            self.request_poll.is_some(),
+            self.web_app.is_some(),
+        ]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+        if action_count > 1 {
+            return Err(
+                "Reply keyboard buttons may contain at most one request/action field.".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_keyboard_rows<T>(
+    rows: &[Vec<T>],
+    validate_button: impl Fn(&T) -> Result<(), String>,
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Err("Keyboard must contain at least one row.".to_string());
+    }
+    for row in rows {
+        if row.is_empty() {
+            return Err("Keyboard rows must contain at least one button.".to_string());
+        }
+        for button in row {
+            validate_button(button)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_button_text(text: &str) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Keyboard button text is required.".to_string());
+    }
+    Ok(())
+}
+
+fn validate_placeholder(value: Option<&str>) -> Result<(), String> {
+    if let Some(value) = value {
+        let len = value.chars().count();
+        if !(1..=64).contains(&len) {
+            return Err("input_field_placeholder must be 1-64 characters.".to_string());
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_reply_markup_json(raw: &str) -> Result<Option<TelegramReplyMarkup>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut markup: TelegramReplyMarkup =
+        serde_json::from_str(raw).map_err(|error| format!("Invalid reply_markup_json: {error}"))?;
+    markup.apply_reply_keyboard_defaults();
+    markup.validate()?;
+    Ok(Some(markup))
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PendingReplyKeyboardKey {
+    chat_id: i64,
+    user_id: i64,
+    message_id: i64,
+}
+
+#[derive(Debug)]
+struct PendingReplyKeyboard {
+    button_texts: HashSet<String>,
+    registered_at: Instant,
+    expires_at: Instant,
+}
+
+fn pending_reply_keyboards()
+-> &'static Mutex<HashMap<PendingReplyKeyboardKey, PendingReplyKeyboard>> {
+    static PENDING: OnceLock<Mutex<HashMap<PendingReplyKeyboardKey, PendingReplyKeyboard>>> =
+        OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_pending_reply_keyboard(
+    chat_id: i64,
+    user_id: i64,
+    message_id: i64,
+    reply_markup: &TelegramReplyMarkup,
+) {
+    let TelegramReplyMarkup::ReplyKeyboardMarkup(markup) = reply_markup else {
+        return;
+    };
+    if markup.is_persistent == Some(true) || markup.one_time_keyboard == Some(false) {
+        return;
+    }
+    let button_texts = reply_markup
+        .reply_keyboard_button_texts()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if button_texts.is_empty() {
+        return;
+    }
+    if let Ok(mut pending) = pending_reply_keyboards().lock() {
+        purge_expired_reply_keyboards(&mut pending);
+        let now = Instant::now();
+        pending.insert(
+            PendingReplyKeyboardKey {
+                chat_id,
+                user_id,
+                message_id,
+            },
+            PendingReplyKeyboard {
+                button_texts,
+                registered_at: now,
+                expires_at: now + PENDING_REPLY_KEYBOARD_TTL,
+            },
+        );
+    }
+}
+
+pub fn pending_reply_keyboard_matches(chat_id: i64, user_id: i64, text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let Ok(mut pending) = pending_reply_keyboards().lock() else {
+        return false;
+    };
+    purge_expired_reply_keyboards(&mut pending);
+    pending_reply_keyboard_match_key(&pending, chat_id, user_id, text).is_some()
+}
+
+pub fn forget_pending_reply_keyboard_match(chat_id: i64, user_id: i64, text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let Ok(mut pending) = pending_reply_keyboards().lock() else {
+        return false;
+    };
+    purge_expired_reply_keyboards(&mut pending);
+    let Some(key) = pending_reply_keyboard_match_key(&pending, chat_id, user_id, text) else {
+        return false;
+    };
+    pending.remove(&key);
+    true
+}
+
+fn pending_reply_keyboard_match_key(
+    pending: &HashMap<PendingReplyKeyboardKey, PendingReplyKeyboard>,
+    chat_id: i64,
+    user_id: i64,
+    text: &str,
+) -> Option<PendingReplyKeyboardKey> {
+    pending
+        .iter()
+        .filter(|(key, keyboard)| {
+            key.chat_id == chat_id && key.user_id == user_id && keyboard.button_texts.contains(text)
+        })
+        .max_by_key(|(key, keyboard)| (keyboard.registered_at, key.message_id))
+        .map(|(key, _)| key.clone())
+}
+
+fn purge_expired_reply_keyboards(
+    pending: &mut HashMap<PendingReplyKeyboardKey, PendingReplyKeyboard>,
+) {
+    let now = Instant::now();
+    pending.retain(|_, keyboard| keyboard.expires_at > now);
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TelegramReactionUpdate {
     pub chat: TelegramChat,
     pub message_id: i64,
@@ -479,6 +1030,8 @@ pub struct TelegramMessage {
     pub document: Option<TelegramDocumentMedia>,
     #[serde(default)]
     pub sticker: Option<TelegramStickerMedia>,
+    #[serde(default)]
+    pub reply_markup: Option<TelegramReplyMarkup>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -561,6 +1114,17 @@ pub struct IncomingTelegramText {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingTelegramCallback {
+    pub update_id: i64,
+    pub callback_query_id: String,
+    pub chat_id: i64,
+    pub user_id: i64,
+    pub message_id: Option<i64>,
+    pub data: String,
+    pub button_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncomingTelegramReaction {
     pub update_id: i64,
     pub chat_id: i64,
@@ -626,6 +1190,63 @@ pub struct IncomingTelegramSticker {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub file_size: Option<i64>,
+}
+
+impl IncomingTelegramCallback {
+    pub fn content(&self) -> String {
+        let data = self.data.trim();
+        match self
+            .button_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            Some(label) if label == data => format!("[Telegram button pressed: {label}]"),
+            Some(label) => format!(
+                "[Telegram button pressed: {label}]\nCallback data: {data}"
+            ),
+            None => format!("[Telegram callback data: {data}]"),
+        }
+    }
+
+    pub fn metadata_with_status(
+        &self,
+        callback_answered: bool,
+        callback_consumed: bool,
+        callback_reply_markup_removed: bool,
+    ) -> serde_json::Value {
+        let mut metadata = serde_json::Map::from_iter([
+            ("source".to_string(), json!("telegram_callback")),
+            (
+                "callback_query_id".to_string(),
+                json!(self.callback_query_id),
+            ),
+            ("chat_id".to_string(), json!(self.chat_id)),
+            ("original_chat_id".to_string(), json!(self.chat_id)),
+            ("user_id".to_string(), json!(self.user_id)),
+            ("message_id".to_string(), json!(self.message_id)),
+            ("update_id".to_string(), json!(self.update_id)),
+            ("callback_data".to_string(), json!(self.data)),
+            ("button_text".to_string(), json!(self.button_text)),
+            ("callback_answered".to_string(), json!(callback_answered)),
+            ("callback_consumed".to_string(), json!(callback_consumed)),
+            (
+                "callback_reply_markup_removed".to_string(),
+                json!(callback_reply_markup_removed),
+            ),
+        ]);
+        annotate_map(
+            &mut metadata,
+            MessageVisibility::UserVisible,
+            MessageKind::Chat,
+            "telegram",
+        );
+        serde_json::Value::Object(metadata)
+    }
+
+    pub fn metadata(&self) -> serde_json::Value {
+        self.metadata_with_status(false, false, false)
+    }
 }
 
 impl IncomingTelegramAudio {
@@ -895,6 +1516,8 @@ struct SendMessageRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     parse_mode: Option<&'a str>,
     disable_web_page_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<&'a TelegramReplyMarkup>,
 }
 
 /// Telegram returns 400 with a "can't parse entities" message when the
@@ -906,6 +1529,22 @@ fn is_parse_entity_error(error: &TelegramError) -> bool {
         || message.contains("can't find end")
         || message.contains("unsupported start tag")
         || (message.contains("400") && message.contains("entities"))
+}
+
+#[derive(Debug, Serialize)]
+struct AnswerCallbackQueryRequest<'a> {
+    callback_query_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    show_alert: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct EditMessageReplyMarkupRequest {
+    chat_id: i64,
+    message_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1074,6 +1713,7 @@ async fn typing_refresh_loop(client: TelegramClient, chat_id: i64) {
 pub struct TelegramToolContext {
     pub token: String,
     pub chat_id: i64,
+    pub user_id: Option<i64>,
     pub last_message_id: Option<i64>,
     pub guard: Option<SharedTelegramTurnGuard>,
     pub dry_run: bool,
@@ -1096,8 +1736,13 @@ impl TelegramToolContext {
 }
 
 impl crate::tools::registry::MessageEgress for TelegramToolContext {
-    fn send_message(&self, text: &str, parse_mode: &str) -> String {
-        Self::send_message(self, text, parse_mode)
+    fn send_message(
+        &self,
+        text: &str,
+        parse_mode: &str,
+        reply_markup_json: Option<&str>,
+    ) -> String {
+        Self::send_message(self, text, parse_mode, reply_markup_json)
     }
     fn send_file(&self, file_path_or_url: &str, caption: &str, as_document: bool) -> String {
         Self::send_file(self, file_path_or_url, caption, as_document)
@@ -1108,24 +1753,50 @@ impl crate::tools::registry::MessageEgress for TelegramToolContext {
 }
 
 impl TelegramToolContext {
-    pub fn send_message(&self, text: &str, parse_mode: &str) -> String {
+    pub fn send_message(
+        &self,
+        text: &str,
+        parse_mode: &str,
+        reply_markup_json: Option<&str>,
+    ) -> String {
         let text = text.trim();
         if text.is_empty() {
             return error_payload("Telegram message text is required.");
         }
+        let reply_markup = match reply_markup_json.map(parse_reply_markup_json).transpose() {
+            Ok(value) => value.flatten(),
+            Err(error) => return error_payload(&error),
+        };
         let parse_mode = telegram_parse_mode(parse_mode);
         if self.dry_run {
-            return serde_json::to_string_pretty(&json!({
+            let mut payload = json!({
                 "success": true,
                 "message_id": 0,
                 "chat_id": self.chat_id,
                 "parse_mode": parse_mode,
-            }))
-            .unwrap();
+            });
+            if let Some(reply_markup) = &reply_markup {
+                payload["reply_markup"] = json!(reply_markup);
+            }
+            return serde_json::to_string_pretty(&payload).unwrap();
         }
-        match send_message_blocking(&self.token, self.chat_id, text, parse_mode) {
+        match send_message_blocking(
+            &self.token,
+            self.chat_id,
+            text,
+            parse_mode,
+            reply_markup.as_ref(),
+        ) {
             Ok(message_id) => {
                 self.remember_sent_message(message_id, text);
+                if let (Some(reply_markup), Some(user_id)) = (&reply_markup, self.user_id) {
+                    register_pending_reply_keyboard(
+                        self.chat_id,
+                        user_id,
+                        message_id,
+                        reply_markup,
+                    );
+                }
                 serde_json::to_string_pretty(&json!({
                     "success": true,
                     "message_id": message_id,
@@ -1223,6 +1894,7 @@ pub fn send_message_blocking(
     chat_id: i64,
     text: &str,
     parse_mode: Option<&'static str>,
+    reply_markup: Option<&TelegramReplyMarkup>,
 ) -> TelegramResult<i64> {
     let mut payload = json!({
         "chat_id": chat_id,
@@ -1231,6 +1903,11 @@ pub fn send_message_blocking(
     });
     if let Some(parse_mode) = parse_mode {
         payload["parse_mode"] = json!(parse_mode);
+    }
+    let reply_markup = reply_markup.map(TelegramReplyMarkup::with_send_defaults);
+    if let Some(reply_markup) = reply_markup.as_ref() {
+        reply_markup.validate().map_err(TelegramError::Api)?;
+        payload["reply_markup"] = json!(reply_markup);
     }
     let response = reqwest::blocking::Client::new()
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
@@ -1476,12 +2153,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_callback_update_with_label_content_and_metadata() {
+        let raw = r#"{
+            "update_id": 44,
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 7},
+                "data": "start_now",
+                "message": {
+                    "message_id": 6,
+                    "chat": {"id": 100},
+                    "reply_markup": {
+                        "inline_keyboard": [[{"text": "Start now", "callback_data": "start_now"}]]
+                    }
+                }
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(raw).unwrap();
+        let incoming = update.incoming_callback().unwrap();
+
+        assert_eq!(incoming.update_id, 44);
+        assert_eq!(incoming.chat_id, 100);
+        assert_eq!(incoming.user_id, 7);
+        assert_eq!(incoming.message_id, Some(6));
+        assert_eq!(incoming.data, "start_now");
+        assert_eq!(incoming.button_text.as_deref(), Some("Start now"));
+        assert_eq!(
+            incoming.content(),
+            "[Telegram button pressed: Start now]\nCallback data: start_now"
+        );
+        let metadata = incoming.metadata_with_status(true, true, true);
+        assert_eq!(metadata["callback_data"], "start_now");
+        assert_eq!(metadata["button_text"], "Start now");
+        assert_eq!(metadata["callback_consumed"], true);
+    }
+
+    #[test]
     fn sent_message_log_records_and_matches_recent_messages() {
         let client = TelegramClient::new("token", vec![7]).unwrap();
         assert!(client.recent_sent_message(100, 5).is_none());
 
         client.remember_sent_message(100, 5, "hello there");
-        let found = client.recent_sent_message(100, 5).expect("recorded message");
+        let found = client
+            .recent_sent_message(100, 5)
+            .expect("recorded message");
         assert_eq!(found.chat_id, 100);
         assert_eq!(found.message_id, 5);
         assert_eq!(found.text, "hello there");
@@ -1500,10 +2215,7 @@ mod tests {
         assert!(log.find(1, 0).is_none());
         assert!(log.find(1, 9).is_none());
         // The most recent ones are retained.
-        assert!(
-            log.find(1, SENT_MESSAGE_LOG_CAPACITY as i64 + 9)
-                .is_some()
-        );
+        assert!(log.find(1, SENT_MESSAGE_LOG_CAPACITY as i64 + 9).is_some());
     }
 
     #[test]
@@ -1764,6 +2476,7 @@ mod tests {
         let context = TelegramToolContext {
             token: "token".to_string(),
             chat_id: 99,
+            user_id: Some(7),
             last_message_id: Some(42),
             guard: Some(guard.clone()),
             dry_run: true,
@@ -1781,6 +2494,234 @@ mod tests {
         assert_eq!(pending[0].chat_id, 99);
         assert_eq!(pending[0].message_id, 77);
         assert_eq!(pending[0].emoji, "🔥");
+    }
+
+    #[test]
+    fn reply_keyboard_markup_serializes_to_bot_api_json() {
+        let markup = parse_reply_markup_json(
+            r#"{"keyboard":[["Yes",{"text":"No"}]],"resize_keyboard":true,"input_field_placeholder":"Pick one"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let value = serde_json::to_value(&markup).unwrap();
+        assert_eq!(value["keyboard"][0][0], "Yes");
+        assert_eq!(value["keyboard"][0][1]["text"], "No");
+        assert_eq!(value["resize_keyboard"], true);
+        assert_eq!(value["one_time_keyboard"], true);
+        assert_eq!(value["input_field_placeholder"], "Pick one");
+    }
+
+    #[test]
+    fn reply_keyboard_preserves_explicit_one_time_false() {
+        let markup =
+            parse_reply_markup_json(r#"{"keyboard":[["Yes","No"]],"one_time_keyboard":false}"#)
+                .unwrap()
+                .unwrap();
+        let value = serde_json::to_value(&markup).unwrap();
+        assert_eq!(value["one_time_keyboard"], false);
+    }
+
+    #[test]
+    fn inline_keyboard_markup_serializes_to_bot_api_json() {
+        let markup = parse_reply_markup_json(
+            r#"{"inline_keyboard":[[{"text":"Start","callback_data":"start_now"},{"text":"Docs","url":"https://example.com"}]]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let value = serde_json::to_value(&markup).unwrap();
+        assert_eq!(value["inline_keyboard"][0][0]["text"], "Start");
+        assert_eq!(value["inline_keyboard"][0][0]["callback_data"], "start_now");
+        assert_eq!(value["inline_keyboard"][0][1]["url"], "https://example.com");
+    }
+
+    #[test]
+    fn inline_keyboard_validation_rejects_zero_or_multiple_actions() {
+        let no_action =
+            parse_reply_markup_json(r#"{"inline_keyboard":[[{"text":"Start"}]]}"#).unwrap_err();
+        assert!(no_action.contains("exactly one action"));
+
+        let two_actions = parse_reply_markup_json(
+            r#"{"inline_keyboard":[[{"text":"Start","callback_data":"start","url":"https://example.com"}]]}"#,
+        )
+        .unwrap_err();
+        assert!(two_actions.contains("exactly one action"));
+    }
+
+    #[test]
+    fn callback_data_validation_enforces_byte_limit() {
+        let empty = parse_reply_markup_json(
+            r#"{"inline_keyboard":[[{"text":"Start","callback_data":""}]]}"#,
+        )
+        .unwrap_err();
+        assert!(empty.contains("callback_data"));
+
+        let long_data = "x".repeat(65);
+        let raw = format!(
+            r#"{{"inline_keyboard":[[{{"text":"Start","callback_data":"{long_data}"}}]]}}"#
+        );
+        let too_long = parse_reply_markup_json(&raw).unwrap_err();
+        assert!(too_long.contains("callback_data"));
+    }
+
+    #[test]
+    fn typed_reply_markup_send_defaults_make_keyboard_one_time() {
+        let markup = TelegramReplyMarkup::ReplyKeyboardMarkup(ReplyKeyboardMarkup {
+            keyboard: vec![vec![ReplyKeyboardButton::Text("Yes".to_string())]],
+            is_persistent: None,
+            resize_keyboard: Some(true),
+            one_time_keyboard: None,
+            input_field_placeholder: None,
+            selective: None,
+        })
+        .with_send_defaults();
+        let value = serde_json::to_value(&markup).unwrap();
+        assert_eq!(value["one_time_keyboard"], true);
+        assert_eq!(value["resize_keyboard"], true);
+    }
+
+    #[test]
+    fn send_message_request_omits_and_includes_reply_markup() {
+        let plain = serde_json::to_value(&SendMessageRequest {
+            chat_id: 1,
+            text: "hello",
+            parse_mode: None,
+            disable_web_page_preview: true,
+            reply_markup: None,
+        })
+        .unwrap();
+        assert!(plain.get("reply_markup").is_none());
+
+        let markup = parse_reply_markup_json(
+            r#"{"inline_keyboard":[[{"text":"Start","callback_data":"start"}]]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let with_markup = serde_json::to_value(&SendMessageRequest {
+            chat_id: 1,
+            text: "hello",
+            parse_mode: Some("HTML"),
+            disable_web_page_preview: true,
+            reply_markup: Some(&markup),
+        })
+        .unwrap();
+        assert_eq!(
+            with_markup["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Start"
+        );
+    }
+
+    #[test]
+    fn parses_callback_query_update_with_metadata() {
+        let raw = r#"{
+            "update_id": 49,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"id": 7},
+                "message": {
+                    "message_id": 5,
+                    "chat": {"id": 100},
+                    "reply_markup": {"inline_keyboard":[[{"text":"Start now","callback_data":"start_now"}]]}
+                },
+                "data": "start_now"
+            }
+        }"#;
+        let update: TelegramUpdate = serde_json::from_str(raw).unwrap();
+        let incoming = update.incoming_callback().unwrap();
+        assert_eq!(incoming.update_id, 49);
+        assert_eq!(incoming.callback_query_id, "cb-1");
+        assert_eq!(incoming.chat_id, 100);
+        assert_eq!(incoming.user_id, 7);
+        assert_eq!(incoming.message_id, Some(5));
+        assert_eq!(incoming.data, "start_now");
+        assert_eq!(incoming.button_text.as_deref(), Some("Start now"));
+        let metadata = incoming.metadata_with_status(true, true, true);
+        assert_eq!(metadata["source"], "telegram_callback");
+        assert_eq!(metadata["callback_data"], "start_now");
+        assert_eq!(metadata["button_text"], "Start now");
+        assert_eq!(metadata["callback_answered"], true);
+        assert_eq!(metadata["callback_consumed"], true);
+        assert_eq!(metadata["callback_reply_markup_removed"], true);
+    }
+
+    #[test]
+    fn edit_message_reply_markup_request_omits_markup_to_remove_inline_keyboard() {
+        let value = serde_json::to_value(&EditMessageReplyMarkupRequest {
+            chat_id: 100,
+            message_id: 5,
+            reply_markup: None,
+        })
+        .unwrap();
+        assert_eq!(value["chat_id"], 100);
+        assert_eq!(value["message_id"], 5);
+        assert!(value.get("reply_markup").is_none());
+    }
+
+    #[test]
+    fn pending_reply_keyboard_matches_once_by_chat_user_message_and_text() {
+        let chat_id = 9_000_001;
+        let user_id = 7_000_001;
+        let message_id = 5;
+        let markup = parse_reply_markup_json(r#"{"keyboard":[["Yes","No"]]}"#)
+            .unwrap()
+            .unwrap();
+        register_pending_reply_keyboard(chat_id, user_id, message_id, &markup);
+        assert!(pending_reply_keyboard_matches(chat_id, user_id, "Yes"));
+        assert!(forget_pending_reply_keyboard_match(chat_id, user_id, "Yes"));
+        assert!(!pending_reply_keyboard_matches(chat_id, user_id, "Yes"));
+    }
+
+    #[test]
+    fn pending_reply_keyboard_does_not_match_other_users_or_inline_markups() {
+        let chat_id = 9_000_002;
+        let user_id = 7_000_002;
+        let reply_markup = parse_reply_markup_json(r#"{"keyboard":[["Yes","No"]]}"#)
+            .unwrap()
+            .unwrap();
+        let inline_markup = parse_reply_markup_json(
+            r#"{"inline_keyboard":[[{"text":"Yes","callback_data":"yes"}]]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let remove_markup = TelegramReplyMarkup::ReplyKeyboardRemove(TelegramReplyKeyboardRemove {
+            remove_keyboard: true,
+            selective: None,
+        });
+
+        register_pending_reply_keyboard(chat_id, user_id, 5, &reply_markup);
+        register_pending_reply_keyboard(chat_id, user_id, 6, &inline_markup);
+        register_pending_reply_keyboard(chat_id, user_id, 7, &remove_markup);
+
+        assert!(!pending_reply_keyboard_matches(
+            chat_id,
+            user_id + 1,
+            "Yes"
+        ));
+        assert!(pending_reply_keyboard_matches(chat_id, user_id, "Yes"));
+        assert!(forget_pending_reply_keyboard_match(chat_id, user_id, "Yes"));
+        assert!(!pending_reply_keyboard_matches(chat_id, user_id, "Yes"));
+    }
+
+    #[test]
+    fn persistent_or_non_one_time_reply_keyboards_are_not_pending() {
+        let chat_id = 9_000_003;
+        let user_id = 7_000_003;
+        let persistent = parse_reply_markup_json(r#"{"keyboard":[["Stay"]],"is_persistent":true}"#)
+            .unwrap()
+            .unwrap();
+        let not_one_time =
+            parse_reply_markup_json(r#"{"keyboard":[["Stay"]],"one_time_keyboard":false}"#)
+                .unwrap()
+                .unwrap();
+
+        register_pending_reply_keyboard(chat_id, user_id, 5, &persistent);
+        register_pending_reply_keyboard(chat_id, user_id, 6, &not_one_time);
+
+        assert!(!pending_reply_keyboard_matches(chat_id, user_id, "Stay"));
+    }
+
+    #[test]
+    fn allowed_updates_include_callback_query() {
+        assert!(TELEGRAM_ALLOWED_UPDATES.contains("callback_query"));
     }
 
     #[test]
@@ -1847,17 +2788,26 @@ mod tests {
         let context = TelegramToolContext {
             token: "token".to_string(),
             chat_id: 99,
+            user_id: Some(7),
             last_message_id: Some(42),
             guard: None,
             dry_run: true,
             sent_messages: None,
         };
 
-        let message: serde_json::Value =
-            serde_json::from_str(&context.send_message("hello", "markdown")).unwrap();
+        let message: serde_json::Value = serde_json::from_str(&context.send_message(
+            "hello",
+            "markdown",
+            Some(r#"{"inline_keyboard":[[{"text":"Start","callback_data":"start"}]]}"#),
+        ))
+        .unwrap();
         assert_eq!(message["success"], true);
         assert_eq!(message["chat_id"], 99);
         assert_eq!(message["parse_mode"], "MarkdownV2");
+        assert_eq!(
+            message["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Start"
+        );
 
         let file_payload: serde_json::Value =
             serde_json::from_str(&context.send_file(file.to_str().unwrap(), "caption", false))

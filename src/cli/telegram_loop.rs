@@ -4,9 +4,10 @@
 //! Owns the `lethe telegram` subcommand surface area. Helpers that are also
 //! useful elsewhere (`empty_marker`, `prompt_store`, `active_reminders_text`)
 //! live in `main.rs` and are reached via `crate::`.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -22,9 +23,10 @@ use lethe::conversation::transcription::{
 };
 use lethe::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use lethe::interfaces::telegram::{
-    IncomingTelegramText, SharedTelegramTurnGuard, TelegramClient, TelegramToolContext,
-    TelegramTurnGuard, TelegramTypingObserver, VisibleTelegramChannel, image_mime_type_from_path,
-    is_emoji_only_reply, split_telegram_messages,
+    IncomingTelegramCallback, IncomingTelegramText, SharedTelegramTurnGuard, TelegramClient,
+    TelegramToolContext, TelegramTurnGuard, TelegramTypingObserver, VisibleTelegramChannel,
+    image_mime_type_from_path, is_emoji_only_reply, split_telegram_messages,
+    forget_pending_reply_keyboard_match, pending_reply_keyboard_matches,
 };
 use lethe::memory::MessageRole;
 use lethe::memory::message_metadata::{
@@ -38,6 +40,7 @@ use super::handlers::empty_marker;
 const TELEGRAM_TYPING_REFRESH_SECONDS: u64 = 3;
 const TELEGRAM_ACTOR_UPDATE_POLL_SECONDS: u64 = 1;
 const TELEGRAM_ACTOR_UPDATE_QUERY_LIMIT: usize = 50;
+const CONSUMED_CALLBACK_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Subcommand)]
 pub enum TelegramCommand {
@@ -156,7 +159,8 @@ pub async fn telegram_command(command: TelegramCommand) -> Result<()> {
                 options.clone(),
                 brainstem.clone(),
             ));
-            let result = run_telegram_with_agent(agent, settings, options, timeout, &brainstem).await;
+            let result =
+                run_telegram_with_agent(agent, settings, options, timeout, &brainstem).await;
             brainstem_task.abort();
             let _ = brainstem_task.await;
             result
@@ -181,9 +185,9 @@ pub async fn run_telegram_with_agent(
         settings.telegram.bot_token.clone(),
         settings.telegram.allowed_user_ids.clone(),
     )?;
-    let conversation_manager = ConversationManager::new(
-        std::time::Duration::from_secs_f64(settings.background.debounce_seconds.max(0.0)),
-    );
+    let conversation_manager = ConversationManager::new(std::time::Duration::from_secs_f64(
+        settings.background.debounce_seconds.max(0.0),
+    ));
     let process_callback = telegram_process_callback(
         client.clone(),
         agent.clone(),
@@ -412,6 +416,60 @@ fn telegram_text_metadata(
     metadata
 }
 
+fn telegram_callback_metadata(
+    incoming: &IncomingTelegramCallback,
+    callback_answered: bool,
+    callback_consumed: bool,
+    callback_reply_markup_removed: bool,
+) -> serde_json::Value {
+    incoming.metadata_with_status(
+        callback_answered,
+        callback_consumed,
+        callback_reply_markup_removed,
+    )
+}
+
+fn callback_consumed(callback: &IncomingTelegramCallback) -> bool {
+    let Ok(mut consumed) = consumed_callbacks().lock() else {
+        return false;
+    };
+    purge_consumed_callbacks(&mut consumed);
+    consumed.contains_key(&callback_consumed_key(callback))
+}
+
+fn mark_callback_consumed(callback: &IncomingTelegramCallback) {
+    if let Ok(mut consumed) = consumed_callbacks().lock() {
+        purge_consumed_callbacks(&mut consumed);
+        consumed.insert(
+            callback_consumed_key(callback),
+            Instant::now() + CONSUMED_CALLBACK_TTL,
+        );
+    }
+}
+
+fn callback_consumed_key(callback: &IncomingTelegramCallback) -> String {
+    if !callback.callback_query_id.trim().is_empty() {
+        callback.callback_query_id.clone()
+    } else {
+        format!(
+            "{}:{}:{}",
+            callback.message_id.unwrap_or(0),
+            callback.data,
+            callback.user_id
+        )
+    }
+}
+
+fn consumed_callbacks() -> &'static Mutex<HashMap<String, Instant>> {
+    static CONSUMED: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    CONSUMED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn purge_consumed_callbacks(consumed: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    consumed.retain(|_, expires_at| *expires_at > now);
+}
+
 fn metadata_i64(metadata: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i64> {
     metadata.get(key).and_then(serde_json::Value::as_i64)
 }
@@ -463,6 +521,7 @@ fn telegram_process_callback(
                 telegram: Some(TelegramToolContext {
                     token: settings.telegram.bot_token.clone(),
                     chat_id: context.chat_id,
+                    user_id: Some(context.user_id),
                     last_message_id: metadata_i64(&context.metadata, "message_id"),
                     guard: Some(guard.clone()),
                     dry_run: false,
@@ -611,7 +670,7 @@ async fn handle_telegram_turn(
 
     let TelegramTurnInput {
         chat_id,
-        user_id: _,
+        user_id,
         message_id,
         content,
         metadata,
@@ -622,6 +681,7 @@ async fn handle_telegram_turn(
         telegram: Some(TelegramToolContext {
             token: settings.telegram.bot_token.clone(),
             chat_id,
+            user_id: Some(user_id),
             last_message_id: Some(message_id),
             guard: Some(guard.clone()),
             dry_run: false,
@@ -750,6 +810,7 @@ async fn process_telegram_actor_updates(
         telegram: Some(TelegramToolContext {
             token: settings.telegram.bot_token.clone(),
             chat_id,
+            user_id: None,
             last_message_id: None,
             guard: Some(guard.clone()),
             dry_run: false,
@@ -859,11 +920,103 @@ async fn process_telegram_once(
     for update in updates {
         next_offset = Some(update.update_id + 1);
 
+        if let Some(callback) = update.incoming_callback() {
+            if !client.user_allowed(callback.user_id) {
+                continue;
+            }
+            last_chat_id = Some(callback.chat_id);
+            if callback_consumed(&callback) {
+                let _ = client
+                    .answer_callback_query(
+                        &callback.callback_query_id,
+                        Some("Already handled"),
+                        false,
+                    )
+                    .await;
+                processed += 1;
+                continue;
+            }
+
+            let callback_answered = match client
+                .answer_callback_query(&callback.callback_query_id, None, false)
+                .await
+            {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        callback_query_id = %callback.callback_query_id,
+                        "failed to answer Telegram callback query"
+                    );
+                    false
+                }
+            };
+            let callback_reply_markup_removed = if let Some(message_id) = callback.message_id {
+                match client
+                    .remove_inline_keyboard(callback.chat_id, message_id)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            chat_id = callback.chat_id,
+                            message_id,
+                            "failed to remove Telegram inline keyboard"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            handle_telegram_turn(
+                client,
+                agent,
+                settings,
+                options,
+                conversation_manager,
+                process_callback.clone(),
+                TelegramTurnInput {
+                    chat_id: callback.chat_id,
+                    user_id: callback.user_id,
+                    message_id: callback.message_id.unwrap_or(0),
+                    content: callback.content(),
+                    metadata: Some(telegram_callback_metadata(
+                        &callback,
+                        callback_answered,
+                        true,
+                        callback_reply_markup_removed,
+                    )),
+                    attachments: Vec::new(),
+                },
+            )
+            .await?;
+            mark_callback_consumed(&callback);
+            processed += 1;
+            continue;
+        }
+
         if let Some(incoming) = update.incoming_text() {
             if !client.user_allowed(incoming.user_id) {
                 continue;
             }
             last_chat_id = Some(incoming.chat_id);
+            if pending_reply_keyboard_matches(incoming.chat_id, incoming.user_id, &incoming.text) {
+                match client.remove_reply_keyboard(incoming.chat_id).await {
+                    Ok(_) => forget_pending_reply_keyboard_match(
+                        incoming.chat_id,
+                        incoming.user_id,
+                        &incoming.text,
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        chat_id = incoming.chat_id,
+                        "failed to remove Telegram reply keyboard"
+                    ),
+                }
+            }
             if handle_telegram_runtime_command(
                 client,
                 agent,
@@ -1225,7 +1378,6 @@ fn telegram_inter_message_delay(chunk: &str) -> std::time::Duration {
     let seconds = ((think + typing).min(4.0) * jitter).clamp(0.25, 4.6);
     std::time::Duration::from_secs_f64(seconds)
 }
-
 
 #[cfg(test)]
 mod tests {

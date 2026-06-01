@@ -7,10 +7,14 @@ use crate::tools::spec::{ToolCategory, ToolDef, ToolExecutor, p_bool, p_int, p_s
 
 fn exec_telegram_send_message(registry: &ToolRegistry<'_>, args: &Value) -> String {
     match registry.message_egress() {
-        Some(egress) => egress.send_message(
-            &string_arg(args, "text"),
-            &string_arg_default(args, "parse_mode", ""),
-        ),
+        Some(egress) => {
+            let reply_markup_json = string_arg(args, "reply_markup_json");
+            egress.send_message(
+                &string_arg(args, "text"),
+                &string_arg_default(args, "parse_mode", ""),
+                (!reply_markup_json.trim().is_empty()).then_some(reply_markup_json.as_str()),
+            )
+        }
         None => NO_EGRESS_ERROR.to_string(),
     }
 }
@@ -39,10 +43,14 @@ fn exec_telegram_react(registry: &ToolRegistry<'_>, args: &Value) -> String {
 pub const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "telegram_send_message",
-        description: "Send an extra Telegram message during a long task.",
+        description: "Send an extra Telegram message during a long task. Optionally attach Telegram reply_markup_json. Use reply keyboards for short visible replies; they default to one_time_keyboard=true unless explicitly set, should usually include resize_keyboard=true, and are removed after a matching button text arrives (example: {\"keyboard\":[[{\"text\":\"Yes\"},{\"text\":\"No\"}]],\"resize_keyboard\":true,\"one_time_keyboard\":true}). Use inline keyboards for message-scoped actions with short non-secret callback_data; callbacks are consumed and buttons are removed after press (example: {\"inline_keyboard\":[[{\"text\":\"Start\",\"callback_data\":\"start_now\"}]]}).",
         params: &[
             p_str_req("text", "Message text."),
             p_str("parse_mode", "markdown, html, or empty."),
+            p_str(
+                "reply_markup_json",
+                "Optional Telegram reply_markup JSON string.",
+            ),
         ],
         category: ToolCategory::Transport,
         execute: ToolExecutor::Sync(exec_telegram_send_message),

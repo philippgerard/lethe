@@ -3,7 +3,8 @@
 /// poller) and `ClientToolContext` (used by the SSE API) implement this so the
 /// `telegram_send_*` / `telegram_react` tools dispatch through one path.
 pub trait MessageEgress {
-    fn send_message(&self, text: &str, parse_mode: &str) -> String;
+    fn send_message(&self, text: &str, parse_mode: &str, reply_markup_json: Option<&str>)
+    -> String;
     fn send_file(&self, file_path_or_url: &str, caption: &str, as_document: bool) -> String;
     fn react(&self, emoji: &str, message_id: i64) -> String;
 }
@@ -22,5 +23,4 @@ impl super::ToolRegistry<'_> {
     }
 }
 
-pub(crate) const NO_EGRESS_ERROR: &str =
-    "Telegram/client context not set. This tool only works during active user transport processing.";
+pub(crate) const NO_EGRESS_ERROR: &str = "Telegram/client context not set. This tool only works during active user transport processing.";
