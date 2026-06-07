@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.22.6 - Tool-call history fix on OpenAI
+
+- **Fix every tool-using turn failing on strict OpenAI**: replayed tool
+  history serialized the tool result as a `user`-role message, so genai's
+  OpenAI adapter never emitted the required `role:"tool"` message and the API
+  rejected the turn (`an assistant message with 'tool_calls' must be followed
+  by tool messages ... the following tool_call_ids did not have response
+  messages`). Tool results are now mapped to `ChatRole::Tool`, which the OpenAI
+  adapter renders correctly; the Anthropic path is unchanged (it renders both
+  as the same `tool_result` block). Reproduced against real OpenAI; preserves
+  structured tool-call/result history for every provider.
+
 ## 0.22.5 - OpenCode Go provider
 
 - **OpenCode Go provider with dual-protocol routing** (#27, thanks @voldmar): a
