@@ -46,6 +46,7 @@ To sign in (or re-auth) a single provider without re-running the full wizard, us
 lethe login openai       # asks: ChatGPT Plus/Pro subscription (default) or API key
 lethe login anthropic    # asks: Claude Pro/Max subscription (default) or API key
 lethe login openrouter   # API key only
+lethe login opencode-go  # API key only
 ```
 
 Each command writes credentials to `~/.lethe/credentials/` (subscription) or sets the API key in `~/.lethe/config/.env`, flips `LLM_PROVIDER`, and prompts for `LLM_MODEL` / `LLM_MODEL_AUX` (defaults from the curated catalog — accept with Enter, or type any other model id).
@@ -187,7 +188,10 @@ Lethe routes chat through `genai`. The runtime supports both API-key and subscri
 | OpenAI (API key) | `OPENAI_API_KEY` | `gpt-5.5` |
 | OpenAI (ChatGPT Plus/Pro) | `lethe login openai` → token file | `gpt-5.5` |
 | OpenRouter | `OPENROUTER_API_KEY` | `openrouter/moonshotai/kimi-k2.6` |
+| OpenCode Go | `OPENCODE_GO_API_KEY` | `opencode-go/kimi-k2.6` |
 | Local OpenAI-compatible | `LLM_API_BASE` + `OPENAI_API_KEY=local` | `openai/gemma-4-31B-it-Q8_0.gguf` |
+
+[OpenCode Go](https://opencode.ai/zen/go) is a budget-friendly gateway ($5–$10/month) to a curated set of open models. Unlike the other providers it speaks **different wire protocols per model** — some models expect the OpenAI API, others the Anthropic Messages API — so each catalog entry declares its protocol and the router selects the matching adapter automatically. No subscription/OAuth path; API key only.
 
 `LLM_PROVIDER` is optional but useful when a model id does not carry a provider prefix — for example `LLM_PROVIDER=openrouter` with `LLM_MODEL=moonshotai/kimi-k2.6`. Subscription auth also requires `LLM_PROVIDER=openai` or `LLM_PROVIDER=anthropic` so the router picks the OAuth path instead of looking for an API key (the `lethe login` commands set this for you).
 
@@ -240,6 +244,7 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `OPENAI_API_KEY` | OpenAI/local-compatible key | unset |
 | `OPENAI_AUTH_TOKEN` | Optional OpenAI OAuth access token (raw) | unset |
 | `LETHE_OPENAI_OAUTH_TOKENS` | Optional OpenAI OAuth token file | `$CREDENTIALS_DIR/openai_oauth_tokens.json` |
+| `OPENCODE_GO_API_KEY` | OpenCode Go key | unset |
 | `EXA_API_KEY` | Exa search/fetch tools | unset |
 | `LETHE_SEMANTIC_SEARCH_ENABLED` | Enable vector recall (fallback is keyword search) | `true` |
 | `LETHE_EMBEDDING_PROVIDER` | `fastembed` or `hash` | `fastembed` |

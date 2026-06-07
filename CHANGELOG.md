@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- **OpenCode Go provider with dual-protocol routing** (#27, thanks @voldmar): a
+  new budget-friendly provider gateway alongside OpenRouter/Anthropic/OpenAI.
+  OpenCode Go speaks different wire protocols per model — some OpenAI-API, some
+  Anthropic-Messages — so each catalog entry declares its protocol and the
+  router selects the matching adapter (and cache dialect) automatically. Adds
+  `OPENCODE_GO_API_KEY`, `lethe login opencode-go`, 14 catalog models, and the
+  `opencode-go/` provider prefix. API key only — no subscription path.
+- **History compaction now counts and archives inline images**: base64 image
+  payloads in conversation history (e.g. Telegram photos) were invisible to the
+  compaction budget, so history with images could grow past the context window
+  and fail with `context_length_exceeded`. `message_chars()` now tallies image
+  attachments, and old images (older than the last 2 user turns) are replaced
+  with lightweight stubs before compaction.
+- **`lethe check` pings both models**: the smoke test now exercises the main
+  model and, if distinct, the aux model separately (previously only the aux).
+- **Fixes**: preserve the full error cause chain in LLM failure logs
+  (`{error:#}` / `?error`); repo-root detection (#26, thanks @voldmar) now
+  resolves from the current directory before falling back to the binary path.
+
 ## 0.22.4 - Telegram interactive keyboards
 
 - **Inline & reply keyboards** (#24, thanks @voldmar): the assistant can now
