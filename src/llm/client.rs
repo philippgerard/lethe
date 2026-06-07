@@ -2093,6 +2093,12 @@ fn into_chat_message(message: LlmMessage) -> ChatMessage {
 
     // Tool-result-only user message → genai expects a content with ToolResponse
     // parts. Mirrors what the in-turn tool loop emits via ToolResponse::new.
+    // Role must be `Tool`, not `User`: genai's OpenAI adapter only emits the
+    // required `role:"tool"` message (with tool_call_id) for ChatRole::Tool. As
+    // ChatRole::User the strict OpenAI API rejects the turn ("an assistant
+    // message with 'tool_calls' must be followed by tool messages ..."). The
+    // Anthropic path treats both roles identically (tool_result block under a
+    // user message), so this is a no-op there.
     if role == LlmRole::User && !tool_responses.is_empty() {
         let mut parts = Vec::new();
         for response in tool_responses {
@@ -2102,7 +2108,7 @@ fn into_chat_message(message: LlmMessage) -> ChatMessage {
             )));
         }
         let mut chat = ChatMessage {
-            role: ChatRole::User,
+            role: ChatRole::Tool,
             content: MessageContent::from_parts(parts),
             options: None,
         };
@@ -2216,6 +2222,72 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].as_text(), Some("caption"));
         assert!(parts[1].is_image());
+    }
+
+    #[test]
+    fn tool_results_serialize_as_tool_role() {
+        // Regression: a reconstructed historical tool result must map to genai
+        // ChatRole::Tool so the OpenAI adapter emits a `role:"tool"` message.
+        // With ChatRole::User the strict OpenAI API 400s the whole turn with
+        // "the following tool_call_ids did not have response messages".
+        let request = build_chat_request(vec![
+            LlmMessage::assistant_with_tool_calls(
+                "",
+                vec![HistoricalToolCall {
+                    call_id: "call_1".to_string(),
+                    fn_name: "calculator".to_string(),
+                    fn_arguments: serde_json::json!({"expression": "2+2"}),
+                    thought_signatures: None,
+                }],
+            ),
+            LlmMessage::tool_results(vec![HistoricalToolResponse {
+                call_id: "call_1".to_string(),
+                content: "4".to_string(),
+                source_message_id: None,
+            }]),
+        ]);
+
+        assert_eq!(request.messages.len(), 2);
+        assert!(matches!(request.messages[0].role, ChatRole::Assistant));
+        assert!(
+            matches!(request.messages[1].role, ChatRole::Tool),
+            "historical tool results must serialize as ChatRole::Tool, not User"
+        );
+    }
+
+    #[test]
+    fn tool_results_still_render_as_anthropic_tool_result_block() {
+        // The Anthropic path must be unchanged by the Tool-role mapping: tool
+        // results still become a `tool_result` block under a user message.
+        let body = anthropic_request_body(
+            "claude-opus-4-6",
+            build_chat_request(vec![
+                LlmMessage::user("what is 2+2?"),
+                LlmMessage::assistant_with_tool_calls(
+                    "",
+                    vec![HistoricalToolCall {
+                        call_id: "call_1".to_string(),
+                        fn_name: "calculator".to_string(),
+                        fn_arguments: serde_json::json!({"expression": "2+2"}),
+                        thought_signatures: None,
+                    }],
+                ),
+                LlmMessage::tool_results(vec![HistoricalToolResponse {
+                    call_id: "call_1".to_string(),
+                    content: "4".to_string(),
+                    source_message_id: None,
+                }]),
+            ]),
+            &ChatOptions::default(),
+        );
+        let messages = body["messages"].as_array().unwrap();
+        let tool_result = messages
+            .iter()
+            .flat_map(|m| m["content"].as_array().cloned().unwrap_or_default())
+            .find(|block| block["type"] == "tool_result")
+            .expect("a tool_result block must be present");
+        assert_eq!(tool_result["tool_use_id"], "call_1");
+        assert_eq!(tool_result["content"], "4");
     }
 
     #[test]
