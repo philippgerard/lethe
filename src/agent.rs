@@ -7,6 +7,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 mod summarizer;
 mod tool_loop;
@@ -128,6 +129,19 @@ impl TurnRequest {
     }
 }
 
+/// A conversation message produced outside the requesting client's own stream —
+/// e.g. a Telegram turn — broadcast so other live surfaces (an open web tab) can
+/// append it. `event` is the SSE event name, `data` its JSON payload.
+#[derive(Clone, Debug)]
+pub struct ConversationEvent {
+    pub event: String,
+    pub data: Value,
+}
+
+/// Depth of the conversation-event broadcast buffer. Slow subscribers that lag
+/// past this just miss intermediate events (they re-sync on reload).
+const CONVERSATION_EVENT_DEPTH: usize = 256;
+
 pub struct Agent {
     settings: Settings,
     memory: Arc<MemoryStore>,
@@ -143,6 +157,9 @@ pub struct Agent {
     /// pressing the model's context limit, not based on a crude char guess.
     /// Zero means "no measurement yet".
     last_prompt_tokens: Arc<AtomicU64>,
+    /// Broadcast of conversation messages from non-requesting transports (e.g.
+    /// Telegram), so an open web client can append them live via `/events`.
+    conversation_tx: broadcast::Sender<ConversationEvent>,
 }
 
 impl Agent {
@@ -186,11 +203,26 @@ impl Agent {
             notification_gate: Mutex::new(NotificationGate::new(15 * 60)),
             processed_notification_events: Mutex::new(HashSet::new()),
             last_prompt_tokens,
+            conversation_tx: broadcast::channel(CONVERSATION_EVENT_DEPTH).0,
         })
     }
 
     pub fn memory(&self) -> &MemoryStore {
         self.memory.as_ref()
+    }
+
+    /// Subscribe to conversation messages emitted by non-requesting transports
+    /// (e.g. Telegram). The HTTP `/events` stream relays these to web clients.
+    pub fn subscribe_conversation_events(&self) -> broadcast::Receiver<ConversationEvent> {
+        self.conversation_tx.subscribe()
+    }
+
+    /// Broadcast a conversation message. No-op (returns) when nobody is listening.
+    pub fn emit_conversation_event(&self, event: impl Into<String>, data: Value) {
+        let _ = self.conversation_tx.send(ConversationEvent {
+            event: event.into(),
+            data,
+        });
     }
 
     /// Most recent prompt-token count seen by the tool loop. Drives the

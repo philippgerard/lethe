@@ -530,6 +530,17 @@ fn telegram_process_callback(
                 "telegram conversation turn started"
             );
 
+            // Mirror the incoming message to any open web client (via /events), so a
+            // Telegram conversation shows up live in the web transcript too.
+            agent.emit_conversation_event(
+                "message",
+                serde_json::json!({
+                    "role": "user",
+                    "content": context.message,
+                    "source": "telegram",
+                }),
+            );
+
             let guard = Arc::new(Mutex::new(TelegramTurnGuard::new()));
             let runtime = ToolRuntime {
                 telegram: Some(TelegramToolContext {
@@ -570,6 +581,14 @@ fn telegram_process_callback(
                         let _ = client
                             .send_message(context.chat_id, OUT_OF_CREDITS_MESSAGE)
                             .await;
+                        agent.emit_conversation_event(
+                            "message",
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": OUT_OF_CREDITS_MESSAGE,
+                                "source": "telegram",
+                            }),
+                        );
                         return Ok(());
                     }
                     return Err(error);
@@ -583,6 +602,14 @@ fn telegram_process_callback(
                 );
                 send_guarded_telegram_final_response(&client, context.chat_id, &response, guard)
                     .await?;
+                agent.emit_conversation_event(
+                    "message",
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": response,
+                        "source": "telegram",
+                    }),
+                );
             }
             Ok(())
         })

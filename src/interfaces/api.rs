@@ -777,6 +777,9 @@ async fn events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     }
     let mut proactive_rx = state.proactive_tx.subscribe();
     let mut stream_rx = state.stream_tx.subscribe();
+    // Conversation messages from other transports (e.g. Telegram) so an open web
+    // client can append them to its transcript live.
+    let mut conversation_rx = state.agent.subscribe_conversation_events();
     let event_stream = stream! {
         loop {
             tokio::select! {
@@ -787,6 +790,11 @@ async fn events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
                 },
                 event = stream_rx.recv() => match event {
                     Ok(event) => yield Ok::<Event, Infallible>(event.into_sse()),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                event = conversation_rx.recv() => match event {
+                    Ok(event) => yield Ok::<Event, Infallible>(ApiEvent::new(event.event, event.data).into_sse()),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
