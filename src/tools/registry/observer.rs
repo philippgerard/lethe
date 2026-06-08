@@ -28,6 +28,11 @@ pub trait TurnObserver: Send + Sync {
     /// Streamed assistant token chunk. The default impl does nothing so
     /// non-streaming transports (Telegram) don't pay any cost.
     fn on_assistant_delta(&self, _content: &str) {}
+
+    /// Streamed reasoning/thinking token chunk, separate from the visible
+    /// answer. Lets clients render a live "thinking…" indicator. Default
+    /// impl does nothing.
+    fn on_reasoning_delta(&self, _reasoning: &str) {}
 }
 
 /// Convenience alias used inside `ToolRuntime`.

@@ -305,9 +305,10 @@ impl LlmRouter {
         request: ChatRequest,
         use_aux: bool,
         on_delta: DeltaCallback<'_>,
+        on_reasoning: Option<DeltaCallback<'_>>,
     ) -> Result<ChatResponse> {
         let model = self.config.model_for(use_aux).to_string();
-        self.exec_chat_request_stream_with_model(request, &model, on_delta)
+        self.exec_chat_request_stream_with_model(request, &model, on_delta, on_reasoning)
             .await
     }
 
@@ -319,6 +320,7 @@ impl LlmRouter {
         request: ChatRequest,
         model: &str,
         on_delta: DeltaCallback<'_>,
+        on_reasoning: Option<DeltaCallback<'_>>,
     ) -> Result<ChatResponse> {
         let model = model.trim();
         if model.is_empty() {
@@ -392,13 +394,23 @@ impl LlmRouter {
                         on_delta(&chunk.content);
                     }
                 }
+                Ok(ChatStreamEvent::ReasoningChunk(chunk)) => {
+                    // Stream thinking tokens on the separate reasoning channel so
+                    // clients can show a live "thinking…" indicator instead of
+                    // dead-air while the model reasons before answering.
+                    if let Some(on_reasoning) = on_reasoning
+                        && !chunk.content.is_empty()
+                    {
+                        on_reasoning(&chunk.content);
+                    }
+                }
                 Ok(ChatStreamEvent::End(end)) => {
                     captured_content = end.captured_content;
                     captured_usage = end.captured_usage;
                     reasoning_content = end.captured_reasoning_content;
                 }
-                // Start / ReasoningChunk / ThoughtSignatureChunk / ToolCallChunk:
-                // tool calls are recovered from the captured content at End.
+                // Start / ThoughtSignatureChunk / ToolCallChunk: tool calls are
+                // recovered from the captured content at End.
                 Ok(_) => {}
                 Err(error) => {
                     // Mid-stream failure: some deltas may already be on screen, so

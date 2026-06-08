@@ -276,9 +276,16 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         let observer_for_stream = registry.turn_observer().cloned();
         let response = match observer_for_stream {
             Some(observer) => {
+                let observer_reasoning = observer.clone();
                 let on_delta = move |chunk: &str| observer.on_assistant_delta(chunk);
+                let on_reasoning = move |chunk: &str| observer_reasoning.on_reasoning_delta(chunk);
                 router
-                    .exec_chat_request_stream_with_model(request.clone(), &model_id, &on_delta)
+                    .exec_chat_request_stream_with_model(
+                        request.clone(),
+                        &model_id,
+                        &on_delta,
+                        Some(&on_reasoning),
+                    )
                     .await?
             }
             None => {

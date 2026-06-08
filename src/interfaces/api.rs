@@ -349,6 +349,16 @@ impl TurnObserver for ApiTurnObserver {
             json!({"content": content}),
         ));
     }
+
+    fn on_reasoning_delta(&self, content: &str) {
+        if content.is_empty() {
+            return;
+        }
+        let _ = self.sender.try_send(ApiEvent::new(
+            "assistant.reasoning",
+            json!({"content": content}),
+        ));
+    }
 }
 
 /// Translate an internal `ActorEvent` into the TUI-facing actor.* surface.
