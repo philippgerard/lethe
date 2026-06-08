@@ -1,6 +1,6 @@
 [package]
 name = "lethe"
-version = "0.22.11"
+version = "0.22.12"
 edition = "2024"
 description = "Autonomous executive assistant with local memory and LLM"
 license = "MIT"

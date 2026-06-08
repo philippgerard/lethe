@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.22.12 - Tool-model handoff hardening
+
+- **The base model's tool call is now a routing signal, not an action**: when
+  `LLM_MODEL_TOOL` is set, a weaker base model (e.g. Gemma) sometimes emits
+  malformed or runaway tool-call batches (empty arguments, duplicate ids). The
+  agent loop now uses the base model's tool-call emission only to detect that
+  tools are needed — it discards those calls without executing them and lets the
+  tool model issue the real, well-formed calls. Prevents floods of failed tool
+  calls on handoff.
+- **`web_search` rejects an empty query** up front with a clear error instead of
+  forwarding it to Exa and surfacing a raw 400.
+
 ## 0.22.11 - Dynamic tool-model routing
 
 - **A turn can now switch models mid-flight for tool chains**: set the new
