@@ -373,25 +373,46 @@ impl Agent {
                 .messages
                 .add(MessageRole::Assistant, &history_content, None)?;
         }
-        if !dropped_for_summary.is_empty() {
-            // Roll the dropped batch into the persistent conversation_summary
-            // block. Errors are logged, not propagated — losing a summary
-            // update should never abort the user-facing turn.
-            if let Err(error) = summarizer::update_conversation_summary(
-                self.memory.as_ref(),
-                &self.prompts,
-                self.router.clone(),
-                &dropped_for_summary,
-            )
-            .await
-            {
-                tracing::warn!(error = %error, "conversation summary update failed");
-            }
-        }
-        if self.settings.background.curator_enabled {
-            if let Err(error) = self.run_curator_pass(false).await {
-                tracing::warn!(error = %error, "curator pass failed");
-            }
+        // Post-turn memory maintenance — rolling the dropped batch into the
+        // persistent conversation_summary, plus the cadence-gated curator pass —
+        // is background work that makes aux-model LLM calls. It must NEVER block
+        // the user-facing reply / `done` (otherwise the client sits on a typing
+        // indicator after the answer is already complete). Spawn it detached;
+        // errors are logged, never propagated.
+        let needs_summary = !dropped_for_summary.is_empty();
+        let curator_enabled = self.settings.background.curator_enabled;
+        if !turn.synthetic && (needs_summary || curator_enabled) {
+            let memory = self.memory.clone();
+            let router = self.router.clone();
+            let prompts = self.prompts.clone();
+            let memory_dir = self.settings.paths.memory_dir.clone();
+            tokio::spawn(async move {
+                if needs_summary
+                    && let Err(error) = summarizer::update_conversation_summary(
+                        memory.as_ref(),
+                        &prompts,
+                        router.clone(),
+                        &dropped_for_summary,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %error, "conversation summary update failed");
+                }
+                if curator_enabled {
+                    let router_snapshot = match router.read() {
+                        Ok(guard) => guard.clone(),
+                        Err(error) => {
+                            tracing::warn!(error = %error, "router lock poisoned in curator pass");
+                            return;
+                        }
+                    };
+                    let curator = MemoryCurator::new(memory_dir.join("curator_state.json"));
+                    if let Err(error) = curator.run_pass(memory.as_ref(), &router_snapshot, false).await
+                    {
+                        tracing::warn!(error = %error, "curator pass failed");
+                    }
+                }
+            });
         }
         Ok(response)
     }

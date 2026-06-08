@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.22.17 - Non-blocking post-turn memory maintenance
+
+- **The reply no longer waits on post-turn memory work.** The conversation-summary
+  update (after a compaction) and the cadence-gated curator pass make aux-model LLM
+  calls; they ran synchronously before `done`, so a client sat on a typing indicator
+  after the answer was already complete. They're now spawned detached — `done` fires
+  right after the reply (measured gap ~0.1s) and memory consolidation runs in the
+  background. Errors are logged, never propagated.
+
 ## 0.22.16 - Stream reasoning (live "thinking") on the API
 
 - **Reasoning tokens now stream on a separate channel.** The genai streaming path
