@@ -366,7 +366,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         name: "memory_complete",
         description: "Mark an archival entry or note as done. It stays searchable but is rendered as a one-line marker in recall (full text via archival_get / note_search). Use when a thread is resolved.",
         params: &[p_str_req("target", "Memory id (mem-...) or note file path.")],
-        category: ToolCategory::CortexOnly,
+        category: ToolCategory::Requestable,
         execute: ToolExecutor::Sync(exec_memory_complete),
     },
     ToolDef {
@@ -384,7 +384,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_int("limit", "Max results."),
             p_str("role", "Optional role filter."),
         ],
-        category: ToolCategory::CortexOnly,
+        category: ToolCategory::Requestable,
         execute: ToolExecutor::Sync(exec_conversation_search),
     },
     ToolDef {
@@ -402,7 +402,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_str_array("tags", "Required tags."),
             p_int("limit", "Max results."),
         ],
-        category: ToolCategory::CortexOnly,
+        category: ToolCategory::Requestable,
         execute: ToolExecutor::Sync(exec_note_search),
     },
     ToolDef {
@@ -413,7 +413,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_str_req("content", "Markdown body."),
             p_str_array("tags", "Tags."),
         ],
-        category: ToolCategory::CortexOnly,
+        category: ToolCategory::Requestable,
         execute: ToolExecutor::Sync(exec_note_create),
     },
     ToolDef {
@@ -425,7 +425,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_enum("priority", "Priority.", TODO_PRIORITY_VALUES),
             p_str("due_date", "Due date."),
         ],
-        category: ToolCategory::CortexOnly,
+        category: ToolCategory::Requestable,
         execute: ToolExecutor::Sync(exec_todo_create),
     },
     ToolDef {
@@ -437,7 +437,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_bool("include_completed", "Include completed/cancelled."),
             p_int("limit", "Max results."),
         ],
-        category: ToolCategory::CortexOnly,
+        category: ToolCategory::Requestable,
         execute: ToolExecutor::Sync(exec_todo_list),
     },
     ToolDef {

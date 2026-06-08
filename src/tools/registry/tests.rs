@@ -63,6 +63,26 @@ fn active_tool_specs_start_small_and_expand_on_request() {
     assert!(initial.contains(&"web_search".to_string()));
     assert!(!initial.contains(&"browser_open".to_string()));
     assert!(!initial.contains(&"fetch_webpage".to_string()));
+    // Kept in the initial cortex set (the core memory read/update pair).
+    assert!(initial.contains(&"memory_read".to_string()));
+    assert!(initial.contains(&"memory_update".to_string()));
+    // Recategorized to Requestable — discoverable via request_tool but not
+    // loaded up front, to keep the initial tool set small (better prefill for
+    // smaller models like Gemma). Leaves room for the 3 transport tools when a
+    // Telegram bot is connected and still stay within a 15-tool initial budget.
+    for moved in [
+        "todo_list",
+        "todo_create",
+        "conversation_search",
+        "note_search",
+        "note_create",
+        "memory_complete",
+    ] {
+        assert!(!initial.contains(&moved.to_string()), "{moved} should be requestable");
+    }
+    // Top-level (non-subagent) turn keeps a lean initial set; with the 3
+    // Transport tools added when Telegram is connected this stays <= 15.
+    assert!(initial.len() <= 12, "initial tool set too large: {}", initial.len());
 
     let active = ["browser_open".to_string(), "fetch_webpage".to_string()]
         .into_iter()

@@ -58,7 +58,10 @@ impl<'a> ToolRegistry<'a> {
             ToolCategory::Initial => true,
             ToolCategory::Requestable => false,
             ToolCategory::CortexOnly => !self.is_subagent_context(),
-            ToolCategory::Actor => self.runtime.actor.is_some(),
+            // Actor-orchestration tools stay discoverable (def_is_visible) but
+            // are only loaded up front for actual subagents — the top-level
+            // agent requests them on demand, keeping its initial tool set small.
+            ToolCategory::Actor => self.is_subagent_context(),
             ToolCategory::ActorSubagent => self
                 .runtime
                 .actor
