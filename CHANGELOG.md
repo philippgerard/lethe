@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.22.14 - Retry transient errors on the OpenRouter path
+
+- **The genai / OpenAI-compatible path now retries transient failures.** HTTP 429
+  (rate limits, incl. OpenRouter's shared-pool throttling), 5xx, and network blips
+  are retried up to 3 attempts with capped exponential backoff (~1s, 2s); permanent
+  errors (400/401/403/404) surface immediately. Previously only the Anthropic OAuth
+  path retried, so a brief OpenRouter rate-limit spike became a hard "LLM streaming
+  chat request failed" error. The streaming path's pre-stream fallback inherits this.
+
 ## 0.22.13 - Keep the fast tool handoff + web_search guard
 
 - **Reverts 0.22.12's discard-on-handoff.** When `LLM_MODEL_TOOL` is set, the
