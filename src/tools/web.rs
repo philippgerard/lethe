@@ -33,6 +33,9 @@ impl WebTools {
         let Some(api_key) = exa_api_key() else {
             return error_json("Exa API not configured. Set EXA_API_KEY environment variable.");
         };
+        if query.trim().is_empty() {
+            return error_json("web_search requires a non-empty `query`.");
+        }
         let num_results = num_results.clamp(1, 20);
         let mut payload = json!({
             "query": query,
