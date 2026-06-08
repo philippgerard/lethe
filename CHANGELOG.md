@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.22.7 - Streaming on OpenAI-compatible providers
+
+- **Stream assistant text on the generic (genai) provider path**: streaming
+  only worked on the Anthropic-OAuth and OpenAI-OAuth paths; every
+  OpenAI-compatible provider routed through genai (OpenRouter, OpenCode Go, any
+  custom `LLM_API_BASE`) fell back to a non-streaming call and replayed the
+  whole reply as a single delta, so clients saw the entire message appear at
+  once after a long pause. `exec_chat_request_stream` now streams via genai's
+  `exec_chat_stream` with `StreamEnd` captures enabled, then rebuilds the same
+  `ChatResponse` (text + tool calls + usage) the non-streaming path returned —
+  the agent loop is unchanged. Pre-stream failures fall back to the
+  non-streaming path; mid-stream failures surface the error without retrying
+  (partial text may already be on screen). Requesting `stream:true` also lets a
+  metering proxy stream its forwarded response.
+
 ## 0.22.6 - Tool-call history fix on OpenAI
 
 - **Fix every tool-using turn failing on strict OpenAI**: replayed tool
