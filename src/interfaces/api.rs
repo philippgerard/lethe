@@ -577,10 +577,9 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
         .await;
     let observer: Option<SharedTurnObserver> = {
         let sessions = state.sessions.lock().await;
-        sessions
-            .by_id
-            .get(&session_id)
-            .map(|session| Arc::new(ApiTurnObserver::new(session.sender.clone())) as SharedTurnObserver)
+        sessions.by_id.get(&session_id).map(|session| {
+            Arc::new(ApiTurnObserver::new(session.sender.clone())) as SharedTurnObserver
+        })
     };
     let tool_runtime = ToolRuntime {
         client: state
@@ -599,7 +598,11 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
         .await;
 
     match response {
-        Ok(message) if !context.interrupt.is_interrupted() && !message.trim().is_empty() => {
+        // Deliver the reply even when the user typed mid-turn (interrupt token
+        // set): the work is done and already persisted to history — dropping it
+        // here just desyncs the live view from reality (observed: a 7-minute
+        // research turn whose answer only ever existed after a page reload).
+        Ok(message) if !message.trim().is_empty() => {
             let _ = state
                 .send_to_session(
                     &session_id,
@@ -631,11 +634,7 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
 
     if let Some(tokens) = state.agent.last_prompt_tokens() {
         let _ = state
-            .send_to_session(
-                &session_id,
-                "usage",
-                json!({"prompt_tokens": tokens}),
-            )
+            .send_to_session(&session_id, "usage", json!({"prompt_tokens": tokens}))
             .await;
     }
     let _ = state
@@ -912,7 +911,8 @@ async fn serve_file(
     if let Some(response) = require_auth(&state, &headers) {
         return response;
     }
-    let Some(path) = resolve_workspace_path(&state.settings.paths.workspace_dir, &query.path) else {
+    let Some(path) = resolve_workspace_path(&state.settings.paths.workspace_dir, &query.path)
+    else {
         return json_error(StatusCode::FORBIDDEN, "path outside workspace");
     };
     if !path.is_file() {

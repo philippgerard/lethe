@@ -209,9 +209,15 @@ impl ShellTools {
         let Some(writer) = process.pty_writer.as_mut() else {
             return format!("Process {shell_id} does not have a writable PTY.");
         };
-        let mut input = text.to_string();
-        if send_enter {
-            input.push('\n');
+        // Interactive TUI prompts (gh's survey selector, etc.) put the PTY in
+        // raw mode and treat CARRIAGE RETURN as Enter — a bare LF does NOT
+        // advance them. Send CR for "Enter", and translate any embedded newlines
+        // too so a model that stuffs "\n" into `text` still works. Cooked-mode
+        // readers (plain `read`) get CR→LF via the tty's ICRNL, so this stays
+        // correct there as well.
+        let mut input = text.replace('\n', "\r");
+        if send_enter && !input.ends_with('\r') {
+            input.push('\r');
         }
         match writer
             .write_all(input.as_bytes())
@@ -303,25 +309,36 @@ impl ShellTools {
             Ok(child) => child,
             Err(error) => return format!("Error executing command: {error}"),
         };
+        let pid = child.id();
 
         let stdout = child.stdout.take().map(read_pipe);
         let stderr = child.stderr.take().map(read_pipe);
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
 
+        let mut timed_out = false;
         let exit_status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return format!("Error: Command timed out after {timeout_seconds} seconds");
+                        timed_out = true;
+                        break None;
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return format!("Error executing command: {error}"),
             }
         };
+
+        // Whether the command exited or timed out, tear down the WHOLE process
+        // group before reading the pipes. This closes the stdout/stderr write
+        // ends that any backgrounded child (e.g. `gh auth login &`) is holding
+        // open — otherwise join_reader() below would block forever waiting for an
+        // EOF that never comes (the foreground-hang bug). It also enforces the
+        // timeout on stragglers. To intentionally keep a process running past the
+        // call, use run_in_background (or `setsid` to leave the group).
+        kill_process_group(pid);
+        let _ = child.wait();
 
         let stdout = join_reader(stdout);
         let stderr = join_reader(stderr);
@@ -337,6 +354,13 @@ impl ShellTools {
         }
         let output = truncate_output(parts.join("\n").trim());
 
+        if timed_out {
+            return if output.is_empty() {
+                format!("Error: Command timed out after {timeout_seconds} seconds")
+            } else {
+                format!("Error: Command timed out after {timeout_seconds} seconds\n{output}")
+            };
+        }
         if let Some(status) = exit_status
             && !status.success()
         {
@@ -386,6 +410,7 @@ impl ShellTools {
         }
 
         let monitor_process = process.clone();
+        let monitor_pid = pid;
         thread::spawn(move || {
             let started = Instant::now();
             loop {
@@ -402,6 +427,9 @@ impl ShellTools {
                     }
                     Ok(None) => {
                         if started.elapsed() > Duration::from_secs(timeout_seconds) {
+                            // Kill the whole group, not just the shell, so any
+                            // children it spawned are reaped too.
+                            kill_process_group(monitor_pid);
                             let _ = child.kill();
                             let _ = child.wait();
                             let mut process =
@@ -426,7 +454,10 @@ impl ShellTools {
             }
         });
 
-        format!("Command running in background with ID: {shell_id}")
+        format!(
+            "Command running in background with shell_id=\"{shell_id}\". \
+             Read its output with bash_output(shell_id=\"{shell_id}\")."
+        )
     }
 
     fn run_background_pty(&self, command: &str, timeout_seconds: u64) -> String {
@@ -532,7 +563,13 @@ impl ShellTools {
             }
         });
 
-        format!("Command running in PTY with ID: {shell_id} (use get_terminal_screen to view)")
+        format!(
+            "Command running in PTY with shell_id=\"{shell_id}\". \
+             View the screen (e.g. a device-login URL + code) with \
+             get_terminal_screen(shell_id=\"{shell_id}\"), and type into it with \
+             send_terminal_input(shell_id=\"{shell_id}\", text=\"…\"). If a login \
+             code appears, send it to the user."
+        )
     }
 
     fn get_process(&self, shell_id: &str) -> Option<SharedProcess> {
@@ -555,9 +592,39 @@ fn shell_command(command: &str, cwd: &Path) -> Command {
         .arg(command)
         .current_dir(cwd)
         .env("TERM", "dumb")
+        // No inherited stdin: an interactive prompt (e.g. `gh auth login`) gets
+        // EOF immediately instead of blocking the call forever waiting for input.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Put the shell in its OWN process group so we can later kill the whole group
+    // (the shell plus anything it backgrounded) in one shot — see kill_process_group.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd
+}
+
+/// SIGKILL the entire process group led by `pid` (created via `process_group(0)`).
+/// Best-effort. A negative target tells `kill` to signal the whole group, which
+/// reaps any child the command backgrounded — both to honor the timeout and to
+/// close stdout/stderr pipes a lingering child would otherwise hold open.
+fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 fn truncate_output(output: &str) -> String {
@@ -691,10 +758,22 @@ fn is_executable_file(path: &Path) -> bool {
 use serde_json::Value;
 
 use crate::tools::registry::ToolRegistry;
-use crate::tools::registry::args::{
-    bool_arg, string_arg, string_arg_default, u64_arg, usize_arg,
-};
+use crate::tools::registry::args::{bool_arg, string_arg, string_arg_default, u64_arg, usize_arg};
 use crate::tools::spec::{ToolCategory, ToolDef, ToolExecutor, p_bool, p_int, p_str, p_str_req};
+
+/// The background-shell tools key off the id returned by `bash`. Models
+/// frequently pass it as `bash_id` or `id` rather than `shell_id`; accept all
+/// three so a one-word naming slip can't strand an interactive flow — e.g. a
+/// device-login PTY whose one-time code the model then can't read back.
+fn shell_id_arg(args: &Value) -> String {
+    for key in ["shell_id", "bash_id", "id"] {
+        let value = string_arg(args, key);
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    String::new()
+}
 
 fn exec_bash(registry: &ToolRegistry<'_>, args: &Value) -> String {
     registry.shell.bash(
@@ -707,25 +786,23 @@ fn exec_bash(registry: &ToolRegistry<'_>, args: &Value) -> String {
 
 fn exec_bash_output(registry: &ToolRegistry<'_>, args: &Value) -> String {
     registry.shell.bash_output(
-        &string_arg(args, "shell_id"),
+        &shell_id_arg(args),
         &string_arg_default(args, "filter_pattern", ""),
         usize_arg(args, "last_lines", 0),
     )
 }
 
 fn exec_kill_bash(registry: &ToolRegistry<'_>, args: &Value) -> String {
-    registry.shell.kill_bash(&string_arg(args, "shell_id"))
+    registry.shell.kill_bash(&shell_id_arg(args))
 }
 
 fn exec_get_terminal_screen(registry: &ToolRegistry<'_>, args: &Value) -> String {
-    registry
-        .shell
-        .get_terminal_screen(&string_arg(args, "shell_id"))
+    registry.shell.get_terminal_screen(&shell_id_arg(args))
 }
 
 fn exec_send_terminal_input(registry: &ToolRegistry<'_>, args: &Value) -> String {
     registry.shell.send_terminal_input(
-        &string_arg(args, "shell_id"),
+        &shell_id_arg(args),
         &string_arg(args, "text"),
         bool_arg(args, "send_enter", true),
     )
@@ -744,7 +821,7 @@ fn exec_check_command_exists(registry: &ToolRegistry<'_>, args: &Value) -> Strin
 pub const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "bash",
-        description: "Run a shell command (use run_in_background for long-running).",
+        description: "Run a shell command (use run_in_background for long-running). For INTERACTIVE commands that wait for input or print a login URL + one-time code (e.g. `gh auth login`, OAuth device flows), set run_in_background=true AND use_pty=true with a generous timeout, then read the code with get_terminal_screen and send it to the user — never run a login in the foreground (it can't be completed and is killed when the call returns).",
         params: &[
             p_str_req("command", "Shell command."),
             p_int("timeout", "Timeout (sec)."),
@@ -814,6 +891,28 @@ mod tests {
 
     use super::*;
 
+    /// Pull `bash_3` out of a `…shell_id="bash_3"…` start message.
+    fn extract_shell_id(start: &str) -> &str {
+        start
+            .split("shell_id=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("no shell_id in: {start:?}"))
+    }
+
+    #[test]
+    fn shell_id_arg_accepts_bash_id_and_id_aliases() {
+        use serde_json::json;
+        assert_eq!(shell_id_arg(&json!({"shell_id": "bash_1"})), "bash_1");
+        assert_eq!(shell_id_arg(&json!({"bash_id": "bash_2"})), "bash_2");
+        assert_eq!(shell_id_arg(&json!({"id": "bash_3"})), "bash_3");
+        assert_eq!(
+            shell_id_arg(&json!({"shell_id": "bash_4", "bash_id": "x"})),
+            "bash_4"
+        );
+        assert_eq!(shell_id_arg(&json!({})), "");
+    }
+
     #[test]
     fn foreground_command_captures_stdout_stderr_and_exit_code() {
         let tmp = tempdir().unwrap();
@@ -846,13 +945,31 @@ mod tests {
     }
 
     #[test]
+    fn foreground_does_not_hang_on_backgrounded_child() {
+        let tmp = tempdir().unwrap();
+        let shell = ShellTools::new(tmp.path());
+
+        // `sleep 30 &` leaves a child holding the shell's stdout pipe open after
+        // the foreground shell exits. Before the process-group fix this hung the
+        // call forever (the `gh auth login &` bug); now killing the group closes
+        // the pipe and the call returns promptly with the foreground output.
+        let started = std::time::Instant::now();
+        let result = shell.bash("echo hi; sleep 30 &", 10, false, false);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "command hung instead of returning promptly"
+        );
+        assert!(result.contains("hi"), "output was: {result:?}");
+    }
+
+    #[test]
     fn background_command_output_and_listing_work() {
         let tmp = tempdir().unwrap();
         let shell = ShellTools::new(tmp.path());
 
         let start = shell.bash("echo hello; sleep 0.1; echo world", 5, true, false);
         assert!(start.contains("background"));
-        let shell_id = start.split(':').next_back().unwrap().trim();
+        let shell_id = extract_shell_id(&start);
 
         let mut output = String::new();
         // 100 × 50ms = 5s cap. Generous for slow CI runners (notably
@@ -876,7 +993,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let shell = ShellTools::new(tmp.path());
         let start = shell.bash("printf 'a\\nkeep 1\\nb\\nkeep 2\\n'", 5, true, false);
-        let shell_id = start.split(':').next_back().unwrap().trim();
+        let shell_id = extract_shell_id(&start);
         let mut filtered = String::new();
         for _ in 0..100 {
             filtered = shell.bash_output(shell_id, "keep", 1);
@@ -895,7 +1012,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let shell = ShellTools::new(tmp.path());
         let start = shell.bash("sleep 20", 30, true, false);
-        let shell_id = start.split(':').next_back().unwrap().trim();
+        let shell_id = extract_shell_id(&start);
 
         let killed = shell.kill_bash(shell_id);
         assert!(killed.contains("Killed"));
@@ -912,13 +1029,7 @@ mod tests {
         let shell = ShellTools::new(tmp.path());
         let start = shell.bash("read line; echo got:$line", 5, true, true);
         assert!(start.contains("PTY"));
-        let shell_id = start
-            .rsplit("ID:")
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .next()
-            .unwrap();
+        let shell_id = extract_shell_id(&start);
 
         assert!(
             shell
@@ -947,7 +1058,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let shell = ShellTools::new(tmp.path());
         let start = shell.bash("sleep 1", 5, true, false);
-        let shell_id = start.split(':').next_back().unwrap().trim();
+        let shell_id = extract_shell_id(&start);
 
         assert!(
             shell

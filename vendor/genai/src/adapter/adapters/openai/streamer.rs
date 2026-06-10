@@ -282,8 +282,9 @@ impl futures::Stream for OpenAIStreamer {
 							}
 
 							// If we do not have content, then log a trace message
-							// TODO: use tracing debug
-							tracing::warn!("EMPTY CHOICE CONTENT");
+							// (normal for role-only first chunks and tool-call deltas —
+							// keep it below warn or it spams every streamed request)
+							tracing::debug!("EMPTY CHOICE CONTENT");
 						}
 					}
 					// -- Usage message
