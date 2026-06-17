@@ -1,7 +1,7 @@
 use genai::chat::Tool;
 
 use crate::tools::spec::{ToolCategory, ToolDef};
-use crate::tools::{browser, filesystem, image, research, shell, web};
+use crate::tools::{browser, filesystem, image, knowledge_graph, research, shell, web};
 
 use super::ToolRegistry;
 use super::{actor_specs, builtin_specs, telegram_specs};
@@ -18,6 +18,7 @@ pub fn all_defs() -> impl Iterator<Item = &'static ToolDef> {
         .chain(actor_specs::TOOL_DEFS.iter())
         .chain(research::TOOL_DEFS.iter())
         .chain(telegram_specs::TOOL_DEFS.iter())
+        .chain(knowledge_graph::TOOL_DEFS.iter())
 }
 
 pub fn find_def(name: &str) -> Option<&'static ToolDef> {
@@ -48,6 +49,7 @@ impl<'a> ToolRegistry<'a> {
             ToolCategory::Transport => {
                 self.runtime.telegram.is_some() || self.runtime.client.is_some()
             }
+            ToolCategory::KnowledgeGraph => knowledge_graph::is_configured(),
         }
     }
 
@@ -70,6 +72,7 @@ impl<'a> ToolRegistry<'a> {
             ToolCategory::Transport => {
                 self.runtime.telegram.is_some() || self.runtime.client.is_some()
             }
+            ToolCategory::KnowledgeGraph => knowledge_graph::is_configured(),
         }
     }
 

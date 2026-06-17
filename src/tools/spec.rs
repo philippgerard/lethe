@@ -22,6 +22,9 @@ pub enum ToolCategory {
     ActorSubagent,
     /// Initial when telegram or client transport context is attached.
     Transport,
+    /// Initial when the hosted knowledge-graph backend is configured
+    /// (KG_API_BASE/KG_API_TOKEN); hidden entirely otherwise.
+    KnowledgeGraph,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

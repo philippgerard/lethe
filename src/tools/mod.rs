@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod filesystem;
 pub mod image;
+pub mod knowledge_graph;
 pub mod registry;
 pub mod research;
 pub mod shell;

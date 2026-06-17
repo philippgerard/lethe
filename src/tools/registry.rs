@@ -184,6 +184,7 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
+        ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
     };
     let initial = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial => true,
@@ -192,6 +193,7 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
+        ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
     };
 
     let mut lines = catalog::all_defs()
