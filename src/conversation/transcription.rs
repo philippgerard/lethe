@@ -15,7 +15,7 @@ pub const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/tra
 pub const OPENROUTER_TRANSCRIPTIONS_URL: &str = "https://openrouter.ai/api/v1/audio/transcriptions";
 
 pub const DEFAULT_OPENAI_MODEL: &str = "whisper-1";
-pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/whisper-1";
+pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/whisper-large-v3";
 pub const DEFAULT_LOCAL_MODEL: &str = "base";
 
 #[derive(Debug, Error)]
@@ -82,6 +82,17 @@ pub fn choose_transcription_provider(
 ) -> TranscriptionResult<TranscriptionProvider> {
     if let Some(provider) = TranscriptionProvider::parse(&settings.transcription.provider)? {
         return Ok(provider);
+    }
+    // A configured LLM_API_BASE means we're talking to an OpenAI-compatible proxy
+    // (the hosted metering proxy) that fronts OpenRouter. Its JSON
+    // /audio/transcriptions route is the only egress, and the credential is the
+    // per-user proxy token (carried in OPENAI_API_KEY), so use the OpenRouter path
+    // there rather than picking OpenAI and calling api.openai.com directly.
+    if !settings.llm.llm_api_base.trim().is_empty()
+        && (configured_api_key(&settings.llm.openrouter_api_key)
+            || configured_api_key(&settings.llm.openai_api_key))
+    {
+        return Ok(TranscriptionProvider::OpenRouter);
     }
     if configured_api_key(&settings.llm.openrouter_api_key) {
         return Ok(TranscriptionProvider::OpenRouter);
@@ -189,7 +200,8 @@ pub fn transcribe_audio(
             &audio_format,
             &model,
             language,
-            &api_key_for_provider(provider, settings)?,
+            &openrouter_transcriptions_url(settings),
+            &openrouter_transcription_key(settings)?,
         ),
         TranscriptionProvider::OpenAi => transcribe_openai(
             audio_bytes,
@@ -208,6 +220,7 @@ fn transcribe_openrouter(
     audio_format: &str,
     model: &str,
     language: Option<&str>,
+    url: &str,
     api_key: &str,
 ) -> TranscriptionResult<String> {
     let mut payload = json!({
@@ -221,7 +234,7 @@ fn transcribe_openrouter(
         payload["language"] = json!(language);
     }
     let response = reqwest::blocking::Client::new()
-        .post(OPENROUTER_TRANSCRIPTIONS_URL)
+        .post(url)
         .bearer_auth(api_key)
         .json(&payload)
         .send()?;
@@ -389,6 +402,36 @@ pub fn extract_local_whisper_stdout(stdout: &str) -> String {
         .to_string()
 }
 
+/// Endpoint for the OpenRouter-format JSON transcription request. Behind the
+/// hosted metering proxy, `LLM_API_BASE` fronts OpenRouter — the proxy forwards
+/// `/audio/transcriptions` upstream with the real key — so prefer it; a direct
+/// setup falls back to OpenRouter's public endpoint.
+fn openrouter_transcriptions_url(settings: &Settings) -> String {
+    let base = settings.llm.llm_api_base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        OPENROUTER_TRANSCRIPTIONS_URL.to_string()
+    } else {
+        format!("{base}/audio/transcriptions")
+    }
+}
+
+/// Credential for the OpenRouter transcription call. A direct setup uses
+/// `OPENROUTER_API_KEY`; behind the proxy the per-user proxy token arrives in
+/// `OPENAI_API_KEY` (the proxy swaps in the real upstream key), so fall back to
+/// it when no dedicated OpenRouter key is set.
+fn openrouter_transcription_key(settings: &Settings) -> TranscriptionResult<String> {
+    if configured_api_key(&settings.llm.openrouter_api_key) {
+        Ok(settings.llm.openrouter_api_key.clone())
+    } else if configured_api_key(&settings.llm.openai_api_key) {
+        Ok(settings.llm.openai_api_key.clone())
+    } else {
+        Err(TranscriptionError::MissingApiKey(
+            "OPENROUTER_API_KEY",
+            "openrouter".to_string(),
+        ))
+    }
+}
+
 fn api_key_for_provider(
     provider: TranscriptionProvider,
     settings: &Settings,
@@ -529,6 +572,29 @@ mod tests {
             choose_transcription_provider(&settings),
             Err(TranscriptionError::NotConfigured)
         ));
+    }
+
+    #[test]
+    fn proxy_base_routes_transcription_through_openrouter() {
+        // Hosted container: only the proxy token (in OPENAI_API_KEY) + LLM_API_BASE
+        // are set. Transcription must select OpenRouter and POST through the proxy,
+        // not pick OpenAI and call api.openai.com with an invalid key.
+        let mut settings = settings();
+        settings.llm.openrouter_api_key = String::new();
+        settings.llm.openai_api_key = "proxy-token".to_string();
+        settings.llm.llm_api_base = "http://172.17.0.1:9787/llm/v1".to_string();
+        assert_eq!(
+            choose_transcription_provider(&settings).unwrap(),
+            TranscriptionProvider::OpenRouter
+        );
+        assert_eq!(
+            openrouter_transcriptions_url(&settings),
+            "http://172.17.0.1:9787/llm/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            openrouter_transcription_key(&settings).unwrap(),
+            "proxy-token"
+        );
     }
 
     #[test]
