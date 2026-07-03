@@ -339,6 +339,9 @@ All API routes require `Authorization: Bearer <LETHE_API_TOKEN>` or `x-lethe-tok
 | `/actors` | `GET` | Snapshot of active and recently terminated actors. |
 | `/todos` | `GET` | List todos (filters: `status`, `priority`, `include_completed`, `limit`). |
 | `/session/history` | `GET` | Last N persisted messages (`limit`). |
+| `/secure-input` | `POST` | Deliver a browser-sealed credential envelope to a pending agent-id prompt (hosted mode). |
+| `/secure-input/cancel` | `POST` | Dismiss a pending secure-input request. |
+| `/secure-input/pending` | `GET` | Live secure-input requests (with sealing envelope) for tab re-hydration. |
 
 SSE event vocabulary on `/chat` and `/events`:
 
@@ -352,7 +355,69 @@ SSE event vocabulary on `/chat` and `/events`:
 | `actor.spawned` / `actor.state` / `actor.task` / `actor.message` | `{actor_id, payload}` | Actor lifecycle events fanned out from `ActorEventBus`. |
 | `usage` | `{prompt_tokens}` | Updated context window usage. |
 | `typing_start` / `typing_stop` | `{}` | Compatibility hints for chat clients. |
+| `secure_input.request` | `{request_id, title, description, fields, server_pub, alg, expires_at, …}` | The agent needs a human-typed secret; render a sealed credential card (hosted). |
+| `secure_input.resolved` | `{request_id, outcome}` | A secure-input request was `submitted` / `expired` / `cancelled`. |
+| `agent_id.bound` | `{owner_sub, jkt}` | Background owner-binding completed. |
 | `done` | `{}` | Turn complete; safe to close the stream. |
+
+## Alien agent-id
+
+Each Lethe instance can carry its own **Alien agent identity** (Ed25519, L0
+self-asserted out of the box; optionally bound to a human owner via the Alien app
+for L1/L2 assurance) and an **encrypted credential vault**, and — locally — drive a
+**vault-sealed browser**. These are provided by the
+[`agent-id`](https://github.com/…) CLIs (`agent-id-core`, `agent-id-vault`,
+`agent-id-browser`); Lethe shells out to them.
+
+Enable by installing the CLIs so they're on `PATH`:
+
+```bash
+npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault   # identity + vault
+# agent-id-browser is marketplace-only; point AGENT_ID_BROWSER_BIN at it to enable browser tools
+```
+
+`lethe init` provisions an L0 identity + vault automatically when the CLIs are
+present; the daemon re-provisions on start. State is isolated per instance under
+`AGENT_ID_STATE_DIR` (default `<LETHE_HOME>/agent-id`).
+
+| env var | default | meaning |
+|---|---|---|
+| `AGENT_ID_ENABLED` | `true` | Master switch for the integration. |
+| `AGENT_ID_STATE_DIR` | `<LETHE_HOME>/agent-id` | Per-instance identity + vault state. |
+| `AGENT_ID_CORE_BIN` / `AGENT_ID_VAULT_BIN` / `AGENT_ID_BROWSER_BIN` | discovered on `PATH` | Override CLI locations. |
+| `ALIEN_PROVIDER_ADDRESS` | — | Alien SSO provider for `agent_id_bind`. |
+| `LETHE_SECURE_PROMPT` | `off` | `hosted` runs the secure-input socket server (set by lethe-hosted). |
+
+Tools (requested on demand): `agent_id_status`, `agent_id_bind`, `agent_id_sign`,
+`vault_list`, `vault_add`, `vault_remove`, `vault_set_totp`, and the local browser
+tools `alien_browser_login` / `_auto_login` / `_open` / `_close` / `_act` /
+`_fill_secret` / `_fill_otp`.
+
+### Security model
+
+Secrets are kept out of the model's context by construction of the tool surface —
+there is **no `vault_show` and no generic `vault_exec`** exposed to the agent. The
+vault tools return metadata only; secret *values* are typed by the human (over the
+hosted secure-input channel or the local loopback browser form) and are used inside
+the vault-sealed browser's own session process (`fill_secret`/`fill_otp`), never
+handed back to the model.
+
+The **hosted secure-input channel** lets a headless Lethe (which cannot open a
+browser) collect a human secret: a credential-collecting CLI POSTs a field spec to
+a unix socket Lethe owns; Lethe surfaces it as a `secure_input.request` event
+carrying a per-request ephemeral P-256 public key; the browser end-to-end-seals the
+typed values (ECDH-P256 → HKDF-SHA256 → AES-256-GCM, with the request id and server
+key bound as AAD) and the control plane relays **ciphertext only** — it never sees
+plaintext and persists nothing. Lethe binds each socket connection to the PID of a
+CLI child it launched itself (`SO_PEERCRED`), so a prompt-injected agent cannot
+forge a card via the socket to harvest a freshly typed secret.
+
+**Trust boundary — same uid.** An agent with shell access at the same uid as
+`AGENT_ID_STATE_DIR` holds the vault's agent-key and can read the vault directly;
+the boundary these tools enforce is against *accidental* transcript/context and
+control-plane exposure, not against an actively adversarial agent that acts to
+obtain a secret. An actively malicious control plane (it ships the frontend JS and
+proxies the SSE stream) is likewise out of scope.
 
 ## Local llama.cpp Example
 

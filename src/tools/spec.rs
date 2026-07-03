@@ -25,6 +25,12 @@ pub enum ToolCategory {
     /// Initial when the hosted knowledge-graph backend is configured
     /// (KG_API_BASE/KG_API_TOKEN); hidden entirely otherwise.
     KnowledgeGraph,
+    /// Alien agent-id identity + vault tools; visible when the agent-id-core and
+    /// agent-id-vault CLIs are present and the integration is enabled.
+    AgentId,
+    /// Alien agent-id vault-sealed browser tools; visible only when the
+    /// (marketplace-only) agent-id-browser CLI is additionally present.
+    AgentIdBrowser,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
