@@ -180,18 +180,38 @@ pub async fn spawn_daemon_ready(
         .stdout
         .take()
         .ok_or_else(|| "no stdout from browser daemon".to_string())?;
+    // The daemon prints its own diagnostics on stderr (the readiness/JSON line is
+    // on stdout). Take stderr so we can fold it into the error when the daemon
+    // exits before ready — otherwise a clean failure (NO_PROFILE, a bad loginUrl,
+    // a launch crash) surfaces only as an opaque timeout and reads as a "crash".
+    let mut stderr = child.stderr.take();
 
     let mut reader = BufReader::new(stdout).lines();
-    let ready = tokio::time::timeout(Duration::from_secs(90), async {
+    // Terminal outcome from the daemon's first meaningful stdout line: Ok(ready
+    // value), or Err(the daemon's own {ok:false,...} message). None = stdout
+    // closed with no verdict (the daemon died); we then read stderr for why.
+    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(value) = serde_json::from_str::<Value>(trimmed)
-                && value.get("ready").and_then(Value::as_bool) == Some(true)
-            {
-                return Some(value);
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                if value.get("ready").and_then(Value::as_bool) == Some(true) {
+                    return Some(Ok(value));
+                }
+                // A structured failure the daemon reports before ready — surface
+                // its own message (e.g. "no browser-profile named 'x' — run
+                // auto-login first") instead of a generic timeout.
+                if value.get("ok").and_then(Value::as_bool) == Some(false) {
+                    let msg = value
+                        .get("message")
+                        .or_else(|| value.get("error"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("browser daemon reported an error")
+                        .to_string();
+                    return Some(Err(msg));
+                }
             }
         }
         None
@@ -199,20 +219,42 @@ pub async fn spawn_daemon_ready(
     .await
     .map_err(|_| "browser daemon did not report ready in time".to_string())?;
 
-    // Keep draining stdout to a log so the daemon doesn't SIGPIPE later, and let
-    // the process run detached from this call.
-    tokio::spawn(async move {
-        let mut sink = tokio::fs::File::create(&log_path).await.ok();
-        let mut lines = reader;
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(f) = sink.as_mut() {
-                use tokio::io::AsyncWriteExt;
-                let _ = f.write_all(line.as_bytes()).await;
-                let _ = f.write_all(b"\n").await;
+    match outcome {
+        Some(Ok(ready)) => {
+            // Ready: keep draining stdout to a log so the daemon doesn't SIGPIPE
+            // later, and let the process run detached from this call.
+            tokio::spawn(async move {
+                let mut sink = tokio::fs::File::create(&log_path).await.ok();
+                let mut lines = reader;
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(f) = sink.as_mut() {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = f.write_all(line.as_bytes()).await;
+                        let _ = f.write_all(b"\n").await;
+                    }
+                }
+                let _ = child.wait().await;
+            });
+            Ok(ready)
+        }
+        // The daemon reported a structured failure, or closed with none. Either
+        // way it isn't going to serve — reap it and return the real reason.
+        Some(Err(msg)) => {
+            let _ = child.kill().await;
+            Err(msg)
+        }
+        None => {
+            let mut buf = String::new();
+            if let Some(err) = stderr.as_mut() {
+                let _ = err.read_to_string(&mut buf).await;
+            }
+            let _ = child.kill().await;
+            let tail = buf.trim();
+            if tail.is_empty() {
+                Err("browser daemon closed before ready".to_string())
+            } else {
+                Err(format!("browser daemon closed before ready: {tail}"))
             }
         }
-        let _ = child.wait().await;
-    });
-
-    ready.ok_or_else(|| "browser daemon closed before ready".to_string())
+    }
 }

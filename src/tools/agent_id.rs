@@ -220,6 +220,12 @@ fn exec_vault_add<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a>
             argv.push("--description".to_string());
             argv.push(desc);
         }
+        // Non-secret: the sign-in page a `login` credential drives. Required for
+        // alien_browser_auto_login to work — without it there is nowhere to start.
+        if let Some(login_url) = nonempty_string(args, "login_url") {
+            argv.push("--login-url".to_string());
+            argv.push(login_url);
+        }
         interactive(Bin::Vault, &sd, &argv, hub_of(r)).await
     })
 }
@@ -462,6 +468,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_str_array("domains", "Host allowlist this credential may be used on (e.g. api.github.com)."),
             p_enum("access", "Access level: 'ro' read-only or 'rw' unrestricted (default rw).", &["ro", "rw"]),
             p_str("description", "Optional human-readable description."),
+            p_str("login_url", "For type=login only: the sign-in page URL (e.g. https://www.reddit.com/login). REQUIRED for alien_browser_auto_login to work — set it whenever you add a login credential you'll log in with."),
         ],
         category: ToolCategory::AgentId,
         execute: ToolExecutor::Async(exec_vault_add),
@@ -495,7 +502,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_auto_login",
-        description: "Headlessly log in using a stored `login` credential (username + password + 2FA policy). 2FA is answered from a stored TOTP seed, or via a secure prompt to the owner.",
+        description: "Headlessly log in using a stored `login` credential (username + password + 2FA policy) and SEAL the resulting signed-in session into a browser-profile for reuse. This is the FIRST step of the headless browser flow (there is no profile to open until this runs) — call it before alien_browser_open/act. Requires the login credential to have a login_url (set it on vault_add). 2FA is answered from a stored TOTP seed, or via a secure prompt to the owner. If it reports the login was blocked by an anti-automation wall, headed login is not available on a server — report that to the owner rather than retrying.",
         params: &[
             p_str_req("cred", "Name of a `login` credential in the vault."),
             p_str("name", "Session name to seal into (default from the credential)."),
@@ -505,7 +512,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_open",
-        description: "Start a persistent browser session daemon (unseals the sealed profile). Returns once ready; drive it with alien_browser_act and close it with alien_browser_close.",
+        description: "Start a persistent browser session daemon by unsealing an EXISTING browser-profile. A profile must already exist (created by alien_browser_auto_login, or a headed alien_browser_login on a machine with a display) — if none does this returns a 'no browser-profile' error, which means run alien_browser_auto_login first, NOT that the browser is missing. Returns once ready; drive it with alien_browser_act and close it with alien_browser_close.",
         params: &[
             p_str("name", "Session name (default 'main')."),
             p_bool("headed", "Show the window (requires a GUI session)."),
