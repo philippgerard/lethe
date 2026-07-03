@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.23.4 - One browser at a time
+
+- **No more two competing browsers.** Lethe has a built-in browser (`browser_*`,
+  via the `agent-browser` CLI) and the agent-id **vault-sealed** browser
+  (`alien_browser_*`). Both used to be offered to the agent at once even though
+  they're separate daemons with separate sessions — so a page opened with one was
+  invisible to the other, and credential injection only worked in a vault-sealed
+  session. The vault-sealed browser is a superset (it does everything the built-in
+  one does plus vault credential injection), so it now **replaces** the built-in
+  one: when agent-id's browser is active the plain `browser_*` tools are hidden,
+  and the agent sees exactly one browser. With no agent-id, the built-in
+  `browser_*` works as before.
+
 ## 0.23.3 - Secure credential card: no phantom "open the app"
 
 - **After you save a credential, the agent knows the secret is already in.**
