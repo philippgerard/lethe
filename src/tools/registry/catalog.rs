@@ -41,6 +41,9 @@ impl<'a> ToolRegistry<'a> {
     pub(super) fn def_is_visible(&self, def: &ToolDef) -> bool {
         match def.category {
             ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
+            // The built-in browser hides when the vault-sealed browser is active,
+            // so the agent is never offered two competing browsers.
+            ToolCategory::BrowserBuiltin => !crate::agent_id::browser_tools_available(),
             ToolCategory::Actor => self.runtime.actor.is_some(),
             ToolCategory::ActorSubagent => self
                 .runtime
@@ -61,7 +64,7 @@ impl<'a> ToolRegistry<'a> {
     pub(super) fn def_is_initial(&self, def: &ToolDef) -> bool {
         match def.category {
             ToolCategory::Initial => true,
-            ToolCategory::Requestable => false,
+            ToolCategory::Requestable | ToolCategory::BrowserBuiltin => false,
             ToolCategory::CortexOnly => !self.is_subagent_context(),
             // Actor-orchestration tools stay discoverable (def_is_visible) but
             // are only loaded up front for actual subagents — the top-level

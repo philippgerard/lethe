@@ -186,6 +186,8 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
 
     let visible = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
+        // Built-in browser hides when the vault-sealed browser is active.
+        ToolCategory::BrowserBuiltin => !crate::agent_id::browser_tools_available(),
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
@@ -195,7 +197,7 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
     };
     let initial = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial => true,
-        ToolCategory::Requestable => false,
+        ToolCategory::Requestable | ToolCategory::BrowserBuiltin => false,
         ToolCategory::CortexOnly => !is_subagent,
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,

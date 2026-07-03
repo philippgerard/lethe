@@ -120,8 +120,11 @@ cargo test
 cargo build --release
 ```
 
-Browser automation uses the external `agent-id-browser` CLI (the vault-sealed
-browser) when browser tools are called — see [Alien agent-id](#alien-agent-id).
+The built-in `browser_*` tools shell out to the external
+[`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI
+(`npm install -g agent-browser`). When the agent-id integration's vault-sealed
+browser is active it takes over instead (and the built-in `browser_*` tools are
+hidden, so there's only ever one browser) — see [Alien agent-id](#alien-agent-id).
 
 ## Running
 
@@ -383,11 +386,16 @@ present; the daemon re-provisions on start. State is isolated per instance under
 
 ### Browser tools (optional)
 
-The vault-sealed browser adds the `alien_browser_*` tools. `agent-id-browser` is
-**marketplace-only — not on npm**; install it from the plugin tarball and point
-`AGENT_ID_BROWSER_BIN` at it (or put it on `PATH`). It drives **real Google
-Chrome** via `channel:"chrome"` (a stealth-tuned patchright launch — not bundled
-Chromium), so the host needs Chrome installed:
+The vault-sealed browser adds the `alien_browser_*` tools (`_open` starts a
+session, `_act` runs any page verb — snapshot/click/type/navigate/… — and
+`_fill_secret` / `_fill_otp` inject vaulted credentials the model never sees).
+Because it's a superset of the built-in browser, **it replaces it**: whenever the
+vault-sealed browser is active the plain `browser_*` tools are hidden, so the
+agent only ever sees one browser. `agent-id-browser` is **marketplace-only — not
+on npm**; install it from the plugin tarball and point `AGENT_ID_BROWSER_BIN` at
+it (or put it on `PATH`). It drives **real Google Chrome** via `channel:"chrome"`
+(a stealth-tuned patchright launch — not bundled Chromium), so the host needs
+Chrome installed:
 
 ```bash
 # From a checkout of github.com/alien-id/agent-id:
