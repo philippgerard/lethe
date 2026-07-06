@@ -468,6 +468,14 @@ async fn read_http_request(
         }
     }
 
+    // Bound the body: field specs and sealed envelopes are a few KB at most, so a
+    // peer (or a PID-reuse impostor) declaring a huge Content-Length must not be
+    // able to make this daemon — which holds the vault key — buffer to OOM.
+    const MAX_BODY: usize = 256 * 1024;
+    if content_length > MAX_BODY {
+        return Err("request body too large".into());
+    }
+
     let mut body = buf[header_end..].to_vec();
     while body.len() < content_length {
         let n = read_half.read(&mut chunk).await.map_err(|e| e.to_string())?;
