@@ -44,6 +44,10 @@ pub struct ApiState {
     /// /events subscriber (TUI clients). Populated when an actor runtime
     /// is installed (see `install_actor_broadcaster`).
     stream_tx: broadcast::Sender<ApiEvent>,
+    /// Hosted secure-input channel (agent-id credential prompts). Present only
+    /// when `LETHE_SECURE_PROMPT=hosted`; drives the `/secure-input*` routes and
+    /// is handed to the agent-id tools per turn.
+    secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +137,22 @@ impl ApiState {
     pub fn with_shared_agent(settings: Settings, agent: Arc<Agent>) -> Self {
         let (proactive_tx, _) = broadcast::channel(PROACTIVE_QUEUE_DEPTH);
         let (stream_tx, _) = broadcast::channel(PROACTIVE_QUEUE_DEPTH);
+        // Hosted secure-input: the hub emits `secure_input.*` onto the same
+        // `/events` broadcast the frontend already consumes.
+        let secure_prompt = if crate::agent_id::is_enabled() && crate::agent_id::secure_prompt_hosted()
+        {
+            let socket_path = crate::agent_id::secure_prompt_socket_path(&settings);
+            let tx = stream_tx.clone();
+            let emit: crate::agent_id::secure_prompt::Emit = Arc::new(move |event: &str, data| {
+                let _ = tx.send(ApiEvent::new(event.to_string(), data));
+            });
+            Some(crate::agent_id::secure_prompt::SecurePromptHub::new(
+                socket_path,
+                emit,
+            ))
+        } else {
+            None
+        };
         Self {
             conversations: ConversationManager::new(Duration::from_secs_f64(
                 settings.background.debounce_seconds,
@@ -142,6 +162,7 @@ impl ApiState {
             sessions: Arc::new(Mutex::new(ApiSessions::default())),
             proactive_tx,
             stream_tx,
+            secure_prompt,
         }
     }
 
@@ -415,6 +436,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/actors", get(list_actors))
         .route("/todos", get(list_todos))
         .route("/session/history", get(session_history))
+        .route("/secure-input", post(secure_input_submit))
+        .route("/secure-input/cancel", post(secure_input_cancel))
+        .route("/secure-input/pending", get(secure_input_pending))
         .with_state(state)
 }
 
@@ -448,6 +472,24 @@ pub async fn serve_with_agent(
     if let Err(error) = state.install_actor_broadcaster().await {
         tracing::warn!(error = %error, "actor broadcaster not installed");
     }
+
+    // Provision the agent's Alien identity + vault (idempotent, degrades to a
+    // warning if the CLIs are absent).
+    crate::agent_id::ensure_provisioned(&settings).await;
+
+    // Hosted secure-input: bind the unix socket and start its accept loop so
+    // agent-id CLI children can raise end-to-end-sealed credential cards.
+    if let Some(hub) = state.secure_prompt.clone() {
+        match hub.bind() {
+            Ok(listener) => {
+                tokio::spawn(crate::agent_id::secure_prompt::serve(hub, listener));
+                tracing::info!("agent-id secure-prompt socket listening");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "agent-id secure-prompt socket bind failed");
+            }
+        }
+    }
     let app = router(state.clone());
     let bind = format!("{}:{port}", settings.api.host);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -479,6 +521,85 @@ pub async fn serve_with_agent(
 
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[derive(Debug, Deserialize)]
+struct SecureInputBody {
+    #[serde(default)]
+    request_id: String,
+    #[serde(default)]
+    client_pub: String,
+    #[serde(default)]
+    salt: String,
+    #[serde(default)]
+    iv: String,
+    #[serde(default)]
+    ciphertext: String,
+}
+
+/// Deliver a browser-sealed credential envelope to the pending request. The
+/// control plane relays this ciphertext-only; we unseal in-process and hand the
+/// values to the waiting CLI child. 2xx = delivered, 404 = gone, 400 = bad
+/// ciphertext (frontend retries).
+async fn secure_input_submit(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<SecureInputBody>,
+) -> Response {
+    if let Some(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(hub) = state.secure_prompt.as_ref() else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "secure-input not enabled");
+    };
+    let sealed = crate::agent_id::crypto::SealedInput {
+        client_pub: body.client_pub,
+        salt: body.salt,
+        iv: body.iv,
+        ciphertext: body.ciphertext,
+    };
+    match hub.submit(&body.request_id, &sealed) {
+        crate::agent_id::secure_prompt::SubmitOutcome::Accepted => {
+            Json(json!({ "ok": true })).into_response()
+        }
+        crate::agent_id::secure_prompt::SubmitOutcome::NotFound => {
+            json_error(StatusCode::NOT_FOUND, "no such pending request")
+        }
+        crate::agent_id::secure_prompt::SubmitOutcome::BadCiphertext(err) => {
+            json_error(StatusCode::BAD_REQUEST, &format!("could not unseal: {err}"))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SecureInputCancelBody {
+    #[serde(default)]
+    request_id: String,
+}
+
+async fn secure_input_cancel(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<SecureInputCancelBody>,
+) -> Response {
+    if let Some(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(hub) = state.secure_prompt.as_ref() else {
+        return json_error(StatusCode::SERVICE_UNAVAILABLE, "secure-input not enabled");
+    };
+    let cancelled = hub.cancel(&body.request_id);
+    Json(json!({ "ok": true, "cancelled": cancelled })).into_response()
+}
+
+async fn secure_input_pending(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    let Some(hub) = state.secure_prompt.as_ref() else {
+        return Json(Value::Array(Vec::new())).into_response();
+    };
+    Json(Value::Array(hub.list_pending())).into_response()
 }
 
 async fn health() -> Json<Value> {
@@ -592,6 +713,7 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
             )
             .await,
         observer,
+        secure_prompt: state.secure_prompt.clone(),
         ..ToolRuntime::default()
     };
     let response = state

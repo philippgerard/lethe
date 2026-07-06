@@ -16,6 +16,14 @@ pub enum ToolCategory {
     CortexOnly,
     /// Not in the initial set; loaded via `request_tool`.
     Requestable,
+    /// Lethe's built-in generic browser (`browser_*`, backed by the external
+    /// `agent-browser` CLI). Requestable, EXCEPT it's hidden when the agent-id
+    /// vault-sealed browser is active — that one is a superset (its
+    /// `alien_browser_act` covers snapshot/click/type/… and it adds vault-sealed
+    /// credential injection), so exposing both would be two competing,
+    /// session-isolated browsers. One browser at a time: the vault-sealed one when
+    /// agent-id is on, this built-in one otherwise.
+    BrowserBuiltin,
     /// Initial when an actor runtime context is attached.
     Actor,
     /// Like `Actor`, but only when the actor is a subagent.
@@ -25,6 +33,12 @@ pub enum ToolCategory {
     /// Initial when the hosted knowledge-graph backend is configured
     /// (KG_API_BASE/KG_API_TOKEN); hidden entirely otherwise.
     KnowledgeGraph,
+    /// Alien agent-id identity + vault tools; visible when the agent-id-core and
+    /// agent-id-vault CLIs are present and the integration is enabled.
+    AgentId,
+    /// Alien agent-id vault-sealed browser tools; visible only when the
+    /// (marketplace-only) agent-id-browser CLI is additionally present.
+    AgentIdBrowser,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

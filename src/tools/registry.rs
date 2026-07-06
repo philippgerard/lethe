@@ -44,6 +44,10 @@ pub struct ToolRuntime {
     pub client: Option<ClientToolContext>,
     pub actor: Option<ActorToolContext>,
     pub observer: Option<SharedTurnObserver>,
+    /// Present only in hosted secure-prompt mode: lets the agent-id tools raise
+    /// end-to-end-sealed credential cards in the frontend and emit identity
+    /// lifecycle events.
+    pub secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
     pub requested_tools: Vec<String>,
 }
 
@@ -54,6 +58,7 @@ impl std::fmt::Debug for ToolRuntime {
             .field("client", &self.client.is_some())
             .field("actor", &self.actor.is_some())
             .field("observer", &self.observer.is_some())
+            .field("secure_prompt", &self.secure_prompt.is_some())
             .field("requested_tools", &self.requested_tools)
             .finish()
     }
@@ -181,19 +186,24 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
 
     let visible = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
+        // Built-in browser hides when the vault-sealed browser is active.
+        ToolCategory::BrowserBuiltin => !crate::agent_id::browser_tools_available(),
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
+        ToolCategory::AgentId => crate::agent_id::vault_tools_available(),
+        ToolCategory::AgentIdBrowser => crate::agent_id::browser_tools_available(),
     };
     let initial = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial => true,
-        ToolCategory::Requestable => false,
+        ToolCategory::Requestable | ToolCategory::BrowserBuiltin => false,
         ToolCategory::CortexOnly => !is_subagent,
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
+        ToolCategory::AgentId | ToolCategory::AgentIdBrowser => false,
     };
 
     let mut lines = catalog::all_defs()
