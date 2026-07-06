@@ -48,6 +48,10 @@ pub enum ParamKind {
     Bool,
     StringArray,
     Enum(&'static [&'static str]),
+    /// A free-form object of arbitrary keys (`additionalProperties: true`). Used
+    /// for pass-through flag bags like `alien_browser_act`'s `params`, whose keys
+    /// the tool cannot enumerate ahead of time.
+    Object,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +134,11 @@ fn param_schema(param: &ParamSpec) -> Value {
             "description": param.description,
             "enum": values.iter().collect::<Vec<_>>(),
         }),
+        ParamKind::Object => json!({
+            "type": "object",
+            "description": param.description,
+            "additionalProperties": true,
+        }),
     }
 }
 
@@ -195,6 +204,15 @@ pub const fn p_enum(
     ParamSpec {
         name,
         kind: ParamKind::Enum(values),
+        description,
+        required: false,
+    }
+}
+
+pub const fn p_object(name: &'static str, description: &'static str) -> ParamSpec {
+    ParamSpec {
+        name,
+        kind: ParamKind::Object,
         description,
         required: false,
     }
