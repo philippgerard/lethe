@@ -1,6 +1,6 @@
 [package]
 name = "lethe"
-version = "0.22.23"
+version = "0.23.4"
 edition = "2024"
 description = "Autonomous executive assistant with local memory and LLM"
 license = "MIT"
@@ -14,6 +14,7 @@ name = "lethe"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1.0"
 async-stream = "0.3"
 axum = "0.8"
@@ -29,7 +30,10 @@ futures-util = "0.3"
 genai = "0.5.3"
 glob = "0.3"
 hf-hub = "0.5"
+hkdf = "0.12"
 kameo = "0.20"
+libc = "0.2"
+p256 = { version = "0.13", features = ["ecdh"] }
 portable-pty = "0.8"
 pulldown-cmark = { version = "0.12", default-features = false }
 rand = "0.9"
@@ -43,12 +47,13 @@ serde_json = "1.0"
 sha2 = "0.10"
 sqlite-vec = "0.1"
 thiserror = "2.0"
-tokio = { version = "1.48", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tui-textarea = "0.7"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3.23"

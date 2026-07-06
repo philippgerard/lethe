@@ -1,5 +1,6 @@
 pub mod actor;
 pub mod agent;
+pub mod agent_id;
 pub mod config;
 pub mod conversation;
 pub mod interfaces;

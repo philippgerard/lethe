@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.23.4 - One browser at a time
+
+- **No more two competing browsers.** Lethe has a built-in browser (`browser_*`,
+  via the `agent-browser` CLI) and the agent-id **vault-sealed** browser
+  (`alien_browser_*`). Both used to be offered to the agent at once even though
+  they're separate daemons with separate sessions — so a page opened with one was
+  invisible to the other, and credential injection only worked in a vault-sealed
+  session. The vault-sealed browser is a superset (it does everything the built-in
+  one does plus vault credential injection), so it now **replaces** the built-in
+  one: when agent-id's browser is active the plain `browser_*` tools are hidden,
+  and the agent sees exactly one browser. With no agent-id, the built-in
+  `browser_*` works as before.
+
+## 0.23.3 - Secure credential card: no phantom "open the app"
+
+- **After you save a credential, the agent knows the secret is already in.**
+  Saving a credential pops a secure card **in the chat** and the tool call blocks
+  until you submit it — so a successful save already means "filled". The result
+  now says so explicitly, which stops the agent from telling you to "open the
+  Alien app and fill it in, then say done" (there is no app step; the card is
+  right in the conversation, and 2FA works the same way).
+
+## 0.23.2 - Headless browser flow works end-to-end
+
+- **The vault-sealed browser is usable from a stored login.** `vault_add` now
+  takes a `login_url` for `login` credentials — without it
+  `alien_browser_auto_login` had nowhere to start, so no signed-in
+  browser-profile could ever be sealed and every later `alien_browser_open`
+  failed with "no browser-profile".
+- **Browser-daemon errors are legible.** A daemon that exits before serving
+  (no profile yet, a bad login URL, a launch failure) now surfaces its actual
+  message instead of a generic "did not report ready" timeout, so a benign
+  "run auto-login first" state no longer reads as "the browser is crashing / not
+  installed". The `alien_browser_open` / `auto_login` tool descriptions also
+  spell out the order: auto-login seals a profile first, open reuses it.
+
+## 0.23.1 - Secure-form guidance fixes
+
+- **The agent no longer invents a phone-app step for vault credential entry.**
+  The `vault_add` / `vault_set_totp` tool descriptions now state where the
+  secure form actually appears — a credential card right in the hosted chat UI,
+  or a local browser form — and that no phone or external app is involved (the
+  "Alien app" wording belongs only to the separate owner-binding deep-link
+  flow). `vault_list` now also states that a listed credential has its secret
+  fields stored, so null bookkeeping metadata (`lastUsedAt`) is no longer
+  misread as "credentials not filled in yet".
+
+## 0.23.0 - Alien agent identity, vault, and sealed browser
+
+- **Each Lethe instance can now hold its own Alien agent identity.** New
+  `agent_id_status`/`bind`/`sign` tools provision an Ed25519 identity (L0
+  self-asserted, optional owner binding via the Alien Network), backed by the
+  `agent-id-core` CLI — gated on discovery, so installs without the CLIs are
+  unaffected.
+- **Encrypted credential vault.** `vault_list`/`add`/`remove`/`set_totp` manage
+  credentials in an encrypted Alien Vault. Secrets never enter the model's
+  context: there is deliberately no `vault_show` and no generic `vault_exec`.
+- **Vault-sealed browser (local).** `alien_browser_login`/`auto_login`/`open`/
+  `close`/`act`/`fill_secret`/`fill_otp` drive a stealth browser whose profile
+  is sealed in the vault; credentials are typed into pages by the vault process,
+  never surfaced to the agent.
+- **Hosted secure-input channel.** In the hosted setup, human-typed secrets are
+  end-to-end sealed in the user's browser (ECDH-P256 → HKDF-SHA256 →
+  AES-256-GCM, request id + server key bound as AAD) and relayed as ciphertext
+  only; the collecting Lethe verifies the requesting child over a unix socket
+  with an SO_PEERCRED peer-PID allowlist, so a prompt-injected agent cannot
+  forge a credential card to harvest a secret.
+
 ## 0.22.23 - Telegram voice transcription on OpenRouter
 
 - **Voice messages from Telegram transcribe again.** In the hosted setup the

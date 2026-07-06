@@ -250,7 +250,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         name: "browser_open",
         description: "Open a URL in the persistent browser.",
         params: &[p_str_req("url", "URL.")],
-        category: ToolCategory::Requestable,
+        category: ToolCategory::BrowserBuiltin,
         execute: ToolExecutor::Sync(exec_browser_open),
     },
     ToolDef {
@@ -260,7 +260,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_bool("interactive_only", "Only interactive elements."),
             p_bool("compact", "Omit empty structural elements."),
         ],
-        category: ToolCategory::Requestable,
+        category: ToolCategory::BrowserBuiltin,
         execute: ToolExecutor::Sync(exec_browser_snapshot),
     },
     ToolDef {
@@ -270,7 +270,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             "ref_or_selector",
             "Element ref (@e1) or selector.",
         )],
-        category: ToolCategory::Requestable,
+        category: ToolCategory::BrowserBuiltin,
         execute: ToolExecutor::Sync(exec_browser_click),
     },
     ToolDef {
@@ -280,7 +280,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
             p_str_req("ref_or_selector", "Element ref (@e1) or selector."),
             p_str_req("text", "Text."),
         ],
-        category: ToolCategory::Requestable,
+        category: ToolCategory::BrowserBuiltin,
         execute: ToolExecutor::Sync(exec_browser_fill),
     },
 ];
@@ -288,6 +288,23 @@ pub const TOOL_DEFS: &[ToolDef] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The built-in browser tools MUST be BrowserBuiltin (not Requestable) — that
+    // category is what hides them when the agent-id vault-sealed browser is active,
+    // so the agent is never offered two competing browsers. Guard against a silent
+    // revert to Requestable.
+    #[test]
+    fn builtin_browser_tools_use_the_gated_category() {
+        assert!(!TOOL_DEFS.is_empty());
+        for def in TOOL_DEFS {
+            assert_eq!(
+                def.category,
+                crate::tools::spec::ToolCategory::BrowserBuiltin,
+                "{} must be BrowserBuiltin so it hides under the vault-sealed browser",
+                def.name,
+            );
+        }
+    }
 
     #[test]
     fn browser_args_add_persistent_profile() {

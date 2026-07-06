@@ -148,6 +148,7 @@ async fn run_interactive(args: InitArgs) -> Result<()> {
         seed_human_block(&settings, &text)?;
     }
     info("Seeded workspace + memory blocks.");
+    provision_agent_id(&settings).await;
 
     // -- Smoke test ---------------------------------------------------------
     println!("\nRunning smoke test...");
@@ -256,6 +257,7 @@ async fn run_noninteractive(args: InitArgs) -> Result<()> {
     )?;
     println!("Wrote {}", env_path.display());
     seed_workspace(&settings)?;
+    provision_agent_id(&settings).await;
     println!(
         "Provider: {}  Main: {main_model}  Aux: {aux_model}",
         provider.label()
@@ -792,6 +794,37 @@ fn print_next_steps(api: bool, yolo: bool, telegram: bool) {
 
 fn info(message: &str) {
     println!("  → {message}");
+}
+
+/// Provision the agent's Alien identity + vault at init time and report it, or
+/// point the user at the CLIs to install when they're absent. Best-effort — a
+/// failure here never blocks setup (the daemon re-provisions on start).
+async fn provision_agent_id(settings: &Settings) {
+    if !lethe::agent_id::is_enabled() {
+        return;
+    }
+    if !lethe::agent_id::vault_tools_available() {
+        info(
+            "Alien agent-id: not set up (optional). Install with \
+             `npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault` to give this \
+             agent a verifiable identity + credential vault.",
+        );
+        return;
+    }
+    lethe::agent_id::ensure_provisioned(settings).await;
+    let sd = lethe::agent_id::state_dir(settings);
+    let status = lethe::agent_id::cli::run_json(lethe::agent_id::cli::Bin::Core, &sd, &["status"]).await;
+    let assurance = status
+        .get("assurance")
+        .and_then(|v| v.as_str())
+        .unwrap_or("self-asserted");
+    match status.get("jkt").and_then(|v| v.as_str()) {
+        Some(jkt) => info(&format!(
+            "Alien identity ready ({assurance}, key {}…). Bind it to you later with the agent_id_bind tool.",
+            &jkt[..jkt.len().min(12)]
+        )),
+        None => info("Alien identity ready. Bind it to you later with the agent_id_bind tool."),
+    }
 }
 
 fn success(message: &str) {

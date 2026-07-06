@@ -1,7 +1,7 @@
 use genai::chat::Tool;
 
 use crate::tools::spec::{ToolCategory, ToolDef};
-use crate::tools::{browser, filesystem, image, knowledge_graph, research, shell, web};
+use crate::tools::{agent_id, browser, filesystem, image, knowledge_graph, research, shell, web};
 
 use super::ToolRegistry;
 use super::{actor_specs, builtin_specs, telegram_specs};
@@ -19,6 +19,7 @@ pub fn all_defs() -> impl Iterator<Item = &'static ToolDef> {
         .chain(research::TOOL_DEFS.iter())
         .chain(telegram_specs::TOOL_DEFS.iter())
         .chain(knowledge_graph::TOOL_DEFS.iter())
+        .chain(agent_id::TOOL_DEFS.iter())
 }
 
 pub fn find_def(name: &str) -> Option<&'static ToolDef> {
@@ -40,6 +41,9 @@ impl<'a> ToolRegistry<'a> {
     pub(super) fn def_is_visible(&self, def: &ToolDef) -> bool {
         match def.category {
             ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
+            // The built-in browser hides when the vault-sealed browser is active,
+            // so the agent is never offered two competing browsers.
+            ToolCategory::BrowserBuiltin => !crate::agent_id::browser_tools_available(),
             ToolCategory::Actor => self.runtime.actor.is_some(),
             ToolCategory::ActorSubagent => self
                 .runtime
@@ -50,6 +54,8 @@ impl<'a> ToolRegistry<'a> {
                 self.runtime.telegram.is_some() || self.runtime.client.is_some()
             }
             ToolCategory::KnowledgeGraph => knowledge_graph::is_configured(),
+            ToolCategory::AgentId => crate::agent_id::vault_tools_available(),
+            ToolCategory::AgentIdBrowser => crate::agent_id::browser_tools_available(),
         }
     }
 
@@ -58,7 +64,7 @@ impl<'a> ToolRegistry<'a> {
     pub(super) fn def_is_initial(&self, def: &ToolDef) -> bool {
         match def.category {
             ToolCategory::Initial => true,
-            ToolCategory::Requestable => false,
+            ToolCategory::Requestable | ToolCategory::BrowserBuiltin => false,
             ToolCategory::CortexOnly => !self.is_subagent_context(),
             // Actor-orchestration tools stay discoverable (def_is_visible) but
             // are only loaded up front for actual subagents — the top-level
@@ -73,6 +79,9 @@ impl<'a> ToolRegistry<'a> {
                 self.runtime.telegram.is_some() || self.runtime.client.is_some()
             }
             ToolCategory::KnowledgeGraph => knowledge_graph::is_configured(),
+            // Identity/vault/browser tools stay discoverable but are requested on
+            // demand — they're used rarely, so keep them out of the initial set.
+            ToolCategory::AgentId | ToolCategory::AgentIdBrowser => false,
         }
     }
 
