@@ -474,8 +474,18 @@ pub async fn serve_with_agent(
     }
 
     // Provision the agent's Alien identity + vault (idempotent, degrades to a
-    // warning if the CLIs are absent).
-    crate::agent_id::ensure_provisioned(&settings).await;
+    // warning if the CLIs are absent). Cache the state dir synchronously (cheap)
+    // so tools resolve it immediately, but run the provisioning itself — which
+    // shells out to the agent-id CLIs, each with a 60s budget — off the hot path,
+    // so a slow or hung shim can't delay the TCP listener (and thus /health) past
+    // the container's health-check grace.
+    crate::agent_id::set_state_dir(&settings);
+    {
+        let settings = settings.clone();
+        tokio::spawn(async move {
+            crate::agent_id::ensure_provisioned(&settings).await;
+        });
+    }
 
     // Hosted secure-input: bind the unix socket and start its accept loop so
     // agent-id CLI children can raise end-to-end-sealed credential cards.

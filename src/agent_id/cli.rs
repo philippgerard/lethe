@@ -90,18 +90,34 @@ pub async fn run_interactive(
 
     let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     // Authorize the child's PID before it can connect (the server also waits
-    // briefly on unknown PIDs to absorb the race).
+    // briefly on unknown PIDs to absorb the race). The guard deauthorizes on
+    // drop — crucially including when a cancelled turn drops this future mid-await
+    // (kill_on_drop then kills the child), so a leaked PID can't linger in the
+    // allowlist and be reused by an unrelated same-uid process.
     let pid = child.id();
-    if let (Some(hub), Some(pid)) = (hub, pid) {
-        hub.authorize(pid);
-    }
+    let _deauth = match (hub, pid) {
+        (Some(hub), Some(pid)) => {
+            hub.authorize(pid);
+            Some(DeauthorizeGuard { hub, pid })
+        }
+        _ => None,
+    };
 
-    let result = wait_parsed(&mut child, HUMAN_TIMEOUT).await;
+    wait_parsed(&mut child, HUMAN_TIMEOUT).await
+}
 
-    if let (Some(hub), Some(pid)) = (hub, pid) {
-        hub.deauthorize(pid);
+/// Deauthorizes a child PID from the secure-prompt allowlist on drop, so the
+/// entry is removed on every exit path — normal return, error, or a cancelled
+/// turn dropping the tool future.
+struct DeauthorizeGuard<'a> {
+    hub: &'a SecurePromptHub,
+    pid: u32,
+}
+
+impl Drop for DeauthorizeGuard<'_> {
+    fn drop(&mut self) {
+        self.hub.deauthorize(self.pid);
     }
-    result
 }
 
 async fn run_command(cmd: Command, timeout: Duration) -> Result<CliResult, String> {
@@ -216,8 +232,18 @@ pub async fn spawn_daemon_ready(
         }
         None
     })
-    .await
-    .map_err(|_| "browser daemon did not report ready in time".to_string())?;
+    .await;
+
+    // On ready-timeout, reap the half-started daemon before returning — it was
+    // spawned with kill_on_drop(false) (it's meant to outlive this call), so
+    // dropping the handle would otherwise leave it running unsupervised.
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err("browser daemon did not report ready in time".to_string());
+        }
+    };
 
     match outcome {
         Some(Ok(ready)) => {

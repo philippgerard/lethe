@@ -20,7 +20,7 @@ use crate::agent_id::secure_prompt::SecurePromptHub;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::args::{bool_arg, nonempty_string, string_arg, string_vec_arg};
 use crate::tools::spec::{
-    ToolCategory, ToolDef, ToolExecutor, p_bool, p_enum, p_str, p_str_array, p_str_req,
+    ToolCategory, ToolDef, ToolExecutor, p_bool, p_enum, p_object, p_str, p_str_array, p_str_req,
 };
 
 type BoxFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
@@ -341,7 +341,19 @@ fn exec_browser_open<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture
             }
             argv.push("--headed".to_string());
         }
-        let log = std::env::temp_dir().join(format!("agent-browser-{name}.log"));
+        // Keep the daemon log inside the 0700 state dir (not world-readable /tmp)
+        // and slugify the model-chosen name so it can't traverse out of it.
+        let slug: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let log = sd.join(format!("browser-{slug}.log"));
         match cli::spawn_daemon_ready(&sd, &argv.iter().map(String::as_str).collect::<Vec<_>>(), log).await {
             Ok(ready) => ready.to_string(),
             Err(message) => err(message),
@@ -568,6 +580,10 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         description: "Run a browser action in an open session. `action` is a verb (snapshot, click, type, navigate, page-text, wait, tabs, tab-new, screenshot, get, scroll, press, …) and `params` its flags (e.g. {\"ref\":\"e3\",\"text\":\"hi\"}). For credential injection use the dedicated fill tools.",
         params: &[
             p_str_req("action", "Browser verb to run."),
+            p_object(
+                "params",
+                "Flags for the action as a JSON object, e.g. {\"ref\":\"e3\",\"text\":\"hi\"} or {\"url\":\"https://…\"}. Omit for verbs that take none (snapshot, page-text, tabs).",
+            ),
             p_str("name", "Session name (default 'main')."),
         ],
         category: ToolCategory::AgentIdBrowser,
@@ -600,8 +616,34 @@ pub const TOOL_DEFS: &[ToolDef] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::note_secret_collected;
+    use super::{TOOL_DEFS, note_secret_collected};
     use serde_json::Value;
+
+    #[test]
+    fn browser_act_schema_advertises_the_params_object() {
+        let def = TOOL_DEFS
+            .iter()
+            .find(|d| d.name == "alien_browser_act")
+            .expect("alien_browser_act is registered");
+        let schema = def.schema();
+        // The handler reads `args.get("params")` to build every flag, so the
+        // published schema must permit it — otherwise a strict function-calling
+        // provider strips it and click/type/navigate degrade to bare verbs.
+        let params = schema
+            .pointer("/properties/params")
+            .expect("params is a declared property");
+        assert_eq!(params.get("type").and_then(Value::as_str), Some("object"));
+        assert_eq!(
+            params.get("additionalProperties").and_then(Value::as_bool),
+            Some(true),
+            "params must accept arbitrary action flags",
+        );
+        assert_eq!(
+            schema.get("additionalProperties").and_then(Value::as_bool),
+            Some(false),
+            "the tool itself still rejects unknown top-level keys",
+        );
+    }
 
     #[test]
     fn ok_result_gets_a_submission_note() {
