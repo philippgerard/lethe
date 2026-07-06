@@ -1151,6 +1151,7 @@ async fn wake(
             dry_run: false,
             sent_messages: None,
         }),
+        secure_prompt: state.secure_prompt.clone(),
         ..ToolRuntime::default()
     };
     let req = TurnRequest::new(&body.message).with_runtime(runtime);
