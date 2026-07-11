@@ -394,6 +394,11 @@ fn exposes_and_executes_telegram_tools_when_context_is_present() {
     assert_eq!(pending[0].chat_id, 99);
     assert_eq!(pending[0].message_id, 42);
     assert_eq!(pending[0].emoji, "🔥");
+
+    // The successful text + file sends are counted as visible messages (the
+    // final-response suppression signal); the failed send and the queued
+    // reaction are not.
+    assert_eq!(guard.lock().unwrap().visible_messages_sent(), 2);
 }
 
 #[test]

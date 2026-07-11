@@ -1369,15 +1369,38 @@ async fn send_guarded_telegram_final_response(
     response: &str,
     guard: SharedTelegramTurnGuard,
 ) -> Result<()> {
-    let (pending_reactions, channel) = {
+    let (pending_reactions, channel, tool_messages_sent) = {
         let mut guard = guard
             .lock()
             .map_err(|error| anyhow!("telegram turn guard poisoned: {error}"))?;
         (
             guard.drain_pending_reactions(),
             guard.choose_visible_channel(),
+            guard.visible_messages_sent(),
         )
     };
+
+    // The model already delivered visible content via telegram_send_message /
+    // telegram_send_file this turn: its final text is a post-tool wrap-up that
+    // would reach the user as a reworded repeat of what it just sent. Treat it
+    // like the /wake path does (final text = internal commentary, discarded);
+    // queued reactions still apply.
+    if tool_messages_sent > 0 {
+        for pending in pending_reactions {
+            let _ = client
+                .set_message_reaction(pending.chat_id, pending.message_id, &pending.emoji)
+                .await
+                .unwrap_or(false);
+        }
+        if !response.trim().is_empty() {
+            tracing::debug!(
+                tool_messages_sent,
+                dropped_chars = response.chars().count(),
+                "dropping final response text: tool already delivered messages this turn"
+            );
+        }
+        return Ok(());
+    }
 
     if is_emoji_only_reply(response) && !pending_reactions.is_empty() {
         if channel == VisibleTelegramChannel::Reaction {
@@ -1448,6 +1471,21 @@ mod tests {
         assert!(!error_is_out_of_credits(&anyhow::anyhow!(
             "connection reset by peer"
         )));
+    }
+
+    #[tokio::test]
+    async fn final_response_is_dropped_when_tools_already_delivered() {
+        let client = TelegramClient::new("test-token".to_string(), Vec::new()).expect("client");
+        let mut turn_guard = TelegramTurnGuard::new();
+        turn_guard.record_visible_message();
+        let guard = Arc::new(Mutex::new(turn_guard));
+
+        // Passes ONLY via the suppression branch: with no queued reactions the
+        // function must return before any Telegram API call — an attempted
+        // send would dial api.telegram.org with a bogus token and error out.
+        send_guarded_telegram_final_response(&client, 99, "reworded wrap-up", guard)
+            .await
+            .expect("final text suppressed without dialing");
     }
 
     fn test_settings(root: &std::path::Path) -> Settings {
