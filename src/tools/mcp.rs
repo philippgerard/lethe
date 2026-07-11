@@ -1,10 +1,11 @@
 //! Remote MCP tools: a minimal Model Context Protocol client (Streamable
 //! HTTP, JSON-RPC 2.0) that lets Lethe discover and call tools on ONE remote
-//! MCP server — e.g. a personal tool hub exposing calendar, contacts, CRM,
-//! email, finance and scheduling tools. Configured via `MCP_SERVER_URL` (the
-//! POST endpoint, e.g. `https://mcp.example.com/mcp`) + `MCP_SERVER_TOKEN`
-//! (a bearer token; scoped service tokens recommended). When unconfigured,
-//! the mcp_* tools are hidden from the model entirely (`ToolCategory::Mcp`).
+//! MCP server. Configured via `MCP_SERVER_URL` (the POST endpoint, e.g.
+//! `https://mcp.example.com/mcp`) + `MCP_SERVER_TOKEN` (a bearer token;
+//! scoped service tokens recommended), plus an optional `MCP_SERVER_LABEL`
+//! (a display name for the server, surfaced in mcp_list_tools output). When
+//! unconfigured, the mcp_* tools are hidden from the model entirely
+//! (`ToolCategory::Mcp`).
 //!
 //! The remote `tools/list` is filtered by the token's grants on the server
 //! side, so what the model can discover and call is exactly what the token
@@ -331,6 +332,13 @@ fn truncated(text: String) -> String {
 
 // ── tool implementations ─────────────────────────────────────────────────────
 
+fn server_label() -> Option<String> {
+    env::var("MCP_SERVER_LABEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 async fn list_tools_impl(args: &Value) -> String {
     let filter = string_arg(args, "filter").trim().to_lowercase();
     match remote_tools().await {
@@ -353,14 +361,15 @@ async fn list_tools_impl(args: &Value) -> String {
                 })
                 .collect();
 
-            truncated(
-                json!({
-                    "count": entries.len(),
-                    "tools": entries,
-                    "note": "mcp_describe_tool gives a tool's parameters; mcp_call executes it.",
-                })
-                .to_string(),
-            )
+            let mut result = json!({
+                "count": entries.len(),
+                "tools": entries,
+                "note": "mcp_describe_tool gives a tool's parameters; mcp_call executes it.",
+            });
+            if let Some(label) = server_label() {
+                result["server"] = Value::String(label);
+            }
+            truncated(result.to_string())
         }
         Err(error) => error,
     }
@@ -461,17 +470,17 @@ fn exec_mcp_call<'a>(
 pub const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "mcp_list_tools",
-        description: "List the tools available on the user's remote MCP tool hub (calendar, contacts, personal CRM, email, food, health, finance, scheduled tasks, …). Returns compact {name, summary} entries — the set is filtered server-side to what this agent's token may use. Start here, then mcp_describe_tool for a tool's parameters and mcp_call to execute it. The catalog is cached for a few minutes.",
+        description: "List the tools available on the configured remote MCP server. Returns compact {name, summary} entries — the visible set is whatever the server grants this agent's token, so listing is also how you discover what the server offers. Start here, then mcp_describe_tool for a tool's parameters and mcp_call to execute it. The catalog is cached for a few minutes.",
         params: &[p_str(
             "filter",
-            "Case-insensitive substring to match against tool names and descriptions (e.g. \"crm\", \"calendar\").",
+            "Case-insensitive substring to match against tool names and descriptions.",
         )],
         category: ToolCategory::Mcp,
         execute: ToolExecutor::Async(exec_mcp_list_tools),
     },
     ToolDef {
         name: "mcp_describe_tool",
-        description: "Full definition of ONE tool on the remote MCP hub: complete description plus its JSON input schema (parameter names, types, required fields). Read this before the first mcp_call of an unfamiliar tool — the summaries from mcp_list_tools omit parameters.",
+        description: "Full definition of ONE tool on the configured remote MCP server: complete description plus its JSON input schema (parameter names, types, required fields). Read this before the first mcp_call of an unfamiliar tool — the summaries from mcp_list_tools omit parameters.",
         params: &[p_str_req(
             "tool",
             "Tool name exactly as listed by mcp_list_tools.",
@@ -481,7 +490,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "mcp_call",
-        description: "Execute a tool on the user's remote MCP tool hub with JSON arguments matching its schema (mcp_describe_tool). Returns the tool's text result. Effects happen on the hub under this agent's token: sensitive actions there (trades, email sends, calendar/contact mutations) stage an owner approval and return pending_approval instead of executing — report that status honestly and, when a request_id is returned, poll the matching *_check_approval_status tool.",
+        description: "Execute a tool on the configured remote MCP server with JSON arguments matching its schema (mcp_describe_tool). Returns the tool's text result. Effects happen on the server under this agent's token. If the server stages an effect for out-of-band approval instead of executing it (e.g. the result reports a pending status with a request id), report that status honestly and follow the server's own instructions for checking the outcome — never claim the action completed.",
         params: &[
             p_str_req("tool", "Tool name exactly as listed by mcp_list_tools."),
             p_object(
@@ -515,6 +524,7 @@ mod tests {
         unsafe {
             env::remove_var("MCP_SERVER_URL");
             env::remove_var("MCP_SERVER_TOKEN");
+            env::remove_var("MCP_SERVER_LABEL");
         }
     }
 
@@ -638,15 +648,17 @@ mod tests {
         unsafe {
             env::set_var("MCP_SERVER_URL", format!("http://{addr}/mcp"));
             env::set_var("MCP_SERVER_TOKEN", "test-token");
+            env::set_var("MCP_SERVER_LABEL", "testhub");
         }
         reset_state();
 
-        // list: both tools, compact one-sentence summaries
+        // list: both tools, compact one-sentence summaries, the optional label
         let listed = list_tools_impl(&json!({})).await;
         assert!(listed.contains("crm_get_overdue"));
         assert!(listed.contains("time_get_current_time"));
         assert!(listed.contains("Keep-in-touch nudges."));
         assert!(!listed.contains("Second sentence"));
+        assert!(listed.contains("testhub"));
 
         // filter narrows
         let filtered = list_tools_impl(&json!({"filter": "crm"})).await;
