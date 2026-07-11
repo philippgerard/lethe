@@ -192,6 +192,7 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
+        ToolCategory::Mcp => crate::tools::mcp::is_configured(),
         ToolCategory::AgentId => crate::agent_id::vault_tools_available(),
         ToolCategory::AgentIdBrowser => crate::agent_id::browser_tools_available(),
     };
@@ -203,6 +204,7 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_transport,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
+        ToolCategory::Mcp => crate::tools::mcp::is_configured(),
         ToolCategory::AgentId | ToolCategory::AgentIdBrowser => false,
     };
 

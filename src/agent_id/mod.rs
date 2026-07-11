@@ -202,12 +202,16 @@ pub async fn ensure_provisioned(settings: &Settings) {
 
     // Identity (L0 is instant, no network).
     let status = cli::run_json(cli::Bin::Core, &sd, &["status"]).await;
-    let initialized = status.get("initialized").and_then(serde_json::Value::as_bool);
+    let initialized = status
+        .get("initialized")
+        .and_then(serde_json::Value::as_bool);
     if initialized == Some(false) {
         let init = cli::run_json(cli::Bin::Core, &sd, &["init"]).await;
         match init.get("fingerprint").and_then(serde_json::Value::as_str) {
             Some(fp) => tracing::info!(fingerprint = %fp, "agent-id: created L0 identity"),
-            None => tracing::warn!(result = %init, "agent-id: identity init returned no fingerprint"),
+            None => {
+                tracing::warn!(result = %init, "agent-id: identity init returned no fingerprint")
+            }
         }
     }
 
