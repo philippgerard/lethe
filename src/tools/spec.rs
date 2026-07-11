@@ -33,6 +33,10 @@ pub enum ToolCategory {
     /// Initial when the hosted knowledge-graph backend is configured
     /// (KG_API_BASE/KG_API_TOKEN); hidden entirely otherwise.
     KnowledgeGraph,
+    /// Remote MCP client tools (mcp_list_tools / mcp_describe_tool /
+    /// mcp_call). Initial when a remote MCP server is configured
+    /// (MCP_SERVER_URL/MCP_SERVER_TOKEN); hidden entirely otherwise.
+    Mcp,
     /// Alien agent-id identity + vault tools; visible when the agent-id-core and
     /// agent-id-vault CLIs are present and the integration is enabled.
     AgentId,

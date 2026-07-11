@@ -1,7 +1,9 @@
 use genai::chat::Tool;
 
 use crate::tools::spec::{ToolCategory, ToolDef};
-use crate::tools::{agent_id, browser, filesystem, image, knowledge_graph, research, shell, web};
+use crate::tools::{
+    agent_id, browser, filesystem, image, knowledge_graph, mcp, research, shell, web,
+};
 
 use super::ToolRegistry;
 use super::{actor_specs, builtin_specs, telegram_specs};
@@ -19,6 +21,7 @@ pub fn all_defs() -> impl Iterator<Item = &'static ToolDef> {
         .chain(research::TOOL_DEFS.iter())
         .chain(telegram_specs::TOOL_DEFS.iter())
         .chain(knowledge_graph::TOOL_DEFS.iter())
+        .chain(mcp::TOOL_DEFS.iter())
         .chain(agent_id::TOOL_DEFS.iter())
 }
 
@@ -54,6 +57,7 @@ impl<'a> ToolRegistry<'a> {
                 self.runtime.telegram.is_some() || self.runtime.client.is_some()
             }
             ToolCategory::KnowledgeGraph => knowledge_graph::is_configured(),
+            ToolCategory::Mcp => mcp::is_configured(),
             ToolCategory::AgentId => crate::agent_id::vault_tools_available(),
             ToolCategory::AgentIdBrowser => crate::agent_id::browser_tools_available(),
         }
@@ -79,6 +83,9 @@ impl<'a> ToolRegistry<'a> {
                 self.runtime.telegram.is_some() || self.runtime.client.is_some()
             }
             ToolCategory::KnowledgeGraph => knowledge_graph::is_configured(),
+            // The remote-hub surface is three small meta-tools; scheduled wake
+            // turns should reach them without a request_tool round-trip.
+            ToolCategory::Mcp => mcp::is_configured(),
             // Identity/vault/browser tools stay discoverable but are requested on
             // demand — they're used rarely, so keep them out of the initial set.
             ToolCategory::AgentId | ToolCategory::AgentIdBrowser => false,
