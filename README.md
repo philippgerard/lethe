@@ -199,7 +199,7 @@ Lethe routes chat through `genai`. The runtime supports both API-key and subscri
 
 `LLM_PROVIDER` is optional but useful when a model id does not carry a provider prefix — for example `LLM_PROVIDER=openrouter` with `LLM_MODEL=moonshotai/kimi-k2.6`. Subscription auth also requires `LLM_PROVIDER=openai` or `LLM_PROVIDER=anthropic` so the router picks the OAuth path instead of looking for an API key (the `lethe login` commands set this for you).
 
-`LLM_MODEL_AUX` defaults to the main model and is used for lightweight/background calls.
+Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX` (defaults to the main model) handles lightweight/background calls (summarizer, curator, heartbeat). Two optional tiers let a turn change models mid-flight: `LLM_MODEL_TOOL` is a stronger reasoner a turn switches to the moment a tool is used, and `LLM_MODEL_DEEP` is a powerful "deep thinking" model the agent **escalates to on demand** for hard tasks — by calling the `think_deeply` tool (self-recognition), automatically when a turn is visibly struggling, or for a subagent spawned on the `deep` tier. Both reset to `LLM_MODEL` on the next turn; deep escalation outranks the tool switch. Set them at runtime via `POST /model` (`model_deep`) or, over Telegram, `/deep <model-id>`.
 
 ### Subscription OAuth
 
@@ -238,7 +238,9 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `LETHE_API_PORT` | API port | `1373` |
 | `LLM_PROVIDER` | Optional provider hint | auto |
 | `LLM_MODEL` | Main model | required for chat |
-| `LLM_MODEL_AUX` | Auxiliary model | main model |
+| `LLM_MODEL_AUX` | Auxiliary model — cheap background calls (summarizer, curator, heartbeat) | main model |
+| `LLM_MODEL_TOOL` | Optional stronger reasoner; a turn switches to it the moment a tool is used (rest of the chain), then resets next turn | unset (no switch) |
+| `LLM_MODEL_DEEP` | Optional powerful "deep thinking" model the agent escalates to for hard tasks — via the `think_deeply` tool, an auto-escalate backstop when a turn struggles, or a `deep`-tier subagent; resets next turn. Outranks `LLM_MODEL_TOOL` | unset (no escalation) |
 | `LLM_API_BASE` | Custom OpenAI-compatible base URL | unset |
 | `LLM_CONTEXT_LIMIT` | Context size hint | `100000` |
 | `OPENROUTER_API_KEY` | OpenRouter key | unset |
@@ -339,7 +341,7 @@ All API routes require `Authorization: Bearer <LETHE_API_TOKEN>` or `x-lethe-tok
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |
 | `/cancel` | `POST` | Cancel active work for a chat. |
 | `/configure` | `POST` | Store user metadata in memory. |
-| `/model` | `GET`/`POST` | Inspect or update main/aux model ids. |
+| `/model` | `GET`/`POST` | Inspect or update the main/aux/deep model ids (`model`, `model_aux`, `model_deep`). |
 | `/file?path=...` | `GET` | Serve a workspace file. |
 | `/actors` | `GET` | Snapshot of active and recently terminated actors. |
 | `/todos` | `GET` | List todos (filters: `status`, `priority`, `include_completed`, `limit`). |
@@ -496,7 +498,7 @@ scripts/package-release
 ls dist/
 ```
 
-Tagged pushes (`v*`) build GitHub release assets on a four-runner matrix — `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64` — each producing one `lethe-<target>.tar.gz` plus a sibling `lethe-migrate-<target>.tar.gz` (`install.sh` and `update.sh` consume the `lethe-*` assets from the latest release). Linux gnu binaries are built on `ubuntu-22.04(-arm)` for a glibc 2.35 floor; macOS binaries link only against system frameworks.
+Tagged pushes (`v*`) build GitHub release assets on a three-runner matrix — `linux-x86_64`, `linux-aarch64`, `macos-aarch64` — each producing one `lethe-<target>.tar.gz`, with `lethe-migrate-<target>.tar.gz` built by the separate `release-migrator.yml` workflow (`install.sh` and `update.sh` consume the `lethe-*` assets from the latest release). Linux gnu binaries are built on `ubuntu-24.04(-arm)` for a glibc 2.39 floor (required by the prebuilt onnxruntime binaries fastembed pulls in — end-user floor: Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL/Rocky 10+); macOS binaries link only against system frameworks.
 
 Useful smoke checks:
 
