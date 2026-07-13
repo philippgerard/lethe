@@ -71,12 +71,14 @@ pub enum TelegramRuntimeCommand {
     Heartbeat,
     Model(Option<String>),
     Aux(Option<String>),
+    Deep(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TelegramModelSlot {
     Main,
     Aux,
+    Deep,
 }
 
 #[derive(Debug)]
@@ -296,13 +298,14 @@ pub fn parse_telegram_runtime_command(text: &str) -> Option<TelegramRuntimeComma
         "heartbeat" => Some(TelegramRuntimeCommand::Heartbeat),
         "model" => Some(TelegramRuntimeCommand::Model(args)),
         "aux" => Some(TelegramRuntimeCommand::Aux(args)),
+        "deep" => Some(TelegramRuntimeCommand::Deep(args)),
         _ => None,
     }
 }
 
 pub fn telegram_help_text(settings: &Settings) -> String {
     format!(
-        "Hello. I'm {}.\n\nSend me any message and I'll help.\n\nCommands:\n/status - Check runtime status\n/stop - Cancel current processing when supported\n/heartbeat - Force a check-in\n/model [model-id] - Show or change the main model\n/aux [model-id] - Show or change the auxiliary model",
+        "Hello. I'm {}.\n\nSend me any message and I'll help.\n\nCommands:\n/status - Check runtime status\n/stop - Cancel current processing when supported\n/heartbeat - Force a check-in\n/model [model-id] - Show or change the main model\n/aux [model-id] - Show or change the auxiliary model\n/deep [model-id] - Show or change the deep-thinking model",
         settings.agent_name
     )
 }
@@ -362,6 +365,7 @@ pub fn telegram_model_text(
     let (label, current) = match slot {
         TelegramModelSlot::Main => ("Main model", before.model.as_str()),
         TelegramModelSlot::Aux => ("Aux model", before.aux_model.as_str()),
+        TelegramModelSlot::Deep => ("Deep model", before.deep_model.as_str()),
     };
 
     let Some(model) = requested_model
@@ -371,6 +375,7 @@ pub fn telegram_model_text(
         let command = match slot {
             TelegramModelSlot::Main => "/model",
             TelegramModelSlot::Aux => "/aux",
+            TelegramModelSlot::Deep => "/deep",
         };
         return Ok(format!(
             "{label}: {}\nUse `{command} <model-id>` to change it for this process.",
@@ -379,8 +384,9 @@ pub fn telegram_model_text(
     };
 
     let changed = match slot {
-        TelegramModelSlot::Main => agent.reconfigure_models(Some(model), None)?,
-        TelegramModelSlot::Aux => agent.reconfigure_models(None, Some(model))?,
+        TelegramModelSlot::Main => agent.reconfigure_models(Some(model), None, None)?,
+        TelegramModelSlot::Aux => agent.reconfigure_models(None, Some(model), None)?,
+        TelegramModelSlot::Deep => agent.reconfigure_models(None, None, Some(model))?,
     };
     if changed
         .as_object()
@@ -393,6 +399,7 @@ pub fn telegram_model_text(
     let updated = match slot {
         TelegramModelSlot::Main => after.model.as_str(),
         TelegramModelSlot::Aux => after.aux_model.as_str(),
+        TelegramModelSlot::Deep => after.deep_model.as_str(),
     };
     Ok(format!(
         "{label} updated: {} -> {}",
@@ -685,6 +692,10 @@ async fn handle_telegram_runtime_command(
         }
         TelegramRuntimeCommand::Aux(model) => {
             let response = telegram_model_text(agent, TelegramModelSlot::Aux, model.as_deref())?;
+            client.send_message(incoming.chat_id, &response).await?;
+        }
+        TelegramRuntimeCommand::Deep(model) => {
+            let response = telegram_model_text(agent, TelegramModelSlot::Deep, model.as_deref())?;
             client.send_message(incoming.chat_id, &response).await?;
         }
     }

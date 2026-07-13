@@ -49,6 +49,10 @@ pub struct ToolRuntime {
     /// lifecycle events.
     pub secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
     pub requested_tools: Vec<String>,
+    /// When true, the turn starts already escalated onto the deep-thinking model
+    /// (set for `deep`-tier subagents). The cortex leaves this false and escalates
+    /// on demand via `think_deeply` or the auto-escalate backstop.
+    pub start_escalated: bool,
 }
 
 impl std::fmt::Debug for ToolRuntime {
@@ -60,6 +64,7 @@ impl std::fmt::Debug for ToolRuntime {
             .field("observer", &self.observer.is_some())
             .field("secure_prompt", &self.secure_prompt.is_some())
             .field("requested_tools", &self.requested_tools)
+            .field("start_escalated", &self.start_escalated)
             .finish()
     }
 }

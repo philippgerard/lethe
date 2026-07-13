@@ -59,6 +59,8 @@ fn active_tool_specs_start_small_and_expand_on_request() {
         .map(|tool| tool.name)
         .collect::<Vec<_>>();
     assert!(initial.contains(&"request_tool".to_string()));
+    // Always loaded so the agent can self-escalate to the deep model on demand.
+    assert!(initial.contains(&"think_deeply".to_string()));
     assert!(initial.contains(&"bash".to_string()));
     assert!(initial.contains(&"web_search".to_string()));
     assert!(!initial.contains(&"browser_open".to_string()));
@@ -84,9 +86,10 @@ fn active_tool_specs_start_small_and_expand_on_request() {
         );
     }
     // Top-level (non-subagent) turn keeps a lean initial set; with the 3
-    // Transport tools added when Telegram is connected this stays <= 15.
+    // Transport tools added when Telegram is connected this stays <= 16
+    // (the +1 over the old 12 is the always-loaded `think_deeply` escalator).
     assert!(
-        initial.len() <= 12,
+        initial.len() <= 13,
         "initial tool set too large: {}",
         initial.len()
     );

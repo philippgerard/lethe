@@ -39,11 +39,20 @@ const MAX_TOOL_ERROR_PRESSURE: usize = 16;
 const MAX_REPEATED_TOOL_CALLS: usize = 4;
 const MAX_NO_PROGRESS_TURNS: usize = 4;
 const MAX_EMPTY_RESPONSES: usize = 2;
+/// Auto-escalation thresholds: when a deep-thinking model is configured and the
+/// turn is visibly struggling — half the error-pressure budget spent, or two
+/// consecutive no-progress rounds — we escalate to the powerful model for the
+/// rest of the turn instead of grinding on toward the circuit breaker. Both sit
+/// below their `MAX_*` breaker caps so escalation gets a chance to recover first.
+const AUTO_ESCALATE_ERROR_PRESSURE: usize = MAX_TOOL_ERROR_PRESSURE / 2;
+const AUTO_ESCALATE_NO_PROGRESS_TURNS: usize = 2;
 
 /// Tools that don't count as "work" against [`total_tool_calls`] — memory
 /// reads/writes, telegram side effects, actor lifecycle. Matches Python's
 /// `FREE_TOOL_NAMES`.
 const FREE_TOOL_NAMES: &[&str] = &[
+    // Reasoning control
+    "think_deeply",
     // Memory
     "memory_read",
     "memory_update",
@@ -353,6 +362,9 @@ pub(super) fn actor_turn_executor(
                     is_subagent: true,
                 }),
                 requested_tools: spec.requested_tools.clone(),
+                // A subagent spawned on the `deep` tier starts already escalated,
+                // so its whole turn runs on the powerful model.
+                start_escalated: spec.model == ModelTier::Deep,
                 ..ToolRuntime::default()
             };
             let messages = vec![
@@ -394,6 +406,9 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     use_aux: bool,
     record_tool_messages: bool,
 ) -> AgentResult<TurnOutput> {
+    // Read before `runtime` is moved into the registry below: a `deep`-tier
+    // subagent starts already escalated onto the powerful model.
+    let start_escalated = runtime.start_escalated;
     let mut active_tools = runtime
         .requested_tools
         .iter()
@@ -424,6 +439,11 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // base model again. With no tool model configured this stays false and the
     // whole turn runs on the base model, exactly as before.
     let mut entered_tool_chain = false;
+    // Deep-thinking escalation: once set (by a `think_deeply` call, an auto-escalate
+    // on struggle, or a `deep`-tier spawn) and a deep model is configured, every
+    // remaining model call this turn — including the post-chain reply — runs on the
+    // powerful model. Escalation outranks the tool-model switch. Resets next turn.
+    let mut escalated = start_escalated;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         request.tools = Some(registry.tools_for_active(&active_tools));
@@ -439,9 +459,12 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             .read()
             .map_err(|error| AgentError::Llm(anyhow!("router lock poisoned: {error}")))?
             .clone();
-        // Once we're inside a tool chain and a dedicated tool model is
-        // configured, route to it; otherwise use the base model for this turn.
-        let model_id = if entered_tool_chain && router.config().has_tool_model() {
+        // Model for this call, in priority order: an active deep-thinking
+        // escalation wins; else the dedicated tool model once inside a tool
+        // chain; else the base model selected by `use_aux` for this turn.
+        let model_id = if escalated && router.config().has_deep_model() {
+            router.config().deep_model().to_string()
+        } else if entered_tool_chain && router.config().has_tool_model() {
             router.config().tool_model().to_string()
         } else {
             router.config().model_for(use_aux).to_string()
@@ -591,6 +614,37 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 matches!(call.fn_name.as_str(), "terminate" | "restart_self");
             let raw_result = if call.fn_name == "request_tool" {
                 request_tool_for_turn(&registry, &mut active_tools, &call.fn_arguments)
+            } else if call.fn_name == "think_deeply" {
+                // Self-triggered escalation: the model recognized a hard task.
+                // Latch it — the next model call runs on the deep model.
+                let reason = call
+                    .fn_arguments
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let has_deep = context
+                    .router
+                    .read()
+                    .ok()
+                    .is_some_and(|router| router.config().has_deep_model());
+                if !has_deep {
+                    // No deep model wired — acknowledge without a false promise.
+                    "No deeper model is configured; continue on the current model. \
+                     Reason carefully through the hard part and answer."
+                        .to_string()
+                } else if escalated {
+                    "Already in deep-thinking mode. Continue reasoning and answer.".to_string()
+                } else {
+                    escalated = true;
+                    tracing::info!(
+                        reason = %reason,
+                        "think_deeply — escalating to the deep model for the rest of the turn"
+                    );
+                    "Escalated to the deep-thinking model for the rest of this turn. \
+                     Now reason carefully through the hard part and answer."
+                        .to_string()
+                }
             } else if registry.tool_is_active(&call.fn_name, &active_tools) {
                 let inner: BoxToolFuture<'_> =
                     Box::pin(registry.execute_async(&call.fn_name, &call.fn_arguments));
@@ -700,6 +754,29 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             }
         }
 
+        // Auto-escalate backstop: the model is visibly struggling but hasn't asked
+        // for help. Before the circuit breaker cuts the turn, hand the rest of it
+        // to the deep model — a stronger reasoner may break the loop. Fires at most
+        // once per turn and only when a distinct deep model is configured.
+        if !escalated
+            && (tool_error_pressure >= AUTO_ESCALATE_ERROR_PRESSURE
+                || no_progress_turns >= AUTO_ESCALATE_NO_PROGRESS_TURNS)
+        {
+            let has_deep = context
+                .router
+                .read()
+                .ok()
+                .is_some_and(|router| router.config().has_deep_model());
+            if has_deep {
+                escalated = true;
+                tracing::info!(
+                    tool_error_pressure,
+                    no_progress_turns,
+                    "auto-escalating to the deep model — turn is struggling"
+                );
+            }
+        }
+
         for image_view in image_views {
             request.messages.push(image_view_message(image_view));
         }
@@ -737,9 +814,12 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         .read()
         .map_err(|error| AgentError::Llm(anyhow!("router lock poisoned: {error}")))?
         .clone();
-    // This wrap-up reply follows a tool chain, so keep it on the tool model when
-    // one is configured (the strong model writes the final answer).
-    let wrap_model = if entered_tool_chain && router.config().has_tool_model() {
+    // The wrap-up reply is the user-facing answer, so honor the same priority as
+    // the loop: a live escalation writes the final answer on the deep model; else
+    // the tool model when we entered a tool chain; else the base model.
+    let wrap_model = if escalated && router.config().has_deep_model() {
+        router.config().deep_model().to_string()
+    } else if entered_tool_chain && router.config().has_tool_model() {
         router.config().tool_model().to_string()
     } else {
         router.config().model_for(use_aux).to_string()

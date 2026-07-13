@@ -213,6 +213,8 @@ pub struct LlmRouterConfig {
     pub aux_model: String,
     /// Optional dedicated model for tool chains. Empty = no mid-turn switch.
     pub tool_model: String,
+    /// Optional powerful model for escalated "deep thinking". Empty = no escalation.
+    pub deep_model: String,
     pub provider: String,
     pub api_base: String,
     pub max_output_tokens: u32,
@@ -225,6 +227,7 @@ impl LlmRouterConfig {
             model: settings.llm.llm_model.clone(),
             aux_model: settings.effective_aux_model().to_string(),
             tool_model: settings.effective_tool_model().to_string(),
+            deep_model: settings.effective_deep_model().to_string(),
             provider: settings.llm.llm_provider.clone(),
             api_base: settings.llm.llm_api_base.clone(),
             max_output_tokens: settings.llm.llm_max_output,
@@ -250,6 +253,18 @@ impl LlmRouterConfig {
     pub fn has_tool_model(&self) -> bool {
         let tool = self.tool_model.trim();
         !tool.is_empty() && tool != self.model.trim()
+    }
+
+    /// The powerful deep-thinking model id (may be empty).
+    pub fn deep_model(&self) -> &str {
+        self.deep_model.trim()
+    }
+
+    /// Whether a deep-thinking model is configured and actually differs from the
+    /// primary model (otherwise escalating to it would be a no-op).
+    pub fn has_deep_model(&self) -> bool {
+        let deep = self.deep_model.trim();
+        !deep.is_empty() && deep != self.model.trim()
     }
 
     pub fn chat_options(&self) -> ChatOptions {
@@ -2480,6 +2495,7 @@ mod tests {
             model: "gpt-5".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: String::new(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2496,6 +2512,7 @@ mod tests {
             model: "gemma".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: String::new(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2511,6 +2528,30 @@ mod tests {
         config.tool_model = "deepseek".to_string();
         assert!(config.has_tool_model());
         assert_eq!(config.tool_model(), "deepseek");
+    }
+
+    #[test]
+    fn has_deep_model_only_when_set_and_distinct() {
+        let mut config = LlmRouterConfig {
+            model: "sonnet".to_string(),
+            aux_model: String::new(),
+            tool_model: String::new(),
+            deep_model: String::new(),
+            provider: String::new(),
+            api_base: String::new(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 500,
+        };
+        // Unset -> no escalation.
+        assert!(!config.has_deep_model());
+        assert_eq!(config.deep_model(), "");
+        // Same as primary -> escalating would be a no-op, so report none.
+        config.deep_model = "sonnet".to_string();
+        assert!(!config.has_deep_model());
+        // Distinct -> escalate.
+        config.deep_model = "  opus  ".to_string();
+        assert!(config.has_deep_model());
+        assert_eq!(config.deep_model(), "opus");
     }
 
     #[test]
@@ -2663,6 +2704,7 @@ mod tests {
             model: "openrouter/moonshotai/kimi-k2.6".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: String::new(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2683,6 +2725,7 @@ mod tests {
             model: "moonshotai/kimi-k2.6".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: "openrouter".to_string(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2702,6 +2745,7 @@ mod tests {
             model: "openai/gemma-4-31B-it-Q8_0.gguf".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: "openai".to_string(),
             api_base: "http://localhost:8090/v1".to_string(),
             max_output_tokens: 100,
@@ -2722,6 +2766,7 @@ mod tests {
             model: "anthropic/claude-sonnet-4-6".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: String::new(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2742,6 +2787,7 @@ mod tests {
             model: "gpt-5.2".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: "openai".to_string(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2761,6 +2807,7 @@ mod tests {
             model: "openrouter/openai/gpt-5.2".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: "openai".to_string(),
             api_base: String::new(),
             max_output_tokens: 100,
@@ -2773,6 +2820,7 @@ mod tests {
             model: "gpt-5.2".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: "openai".to_string(),
             api_base: "http://localhost:8080/v1/".to_string(),
             max_output_tokens: 100,
@@ -2787,6 +2835,7 @@ mod tests {
             model: "claude-opus-4-6".to_string(),
             aux_model: String::new(),
             tool_model: String::new(),
+            deep_model: String::new(),
             provider: "anthropic".to_string(),
             api_base: String::new(),
             max_output_tokens: 100,
