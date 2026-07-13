@@ -861,6 +861,7 @@ async fn model_get(State(state): State<ApiState>, headers: HeaderMap) -> Respons
     Json(json!({
         "model": config.model,
         "model_aux": config.aux_model,
+        "model_deep": config.deep_model,
         "provider": model_provider(&config.model, &state.settings.llm.llm_provider),
         "current_auth": "API",
         "available_providers": available_provider_ids(),
@@ -873,6 +874,8 @@ async fn model_get(State(state): State<ApiState>, headers: HeaderMap) -> Respons
 struct ModelUpdateRequest {
     model: Option<String>,
     model_aux: Option<String>,
+    /// Powerful deep-thinking model. An explicit empty string clears it.
+    model_deep: Option<String>,
 }
 
 async fn model_post(
@@ -894,10 +897,20 @@ async fn model_post(
         .model_aux
         .as_deref()
         .map(|id| normalize_model_id(provider, id));
-    let changed = match state
-        .agent
-        .reconfigure_models(model.as_deref(), model_aux.as_deref())
-    {
+    // Preserve an explicit empty string (clear the deep slot) — only normalize
+    // a non-empty id against the configured provider.
+    let model_deep = body.model_deep.as_deref().map(|id| {
+        if id.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_model_id(provider, id)
+        }
+    });
+    let changed = match state.agent.reconfigure_models(
+        model.as_deref(),
+        model_aux.as_deref(),
+        model_deep.as_deref(),
+    ) {
         Ok(changed) => changed,
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
@@ -909,6 +922,7 @@ async fn model_post(
         "status": "updated",
         "model": config.model,
         "model_aux": config.aux_model,
+        "model_deep": config.deep_model,
         "provider": model_provider(&config.model, &state.settings.llm.llm_provider),
         "changed": changed,
     }))

@@ -68,6 +68,7 @@ pub(super) fn intent_model_name(model: ModelTier) -> &'static str {
     match model {
         ModelTier::Main => "main",
         ModelTier::Aux => "aux",
+        ModelTier::Deep => "deep",
     }
 }
 
@@ -75,6 +76,7 @@ pub(super) fn parse_model_tier(value: &str) -> Option<ModelTier> {
     match value.trim().to_ascii_lowercase().as_str() {
         "main" => Some(ModelTier::Main),
         "aux" | "" => Some(ModelTier::Aux),
+        "deep" => Some(ModelTier::Deep),
         _ => None,
     }
 }

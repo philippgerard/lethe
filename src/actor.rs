@@ -32,6 +32,9 @@ mod tests;
 pub enum ModelTier {
     Main,
     Aux,
+    /// Powerful deep-thinking model (LLM_MODEL_DEEP). A subagent on this tier
+    /// starts already escalated so its whole turn runs on the strong model.
+    Deep,
 }
 
 pub type ActorTurnFuture = Pin<Box<dyn Future<Output = ActorResult<String>> + Send + 'static>>;

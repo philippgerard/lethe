@@ -24,6 +24,12 @@ fn exec_request_tool(_registry: &ToolRegistry<'_>, _args: &Value) -> String {
     "Error: request_tool must be intercepted by the tool loop.".to_string()
 }
 
+fn exec_think_deeply(_registry: &ToolRegistry<'_>, _args: &Value) -> String {
+    // Handled inline by the agent tool loop (sets the escalation latch) before
+    // dispatch is reached. This fallback only runs if no deep model is wired.
+    "Noted — reason carefully through the hard part and answer.".to_string()
+}
+
 fn exec_memory_read(registry: &ToolRegistry<'_>, args: &Value) -> String {
     match registry.memory.blocks.get(&string_arg(args, "label")) {
         Ok(Some(block)) => {
@@ -313,6 +319,22 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         params: &[p_str_req("name", "Tool name.")],
         category: ToolCategory::Initial,
         execute: ToolExecutor::Sync(exec_request_tool),
+    },
+    ToolDef {
+        name: "think_deeply",
+        description: "Escalate this turn to a more powerful reasoning model. Call this \
+                      BEFORE answering when the task genuinely needs it: hard multi-step \
+                      reasoning, subtle trade-offs, architecture or planning, high-stakes \
+                      or irreversible decisions, tricky debugging, or when you've tried and \
+                      feel stuck. The stronger model then handles the rest of this turn. \
+                      Don't call it for routine chat, lookups, or simple tasks — it is \
+                      slower and costlier, so reserve it for problems that deserve it.",
+        params: &[p_str_req(
+            "reason",
+            "One line on why this task needs deeper thinking.",
+        )],
+        category: ToolCategory::Initial,
+        execute: ToolExecutor::Sync(exec_think_deeply),
     },
     ToolDef {
         name: "memory_read",

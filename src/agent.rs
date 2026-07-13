@@ -294,6 +294,7 @@ impl Agent {
         &self,
         model: Option<&str>,
         aux_model: Option<&str>,
+        deep_model: Option<&str>,
     ) -> AgentResult<serde_json::Value> {
         let mut router = self
             .router
@@ -319,6 +320,17 @@ impl Agent {
                 json!({"old": config.aux_model.clone(), "new": aux_model}),
             );
             config.aux_model = aux_model.to_string();
+        }
+        // Deep model accepts an explicit empty string as "clear it", so unlike
+        // model/aux we don't filter empties out — only skip a no-op change.
+        if let Some(deep_model) = deep_model.map(str::trim)
+            && deep_model != config.deep_model
+        {
+            changed.insert(
+                "model_deep".to_string(),
+                json!({"old": config.deep_model.clone(), "new": deep_model}),
+            );
+            config.deep_model = deep_model.to_string();
         }
 
         if !changed.is_empty() {
@@ -2270,14 +2282,23 @@ mod tests {
         let agent = Agent::from_settings(settings(tmp.path())).unwrap();
 
         let changed = agent
-            .reconfigure_models(Some("main-next"), Some("aux-next"))
+            .reconfigure_models(Some("main-next"), Some("aux-next"), Some("deep-next"))
             .unwrap();
         let config = agent.router_config().unwrap();
 
         assert_eq!(config.model, "main-next");
         assert_eq!(config.aux_model, "aux-next");
+        assert_eq!(config.deep_model, "deep-next");
         assert_eq!(changed["model"]["old"], "test-model");
         assert_eq!(changed["model_aux"]["new"], "aux-next");
+        assert_eq!(changed["model_deep"]["new"], "deep-next");
+
+        // An explicit empty string clears the deep slot; a `None` leaves it.
+        let cleared = agent
+            .reconfigure_models(None, None, Some(""))
+            .unwrap();
+        assert_eq!(cleared["model_deep"]["new"], "");
+        assert_eq!(agent.router_config().unwrap().deep_model, "");
     }
 
     #[test]

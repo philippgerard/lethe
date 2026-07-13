@@ -56,6 +56,12 @@ pub struct LlmConfig {
     /// turn starts on the primary model again. Empty = no switching (the whole
     /// turn stays on the primary/aux model, as before).
     pub llm_model_tool: String,
+    /// Optional powerful "deep thinking" model for hard tasks. A turn starts on
+    /// the primary model and escalates to this one for the rest of the turn when
+    /// the model calls `think_deeply`, when it visibly struggles (repeated tool
+    /// errors / no progress), or when a subagent is spawned on the `deep` tier.
+    /// Resets to the primary model on the next turn. Empty = no escalation.
+    pub llm_model_deep: String,
     pub llm_provider: String,
     pub llm_api_base: String,
     pub llm_context_limit: usize,
@@ -116,6 +122,12 @@ impl LlmConfig {
     /// configured (in which case the agent loop never switches models mid-turn).
     pub fn effective_tool_model(&self) -> &str {
         self.llm_model_tool.trim()
+    }
+
+    /// The powerful deep-thinking model id, trimmed, or empty when none is
+    /// configured (in which case the agent loop never escalates mid-turn).
+    pub fn effective_deep_model(&self) -> &str {
+        self.llm_model_deep.trim()
     }
 
     /// Effective context window in tokens for the given model id, falling
@@ -239,6 +251,7 @@ impl Settings {
                 llm_model: env_string("LLM_MODEL", ""),
                 llm_model_aux: env_string("LLM_MODEL_AUX", ""),
                 llm_model_tool: env_string("LLM_MODEL_TOOL", ""),
+                llm_model_deep: env_string("LLM_MODEL_DEEP", ""),
                 llm_provider: env_string("LLM_PROVIDER", ""),
                 llm_api_base: env_string("LLM_API_BASE", ""),
                 llm_context_limit: env_usize("LLM_CONTEXT_LIMIT", 100_000),
@@ -270,6 +283,10 @@ impl Settings {
 
     pub fn effective_tool_model(&self) -> &str {
         self.llm.effective_tool_model()
+    }
+
+    pub fn effective_deep_model(&self) -> &str {
+        self.llm.effective_deep_model()
     }
 }
 
@@ -368,6 +385,7 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
             llm_model: "test-model".to_string(),
             llm_model_aux: String::new(),
             llm_model_tool: String::new(),
+            llm_model_deep: String::new(),
             llm_provider: String::new(),
             llm_api_base: String::new(),
             llm_context_limit: 100_000,
