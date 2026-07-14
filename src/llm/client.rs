@@ -39,6 +39,9 @@ const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/";
 const OPENCODE_GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/";
 pub(crate) const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+/// Keep ordinary burst throttles retryable without letting subscription-window
+/// limits pin a turn (and the shared request gate) for minutes or hours.
+const MAX_ANTHROPIC_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_CODE_VERSION: &str = "2.1.117";
 const CLAUDE_CODE_SALT: &str = "59cf53e54c78";
@@ -699,6 +702,9 @@ impl AnthropicOAuthClient {
                 Ok(response) => return Ok(response),
                 Err(error @ AnthropicOAuthError::RateLimited { retry_after, .. }) => {
                     last_error = Some(error);
+                    if !anthropic_rate_limit_is_retryable(retry_after) {
+                        break;
+                    }
                     tokio::time::sleep(retry_after).await;
                 }
                 Err(error @ AnthropicOAuthError::Transient { retry_after, .. }) => {
@@ -1048,12 +1054,19 @@ impl AnthropicOAuthClient {
             let until = self.rate_limit_until.lock().await;
             until.and_then(|instant| instant.checked_duration_since(Instant::now()))
         };
-        if let Some(wait) = wait {
+        if let Some(wait) = wait.filter(|wait| anthropic_rate_limit_is_retryable(*wait)) {
             tokio::time::sleep(wait).await;
         }
     }
 
     async fn set_rate_limit(&self, wait: Duration) {
+        if !anthropic_rate_limit_is_retryable(wait) {
+            tracing::warn!(
+                retry_after_seconds = wait.as_secs_f64(),
+                "Anthropic rate-limit window exceeds automatic retry cap; failing fast"
+            );
+            return;
+        }
         let mut until = self.rate_limit_until.lock().await;
         *until = Some(Instant::now() + wait);
     }
@@ -1478,6 +1491,10 @@ fn retry_after_from_headers(headers: &HeaderMap) -> Duration {
         .and_then(|value| value.parse::<f64>().ok())
         .map(Duration::from_secs_f64)
         .unwrap_or_else(|| Duration::from_secs(30))
+}
+
+fn anthropic_rate_limit_is_retryable(retry_after: Duration) -> bool {
+    retry_after <= MAX_ANTHROPIC_RATE_LIMIT_WAIT
 }
 
 fn truncate_error(text: &str) -> String {
@@ -2582,6 +2599,41 @@ mod tests {
         assert_eq!(genai_retry_backoff(0), Duration::from_secs(1));
         assert_eq!(genai_retry_backoff(1), Duration::from_secs(2));
         assert!(genai_retry_backoff(10) <= Duration::from_secs(4));
+    }
+
+    #[test]
+    fn anthropic_rate_limit_retries_only_short_windows() {
+        assert!(anthropic_rate_limit_is_retryable(Duration::from_secs(1)));
+        assert!(anthropic_rate_limit_is_retryable(
+            MAX_ANTHROPIC_RATE_LIMIT_WAIT
+        ));
+        assert!(!anthropic_rate_limit_is_retryable(Duration::from_secs(
+            60 * 60
+        )));
+    }
+
+    #[test]
+    fn anthropic_retry_after_header_preserves_long_window_for_fail_fast_decision() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "3600".parse().unwrap());
+        let retry_after = retry_after_from_headers(&headers);
+        assert_eq!(retry_after, Duration::from_secs(3600));
+        assert!(!anthropic_rate_limit_is_retryable(retry_after));
+    }
+
+    #[tokio::test]
+    async fn anthropic_long_rate_limit_does_not_arm_shared_gate() {
+        let client = AnthropicOAuthClient {
+            http: reqwest::Client::new(),
+            token_file: PathBuf::new(),
+            tokens: Arc::new(Mutex::new(AnthropicOAuthTokens::default())),
+            request_gate: Arc::new(Semaphore::new(1)),
+            rate_limit_until: Arc::new(Mutex::new(None)),
+        };
+
+        client.set_rate_limit(Duration::from_secs(3600)).await;
+
+        assert!(client.rate_limit_until.lock().await.is_none());
     }
 
     #[test]

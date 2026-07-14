@@ -20,6 +20,32 @@ pub use formatting::{
     image_mime_type_from_path, is_emoji_only_reply, split_telegram_messages, telegram_parse_mode,
 };
 
+pub const OUT_OF_CREDITS_MESSAGE: &str =
+    "You're out of credits. Top up to keep chatting with Lethe.";
+pub const USAGE_LIMIT_MESSAGE: &str =
+    "The AI provider's usage limit has been reached. Please try again after it resets.";
+
+/// Map billing and provider usage-limit failures to a reply suitable for every
+/// Telegram turn path (queued conversations, direct turns, `/wake`, and actor
+/// updates). Formatting the full anyhow chain preserves status details added by
+/// lower layers.
+pub fn llm_limit_reply(error: &anyhow::Error) -> Option<&'static str> {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    if text.contains("out of credits") || text.contains("402 payment required") {
+        return Some(OUT_OF_CREDITS_MESSAGE);
+    }
+    if text.contains("429")
+        || text.contains("too many requests")
+        || text.contains("rate limited")
+        || text.contains("rate-limited")
+        || text.contains("rate_limit")
+        || text.contains("usage limit")
+    {
+        return Some(USAGE_LIMIT_MESSAGE);
+    }
+    None
+}
+
 #[derive(Debug, Error)]
 pub enum TelegramError {
     #[error("telegram bot token is required")]
@@ -2189,6 +2215,22 @@ mod tests {
         let client = TelegramClient::new("token", vec![7]).unwrap();
         assert!(client.user_allowed(7));
         assert!(!client.user_allowed(8));
+    }
+
+    #[test]
+    fn maps_credit_and_usage_limit_errors_to_telegram_replies() {
+        let credits = anyhow::anyhow!("LLM request failed")
+            .context("Status: 402 Payment Required Body: Out of credits");
+        assert_eq!(llm_limit_reply(&credits), Some(OUT_OF_CREDITS_MESSAGE));
+
+        let usage_limit = anyhow::anyhow!(
+            "Anthropic OAuth rate limited (429) - usage limit reached; retry after 3600s"
+        );
+        assert_eq!(llm_limit_reply(&usage_limit), Some(USAGE_LIMIT_MESSAGE));
+        assert_eq!(
+            llm_limit_reply(&anyhow::anyhow!("connection reset by peer")),
+            None
+        );
     }
 
     #[test]
