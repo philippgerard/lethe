@@ -53,6 +53,9 @@ const DEFAULT_INSTRUCTIONS: &str = "You are Lethe, a helpful and precise assista
 const DEVICE_AUTH_TIMEOUT_SECS: u64 = 900;
 const DEVICE_POLL_SAFETY_MARGIN_SECS: u64 = 3;
 const JWT_ACCOUNT_PATH: &str = "https://api.openai.com/auth";
+/// Retry ordinary burst throttles, but never let a subscription usage-window
+/// reset pin the current turn and the shared request gate for minutes or hours.
+const MAX_OPENAI_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 
 // --- Client ------------------------------------------------------------------
 
@@ -140,6 +143,9 @@ impl OpenAiOAuthClient {
                 Ok(response) => return Ok(response),
                 Err(error @ OpenAiOAuthError::RateLimited { retry_after, .. }) => {
                     last_error = Some(error);
+                    if !openai_rate_limit_is_retryable(retry_after) {
+                        break;
+                    }
                     tokio::time::sleep(retry_after).await;
                 }
                 Err(error @ OpenAiOAuthError::Transient { retry_after, .. }) => {
@@ -491,12 +497,19 @@ impl OpenAiOAuthClient {
             let until = self.rate_limit_until.lock().await;
             until.and_then(|instant| instant.checked_duration_since(Instant::now()))
         };
-        if let Some(wait) = wait {
+        if let Some(wait) = wait.filter(|wait| openai_rate_limit_is_retryable(*wait)) {
             tokio::time::sleep(wait).await;
         }
     }
 
     async fn set_rate_limit(&self, wait: Duration) {
+        if !openai_rate_limit_is_retryable(wait) {
+            tracing::warn!(
+                retry_after_seconds = wait.as_secs_f64(),
+                "OpenAI rate-limit window exceeds automatic retry cap; failing fast"
+            );
+            return;
+        }
         let mut until = self.rate_limit_until.lock().await;
         *until = Some(Instant::now() + wait);
     }
@@ -1599,6 +1612,10 @@ fn retry_after_from_headers(headers: &HeaderMap) -> Duration {
         .unwrap_or_else(|| Duration::from_secs(30))
 }
 
+fn openai_rate_limit_is_retryable(retry_after: Duration) -> bool {
+    retry_after <= MAX_OPENAI_RATE_LIMIT_WAIT
+}
+
 fn short_uuid() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
 }
@@ -1833,6 +1850,39 @@ mod tests {
 
     // Env-rewriter tests live in `oauth_env::tests` — that's the shared
     // helper both login flows go through.
+
+    #[test]
+    fn openai_rate_limit_retries_only_short_windows() {
+        assert!(openai_rate_limit_is_retryable(Duration::from_secs(1)));
+        assert!(openai_rate_limit_is_retryable(MAX_OPENAI_RATE_LIMIT_WAIT));
+        assert!(!openai_rate_limit_is_retryable(Duration::from_secs(
+            60 * 60
+        )));
+    }
+
+    #[test]
+    fn openai_retry_after_header_preserves_long_window_for_fail_fast_decision() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "3600".parse().unwrap());
+        let retry_after = retry_after_from_headers(&headers);
+        assert_eq!(retry_after, Duration::from_secs(3600));
+        assert!(!openai_rate_limit_is_retryable(retry_after));
+    }
+
+    #[tokio::test]
+    async fn openai_long_rate_limit_does_not_arm_shared_gate() {
+        let client = OpenAiOAuthClient {
+            http: reqwest::Client::new(),
+            token_file: PathBuf::new(),
+            tokens: Arc::new(Mutex::new(OpenAiOAuthTokens::default())),
+            request_gate: Arc::new(Semaphore::new(1)),
+            rate_limit_until: Arc::new(Mutex::new(None)),
+        };
+
+        client.set_rate_limit(Duration::from_secs(3600)).await;
+
+        assert!(client.rate_limit_until.lock().await.is_none());
+    }
 
     #[test]
     fn token_file_round_trips_through_disk() {

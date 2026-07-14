@@ -26,7 +26,7 @@ use lethe::interfaces::telegram::{
     FirstUserLockCallback, IncomingTelegramCallback, IncomingTelegramText, SharedTelegramTurnGuard,
     TelegramClient, TelegramToolContext, TelegramTurnGuard, TelegramTypingObserver,
     VisibleTelegramChannel, forget_pending_reply_keyboard_match, image_mime_type_from_path,
-    is_emoji_only_reply, pending_reply_keyboard_matches, split_telegram_messages,
+    is_emoji_only_reply, llm_limit_reply, pending_reply_keyboard_matches, split_telegram_messages,
 };
 use lethe::memory::MessageRole;
 use lethe::memory::message_metadata::{
@@ -504,14 +504,16 @@ fn metadata_map_from_value(
     }
 }
 
-const OUT_OF_CREDITS_MESSAGE: &str = "You're out of credits. Top up to keep chatting with Lethe.";
-
-/// True when an LLM turn failed because the user is out of credits — the hosted
-/// metering proxy rejects the call with HTTP 402 and this message. Lets the
-/// Telegram path surface a clear note instead of failing silently.
-fn error_is_out_of_credits(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}");
-    text.contains("Out of credits") || text.contains("402 Payment Required")
+async fn send_llm_limit_reply(
+    client: &TelegramClient,
+    chat_id: i64,
+    error: &anyhow::Error,
+) -> Result<Option<&'static str>> {
+    let Some(message) = llm_limit_reply(error) else {
+        return Ok(None);
+    };
+    client.send_message(chat_id, message).await?;
+    Ok(Some(message))
 }
 
 fn telegram_process_callback(
@@ -577,17 +579,14 @@ fn telegram_process_callback(
                     Ok(response) => response,
                     Err(error) => {
                         let error = anyhow::Error::new(error);
-                        // Don't fail silently when the user is out of credits — the
-                        // hosted metering proxy rejects the LLM call with 402; reply.
-                        if error_is_out_of_credits(&error) {
-                            let _ = client
-                                .send_message(context.chat_id, OUT_OF_CREDITS_MESSAGE)
-                                .await;
+                        if let Some(message) =
+                            send_llm_limit_reply(&client, context.chat_id, &error).await?
+                        {
                             agent.emit_conversation_event(
                                 "message",
                                 serde_json::json!({
                                     "role": "assistant",
-                                    "content": OUT_OF_CREDITS_MESSAGE,
+                                    "content": message,
                                     "source": "telegram",
                                 }),
                             );
@@ -766,7 +765,19 @@ async fn handle_telegram_turn(
     if let Some(metadata) = metadata {
         req = req.with_metadata(metadata);
     }
-    let response = with_telegram_typing(client, chat_id, agent.chat_once(req)).await?;
+    let response = match with_telegram_typing(client, chat_id, agent.chat_once(req)).await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            if send_llm_limit_reply(client, chat_id, &error)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     tracing::info!(
         chat_id,
         response_chars = response.chars().count(),
@@ -897,7 +908,19 @@ async fn process_telegram_actor_updates(
             MessageKind::ActorUpdate,
             "actor_update",
         ));
-    let response = with_telegram_typing(client, chat_id, agent.chat_once(req)).await?;
+    let response = match with_telegram_typing(client, chat_id, agent.chat_once(req)).await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            if send_llm_limit_reply(client, chat_id, &error)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     // Match Python heartbeat: the synthetic prompt explicitly instructs the
     // model to reply with literal "ok" when there's nothing to surface.
     // Anything else is forwarded. This is a sentinel contract, not pattern
@@ -1475,13 +1498,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_out_of_credits_errors() {
+    fn detects_llm_limit_errors() {
         let err = anyhow::anyhow!("LLM streaming chat request failed")
             .context("Status: 402 Payment Required Body: {\"message\":\"Out of credits\"}");
-        assert!(error_is_out_of_credits(&err));
-        assert!(!error_is_out_of_credits(&anyhow::anyhow!(
-            "connection reset by peer"
-        )));
+        assert_eq!(
+            llm_limit_reply(&err),
+            Some(lethe::interfaces::telegram::OUT_OF_CREDITS_MESSAGE)
+        );
+        assert_eq!(
+            llm_limit_reply(&anyhow::anyhow!("429 Too Many Requests")),
+            Some(lethe::interfaces::telegram::USAGE_LIMIT_MESSAGE)
+        );
     }
 
     #[tokio::test]

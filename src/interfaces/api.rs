@@ -21,7 +21,7 @@ use crate::actor::ActorEvent;
 use crate::agent::{Agent, TurnRequest};
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
-use crate::interfaces::telegram::TelegramToolContext;
+use crate::interfaces::telegram::{TelegramClient, TelegramToolContext, llm_limit_reply};
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
 use crate::scheduler::brainstem::{BrainstemEmission, BrainstemHandle};
@@ -1166,6 +1166,15 @@ async fn wake(
     // Bind the turn to the real Telegram egress. message_egress() prefers
     // runtime.telegram over the SSE client egress, so telegram_send_message
     // reaches Telegram instead of a discarded response stream.
+    let telegram_client = match TelegramClient::new(token.clone(), vec![chat_id]) {
+        Ok(client) => client,
+        Err(error) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("Telegram client setup failed: {error}"),
+            );
+        }
+    };
     let runtime = ToolRuntime {
         telegram: Some(TelegramToolContext {
             token,
@@ -1188,10 +1197,22 @@ async fn wake(
             "reply_chars": reply.chars().count(),
         }))
         .into_response(),
-        Err(error) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("turn failed: {error}"),
-        ),
+        Err(error) => {
+            let error = anyhow::Error::new(error);
+            if let Some(message) = llm_limit_reply(&error) {
+                return match telegram_client.send_message(chat_id, message).await {
+                    Ok(_) => json_error(StatusCode::TOO_MANY_REQUESTS, message),
+                    Err(send_error) => json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("turn failed and limit reply could not be sent: {send_error}"),
+                    ),
+                };
+            }
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("turn failed: {error}"),
+            )
+        }
     }
 }
 
