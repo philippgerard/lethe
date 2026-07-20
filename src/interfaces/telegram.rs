@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -56,9 +57,17 @@ pub enum TelegramError {
     Http(#[from] reqwest::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Unexpected(String),
 }
 
 pub type TelegramResult<T> = Result<T, TelegramError>;
+
+impl TelegramError {
+    fn from_reqwest(error: reqwest::Error) -> Self {
+        Self::Http(error.without_url())
+    }
+}
 
 /// Number of recently-sent outgoing messages we remember per process so that we
 /// can recognise reactions placed on Lethe's *own* messages.
@@ -122,9 +131,11 @@ pub struct TelegramClient {
     // Interior-mutable so the allowlist can be set at runtime — specifically the
     // "lock to the first user who messages" flow used by the hosted runtime.
     allowed_user_ids: Arc<Mutex<Vec<i64>>>,
+    allow_any_user: bool,
     lock_on_first: bool,
     on_lock: Option<FirstUserLockCallback>,
     http: reqwest::Client,
+    download_max_bytes: u64,
     sent_messages: SharedSentMessageLog,
 }
 
@@ -140,11 +151,25 @@ impl TelegramClient {
         Ok(Self {
             token,
             allowed_user_ids: Arc::new(Mutex::new(allowed_user_ids)),
+            allow_any_user: false,
             lock_on_first: false,
             on_lock: None,
             http: reqwest::Client::new(),
+            download_max_bytes: 50 * 1024 * 1024,
             sent_messages: Arc::new(Mutex::new(SentMessageLog::default())),
         })
+    }
+
+    /// Explicitly opt into the historical public-bot behavior. Without this,
+    /// an empty allowlist fails closed unless first-user-lock is active.
+    pub fn with_allow_any_user(mut self, allow_any_user: bool) -> Self {
+        self.allow_any_user = allow_any_user;
+        self
+    }
+
+    pub fn with_download_max_bytes(mut self, download_max_bytes: u64) -> Self {
+        self.download_max_bytes = download_max_bytes.max(1);
+        self
     }
 
     /// Enable "lock to the first user who messages" mode: when no allowlist is
@@ -171,7 +196,7 @@ impl TelegramClient {
                 }
                 return true;
             }
-            return true;
+            return self.allow_any_user;
         }
         allowed.contains(&user_id)
     }
@@ -212,10 +237,13 @@ impl TelegramClient {
         }
         let response = request
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<Vec<TelegramUpdate>>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         response.into_result()
     }
 
@@ -284,9 +312,11 @@ impl TelegramClient {
                 reply_markup,
             })
             .send()
-            .await?
+            .await
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<SentTelegramMessage>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         response.into_result().map(|message| message.message_id)
     }
 
@@ -296,10 +326,13 @@ impl TelegramClient {
             .post(self.method_url("sendChatAction"))
             .json(&SendChatActionRequest { chat_id, action })
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<bool>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         response.into_result()
     }
 
@@ -325,10 +358,13 @@ impl TelegramClient {
                 }],
             })
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<bool>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         match response.into_result() {
             Ok(value) => Ok(value),
             Err(TelegramError::Api(message)) if is_invalid_reaction_error(&message) => Ok(false),
@@ -351,10 +387,13 @@ impl TelegramClient {
                 show_alert,
             })
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<bool>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         response.into_result()
     }
 
@@ -381,10 +420,13 @@ impl TelegramClient {
                 reply_markup: None,
             })
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<serde_json::Value>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         response.into_result().map(|_| true)
     }
 
@@ -394,25 +436,56 @@ impl TelegramClient {
             .get(self.method_url("getFile"))
             .query(&[("file_id", file_id)])
             .send()
-            .await?
-            .error_for_status()?
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?
             .json::<TelegramResponse<TelegramFileInfo>>()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?;
         response.into_result()
     }
 
     pub async fn download_file(&self, file_path: &str) -> TelegramResult<Vec<u8>> {
-        let bytes = self
+        let response = self
             .http
             .get(format!(
                 "https://api.telegram.org/file/bot{}/{}",
                 self.token, file_path
             ))
             .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+            .await
+            .map_err(TelegramError::from_reqwest)?
+            .error_for_status()
+            .map_err(TelegramError::from_reqwest)?;
+        if let Some(length) = response.content_length()
+            && length > self.download_max_bytes
+        {
+            return Err(TelegramError::Unexpected(format!(
+                "Telegram file is too large ({} bytes; max {})",
+                length, self.download_max_bytes
+            )));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(TelegramError::from_reqwest)?;
+            let next_size = bytes.len() as u64 + chunk.len() as u64;
+            if next_size > self.download_max_bytes {
+                return Err(TelegramError::Unexpected(format!(
+                    "Telegram file is too large ({} bytes; max {})",
+                    next_size, self.download_max_bytes
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() as u64 > self.download_max_bytes {
+            return Err(TelegramError::Unexpected(format!(
+                "Telegram file is too large ({} bytes; max {})",
+                bytes.len(),
+                self.download_max_bytes
+            )));
+        }
         Ok(bytes.to_vec())
     }
 
@@ -2001,9 +2074,12 @@ pub fn send_message_blocking(
     let response = reqwest::blocking::Client::new()
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
         .json(&payload)
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<SentTelegramMessage>>()?;
+        .send()
+        .map_err(TelegramError::from_reqwest)?
+        .error_for_status()
+        .map_err(TelegramError::from_reqwest)?
+        .json::<TelegramResponse<SentTelegramMessage>>()
+        .map_err(TelegramError::from_reqwest)?;
     response.into_result().map(|message| message.message_id)
 }
 
@@ -2121,9 +2197,12 @@ fn send_file_url_blocking(
             plan.send_type.method()
         ))
         .json(&payload)
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<SentTelegramMessage>>()?;
+        .send()
+        .map_err(TelegramError::from_reqwest)?
+        .error_for_status()
+        .map_err(TelegramError::from_reqwest)?
+        .json::<TelegramResponse<SentTelegramMessage>>()
+        .map_err(TelegramError::from_reqwest)?;
     response.into_result().map(|message| message.message_id)
 }
 
@@ -2151,9 +2230,12 @@ fn send_file_path_blocking(
             plan.send_type.method()
         ))
         .multipart(form)
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<SentTelegramMessage>>()?;
+        .send()
+        .map_err(TelegramError::from_reqwest)?
+        .error_for_status()
+        .map_err(TelegramError::from_reqwest)?
+        .json::<TelegramResponse<SentTelegramMessage>>()
+        .map_err(TelegramError::from_reqwest)?;
     response.into_result().map(|message| message.message_id)
 }
 
@@ -2179,9 +2261,12 @@ pub fn set_message_reaction_blocking(
                 emoji,
             }],
         })
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<bool>>()?;
+        .send()
+        .map_err(TelegramError::from_reqwest)?
+        .error_for_status()
+        .map_err(TelegramError::from_reqwest)?
+        .json::<TelegramResponse<bool>>()
+        .map_err(TelegramError::from_reqwest)?;
     match response.into_result() {
         Ok(value) => Ok(value),
         Err(TelegramError::Api(message)) if is_invalid_reaction_error(&message) => Ok(false),
@@ -2234,10 +2319,36 @@ mod tests {
     }
 
     #[test]
-    fn empty_allowlist_without_lock_allows_anyone() {
+    fn empty_allowlist_without_lock_rejects_everyone() {
         let client = TelegramClient::new("token", Vec::new()).unwrap();
+        assert!(!client.user_allowed(1));
+        assert!(!client.user_allowed(2));
+    }
+
+    #[test]
+    fn explicit_allow_any_user_preserves_public_bot_mode() {
+        let client = TelegramClient::new("token", Vec::new())
+            .unwrap()
+            .with_allow_any_user(true);
         assert!(client.user_allowed(1));
         assert!(client.user_allowed(2));
+    }
+
+    #[test]
+    fn reqwest_errors_are_sanitized_before_display() {
+        let token = "123456:SECRET-TOKEN";
+        let error = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get(format!("http://127.0.0.1:1/bot{token}/sendMessage"))
+            .send()
+            .unwrap_err();
+
+        let sanitized = TelegramError::from_reqwest(error).to_string();
+        assert!(!sanitized.contains(token));
+        assert!(!sanitized.contains("bot123456"));
+        assert!(!sanitized.contains("sendMessage"));
     }
 
     #[test]

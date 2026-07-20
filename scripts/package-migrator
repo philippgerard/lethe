@@ -35,7 +35,7 @@ trap cleanup EXIT
 cd "$ROOT_DIR"
 
 if [ ! -x "$BIN_PATH" ]; then
-    cargo build --release --manifest-path migrator/Cargo.toml
+    cargo build --release --locked --manifest-path migrator/Cargo.toml
 fi
 
 mkdir -p "$DIST_DIR" "$WORK_DIR/$PACKAGE_NAME"

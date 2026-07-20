@@ -34,7 +34,7 @@ trap cleanup EXIT
 cd "$ROOT_DIR"
 
 if [ ! -x "$BIN_PATH" ]; then
-    cargo build --release
+    cargo build --release --locked
 fi
 
 mkdir -p "$DIST_DIR" "$WORK_DIR/$PACKAGE_NAME"

@@ -17,7 +17,7 @@ COPY config/ config/
 COPY src/ src/
 COPY vendor/ vendor/
 
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:trixie-slim
 

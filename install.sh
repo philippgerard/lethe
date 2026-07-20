@@ -93,14 +93,20 @@ detect_release_target() {
 download_binary() {
     local name="$1"
     local target="$2"
-    local url tmp archive binary
+    local url checksum_url tmp archive binary
     url="$RELEASE_BASE_URL/${name}-${target}.tar.gz"
+    checksum_url="$url.sha256"
     tmp="$(mktemp -d)"
     archive="$tmp/${name}.tar.gz"
 
     info "Downloading $name: $url"
     if ! curl -fsSL "$url" -o "$archive"; then
         warn "Download failed: $url"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if ! verify_archive_sha256 "$archive" "$checksum_url" "$tmp/${name}.sha256"; then
         rm -rf "$tmp"
         return 1
     fi
@@ -123,6 +129,49 @@ download_binary() {
     chmod +x "$BIN_DIR/$name"
     rm -rf "$tmp"
     success "Installed $BIN_DIR/$name"
+    return 0
+}
+
+verify_archive_sha256() {
+    local archive="$1"
+    local checksum_url="$2"
+    local checksum_file="$3"
+    local expected actual
+
+    info "Downloading checksum: $checksum_url"
+    if ! curl -fsSL "$checksum_url" -o "$checksum_file"; then
+        warn "Checksum download failed: $checksum_url"
+        return 1
+    fi
+
+    expected="$(awk 'NF { print $1; exit }' "$checksum_file" | tr '[:upper:]' '[:lower:]')"
+    case "$expected" in
+        *[!0-9a-f]*|'')
+            warn "Checksum file did not contain a valid SHA256 digest: $checksum_url"
+            return 1
+            ;;
+    esac
+    if [ "${#expected}" -ne 64 ]; then
+        warn "Checksum file did not contain a SHA256 digest: $checksum_url"
+        return 1
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$archive" | awk '{ print $1 }')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$archive" | awk '{ print $1 }')"
+    else
+        warn "sha256sum or shasum is required to verify binary releases."
+        return 1
+    fi
+
+    actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+    if [ "$actual" != "$expected" ]; then
+        warn "Checksum mismatch for $archive"
+        return 1
+    fi
+
+    success "Verified SHA256 checksum"
     return 0
 }
 
@@ -176,7 +225,7 @@ build_from_source() {
     checkout_repo
 
     info "Building lethe with Cargo..."
-    cargo build --release --manifest-path "$INSTALL_DIR/Cargo.toml"
+    cargo build --release --locked --manifest-path "$INSTALL_DIR/Cargo.toml"
     mkdir -p "$BIN_DIR"
     cp "$INSTALL_DIR/target/release/lethe" "$BIN_DIR/lethe"
     chmod +x "$BIN_DIR/lethe"
@@ -186,7 +235,7 @@ build_from_source() {
     if [ "${LETHE_BUILD_MIGRATOR:-0}" = "1" ]; then
         ensure_protoc
         info "Building lethe-migrate with Cargo..."
-        cargo build --release --manifest-path "$INSTALL_DIR/migrator/Cargo.toml"
+        cargo build --release --locked --manifest-path "$INSTALL_DIR/migrator/Cargo.toml"
         cp "$INSTALL_DIR/migrator/target/release/lethe-migrate" "$BIN_DIR/lethe-migrate"
         chmod +x "$BIN_DIR/lethe-migrate"
         success "Installed $BIN_DIR/lethe-migrate"

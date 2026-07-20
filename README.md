@@ -219,6 +219,8 @@ Both `genai`'s native OpenAI adapter and our vendored fork now carry the patch �
 ## Configuration
 
 Configuration is read from process environment, a local `.env`, and `$LETHE_HOME/config/.env`.
+For supported secrets, `VAR` takes precedence over `VAR_FILE`; if `VAR` is empty or unset,
+Lethe reads the trimmed contents of the path in `VAR_FILE`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -230,10 +232,12 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `MEMORY_DIR` | Memory data directory | `$LETHE_HOME/data/memory` |
 | `DB_PATH` | SQLite todo database path | `$LETHE_HOME/data/lethe.db` |
 | `LOGS_DIR` | Runtime log directory | `$LETHE_HOME/logs` |
-| `TELEGRAM_BOT_TOKEN` | Bot token from BotFather | required for Telegram |
-| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated allowlist | all users |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_BOT_TOKEN_FILE` | Bot token from BotFather or a secret file | required for Telegram |
+| `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated allowlist | rejects everyone |
+| `TELEGRAM_ALLOW_ANY_USER` | Unsafe public-bot mode when no allowlist is set | `false` |
+| `TELEGRAM_DOWNLOAD_MAX_BYTES` | Maximum Telegram media download size | `52428800` |
 | `TELEGRAM_TRANSCRIPTION_ENABLED` | Transcribe Telegram audio/voice | `true` |
-| `LETHE_API_TOKEN` | Bearer or `x-lethe-token` auth for API mode | required for API |
+| `LETHE_API_TOKEN` / `LETHE_API_TOKEN_FILE` | Bearer or `x-lethe-token` auth for API mode | required for API |
 | `LETHE_API_HOST` | API bind address | `127.0.0.1` |
 | `LETHE_API_PORT` | API port | `1373` |
 | `LLM_PROVIDER` | Optional provider hint | auto |
@@ -243,15 +247,15 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `LLM_MODEL_DEEP` | Optional powerful "deep thinking" model the agent escalates to for hard tasks — via the `think_deeply` tool, an auto-escalate backstop when a turn struggles, or a `deep`-tier subagent; resets next turn. Outranks `LLM_MODEL_TOOL` | unset (no escalation) |
 | `LLM_API_BASE` | Custom OpenAI-compatible base URL | unset |
 | `LLM_CONTEXT_LIMIT` | Context size hint | `100000` |
-| `OPENROUTER_API_KEY` | OpenRouter key | unset |
-| `ANTHROPIC_API_KEY` | Anthropic key | unset |
+| `OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_FILE` | OpenRouter key or secret file | unset |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` | Anthropic key or secret file | unset |
 | `ANTHROPIC_AUTH_TOKEN` | Optional Anthropic OAuth access token (raw) | unset |
 | `LETHE_ANTHROPIC_OAUTH_TOKENS` | Optional Anthropic OAuth token file | `$CREDENTIALS_DIR/anthropic_oauth_tokens.json` |
-| `OPENAI_API_KEY` | OpenAI/local-compatible key | unset |
+| `OPENAI_API_KEY` / `OPENAI_API_KEY_FILE` | OpenAI/local-compatible key or secret file | unset |
 | `OPENAI_AUTH_TOKEN` | Optional OpenAI OAuth access token (raw) | unset |
 | `LETHE_OPENAI_OAUTH_TOKENS` | Optional OpenAI OAuth token file | `$CREDENTIALS_DIR/openai_oauth_tokens.json` |
-| `OPENCODE_GO_API_KEY` | OpenCode Go key | unset |
-| `MISTRAL_API_KEY` | Mistral key — Voxtral transcription only (not the chat LLM) | unset |
+| `OPENCODE_GO_API_KEY` / `OPENCODE_GO_API_KEY_FILE` | OpenCode Go key or secret file | unset |
+| `MISTRAL_API_KEY` / `MISTRAL_API_KEY_FILE` | Mistral key — Voxtral transcription only (not the chat LLM) | unset |
 | `EXA_API_KEY` | Exa search/fetch tools | unset |
 | `LETHE_SEMANTIC_SEARCH_ENABLED` | Enable vector recall (fallback is keyword search) | `true` |
 | `LETHE_EMBEDDING_PROVIDER` | `fastembed` or `hash` | `fastembed` |

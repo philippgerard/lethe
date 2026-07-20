@@ -599,7 +599,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 iteration,
                 tool = %tool_name,
                 call_id = %call_id,
-                args = %truncate_log_text(&args_string, 1200),
+                args_chars = args_string.chars().count(),
                 "tool call started"
             );
 
@@ -681,7 +681,6 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 tool = %tool_name,
                 call_id = %call_id,
                 result_chars = result.chars().count(),
-                result = %truncate_log_text(&result, 1200),
                 "tool call completed"
             );
             image_views.extend(views);
@@ -954,14 +953,6 @@ fn request_tool_for_turn(
     }
     active_tools.insert(name.to_string());
     format!("Tool '{name}' is now available. You can use it in the next tool call.")
-}
-
-fn truncate_log_text(value: &str, limit: usize) -> String {
-    let mut truncated = value.chars().take(limit).collect::<String>();
-    if value.chars().count() > limit {
-        truncated.push_str("...[truncated]");
-    }
-    truncated
 }
 
 fn assistant_tool_message(text: String, tool_calls: Vec<ToolCall>) -> ChatMessage {

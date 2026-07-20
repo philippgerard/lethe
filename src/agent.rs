@@ -2294,9 +2294,7 @@ mod tests {
         assert_eq!(changed["model_deep"]["new"], "deep-next");
 
         // An explicit empty string clears the deep slot; a `None` leaves it.
-        let cleared = agent
-            .reconfigure_models(None, None, Some(""))
-            .unwrap();
+        let cleared = agent.reconfigure_models(None, None, Some("")).unwrap();
         assert_eq!(cleared["model_deep"]["new"], "");
         assert_eq!(agent.router_config().unwrap().deep_model, "");
     }

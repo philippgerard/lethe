@@ -622,12 +622,14 @@ fn prompt_telegram(existing_env: &EnvMap) -> Result<Option<TelegramSetup>> {
         println!("  No token entered — skipping Telegram.");
         return Ok(None);
     }
-    let allowed = prompt_line("  Allowed Telegram user ids (comma-separated, blank for any): ")?
-        .trim()
-        .to_string();
+    let allowed =
+        prompt_line("  Allowed Telegram user ids (comma-separated, blank rejects everyone): ")?
+            .trim()
+            .to_string();
     if allowed.is_empty() {
-        warn("No allowed ids set — ANYONE who finds the bot can talk to your assistant.");
-        warn("Lock it down later via TELEGRAM_ALLOWED_USER_IDS (your numeric Telegram id).");
+        warn("No allowed ids set — Telegram will reject all users until configured.");
+        warn("Set TELEGRAM_ALLOWED_USER_IDS to your numeric Telegram id.");
+        warn("Unsafe public-bot mode requires TELEGRAM_ALLOW_ANY_USER=true.");
     }
     Ok(Some(TelegramSetup {
         bot_token: token,
@@ -677,12 +679,11 @@ fn write_config(
     }
     if let Some(tg) = telegram {
         updates.push(("TELEGRAM_BOT_TOKEN".into(), tg.bot_token.clone()));
-        if !tg.allowed_user_ids.trim().is_empty() {
-            updates.push((
-                "TELEGRAM_ALLOWED_USER_IDS".into(),
-                tg.allowed_user_ids.clone(),
-            ));
-        }
+        updates.push((
+            "TELEGRAM_ALLOWED_USER_IDS".into(),
+            tg.allowed_user_ids.clone(),
+        ));
+        updates.push(("TELEGRAM_ALLOW_ANY_USER".into(), "false".into()));
     }
     upsert_env(path, &updates)
 }
@@ -848,5 +849,38 @@ mod tests {
         assert_eq!(Provider::from_id("opencode-go"), Some(Provider::OpenCodeGo));
         assert_eq!(Provider::from_id("opencodego"), Some(Provider::OpenCodeGo));
         assert_eq!(Provider::from_id("nope"), None);
+    }
+
+    #[test]
+    fn telegram_setup_clears_stale_allow_any_and_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config/.env");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "TELEGRAM_ALLOWED_USER_IDS=111\nTELEGRAM_ALLOW_ANY_USER=true\n",
+        )
+        .unwrap();
+
+        write_config(
+            &path,
+            Provider::OpenRouter,
+            "openrouter/test",
+            "",
+            None,
+            None,
+            None,
+            Some(&TelegramSetup {
+                bot_token: "token".to_string(),
+                allowed_user_ids: String::new(),
+            }),
+        )
+        .unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("TELEGRAM_ALLOWED_USER_IDS=\n"));
+        assert!(body.contains("TELEGRAM_ALLOW_ANY_USER=false\n"));
+        assert!(!body.contains("TELEGRAM_ALLOWED_USER_IDS=111"));
+        assert!(!body.contains("TELEGRAM_ALLOW_ANY_USER=true"));
     }
 }

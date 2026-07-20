@@ -55,7 +55,7 @@ detect_release_target() {
 }
 
 install_release_binary() {
-    local target url tmp archive binary
+    local target url checksum_url tmp archive binary
 
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
         warn "curl and tar are required for binary update."
@@ -68,12 +68,18 @@ install_release_binary() {
     fi
 
     url="$RELEASE_BASE_URL/lethe-$target.tar.gz"
+    checksum_url="$url.sha256"
     tmp="$(mktemp -d)"
     archive="$tmp/lethe.tar.gz"
 
     info "Downloading binary release: $url"
     if ! curl -fsSL "$url" -o "$archive"; then
         warn "Binary release download failed."
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if ! verify_archive_sha256 "$archive" "$checksum_url" "$tmp/lethe.sha256"; then
         rm -rf "$tmp"
         return 1
     fi
@@ -96,6 +102,49 @@ install_release_binary() {
     chmod +x "$BIN_DIR/lethe"
     rm -rf "$tmp"
     success "Updated $BIN_DIR/lethe from binary release"
+}
+
+verify_archive_sha256() {
+    local archive="$1"
+    local checksum_url="$2"
+    local checksum_file="$3"
+    local expected actual
+
+    info "Downloading checksum: $checksum_url"
+    if ! curl -fsSL "$checksum_url" -o "$checksum_file"; then
+        warn "Checksum download failed."
+        return 1
+    fi
+
+    expected="$(awk 'NF { print $1; exit }' "$checksum_file" | tr '[:upper:]' '[:lower:]')"
+    case "$expected" in
+        *[!0-9a-f]*|'')
+            warn "Checksum file did not contain a valid SHA256 digest."
+            return 1
+            ;;
+    esac
+    if [ "${#expected}" -ne 64 ]; then
+        warn "Checksum file did not contain a SHA256 digest."
+        return 1
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$archive" | awk '{ print $1 }')"
+    elif command -v shasum >/dev/null 2>&1; then
+        actual="$(shasum -a 256 "$archive" | awk '{ print $1 }')"
+    else
+        warn "sha256sum or shasum is required to verify binary releases."
+        return 1
+    fi
+
+    actual="$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')"
+    if [ "$actual" != "$expected" ]; then
+        warn "Checksum mismatch for binary release archive."
+        return 1
+    fi
+
+    success "Verified SHA256 checksum"
+    return 0
 }
 
 if [ "${LETHE_UPDATE_FROM_SOURCE:-0}" != "1" ] && install_release_binary; then
@@ -121,7 +170,7 @@ info "Updating checkout: $INSTALL_DIR"
 git -C "$INSTALL_DIR" pull --ff-only
 
 info "Building release binary..."
-cargo build --release --manifest-path "$INSTALL_DIR/Cargo.toml"
+cargo build --release --locked --manifest-path "$INSTALL_DIR/Cargo.toml"
 
 mkdir -p "$BIN_DIR"
 cp "$INSTALL_DIR/target/release/lethe" "$BIN_DIR/lethe"

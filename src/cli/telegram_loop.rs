@@ -114,7 +114,9 @@ pub async fn telegram_command(command: TelegramCommand) -> Result<()> {
             let client = TelegramClient::new(
                 settings.telegram.bot_token.clone(),
                 settings.telegram.allowed_user_ids.clone(),
-            )?;
+            )?
+            .with_allow_any_user(settings.telegram.allow_any_user)
+            .with_download_max_bytes(settings.telegram.download_max_bytes);
             let agent = Agent::from_settings(settings.clone())?;
             let options = AgentOptions {
                 use_hippocampus: !no_recall,
@@ -187,7 +189,9 @@ pub async fn run_telegram_with_agent(
     let mut client = TelegramClient::new(
         settings.telegram.bot_token.clone(),
         settings.telegram.allowed_user_ids.clone(),
-    )?;
+    )?
+    .with_allow_any_user(settings.telegram.allow_any_user)
+    .with_download_max_bytes(settings.telegram.download_max_bytes);
     if let Some(on_lock) = lock_on_first {
         client = client.with_first_user_lock(on_lock);
     }

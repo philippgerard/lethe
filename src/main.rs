@@ -1040,7 +1040,6 @@ fn status(settings: &Settings) -> Result<()> {
     }
 
     let llm = &settings.llm;
-    let anthropic_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
     let anthropic_token = std::env::var("ANTHROPIC_AUTH_TOKEN").unwrap_or_default();
 
     lines.push(format!("  config:    {}", config_file.display()));
@@ -1064,7 +1063,7 @@ fn status(settings: &Settings) -> Result<()> {
     lines.push("  keys:".to_string());
     for (label, value) in [
         ("OPENROUTER_API_KEY", llm.openrouter_api_key.as_str()),
-        ("ANTHROPIC_API_KEY", anthropic_key.as_str()),
+        ("ANTHROPIC_API_KEY", llm.anthropic_api_key.as_str()),
         ("ANTHROPIC_AUTH_TOKEN", anthropic_token.as_str()),
         ("OPENAI_API_KEY", llm.openai_api_key.as_str()),
         ("OPENCODE_GO_API_KEY", llm.opencode_go_api_key.as_str()),
