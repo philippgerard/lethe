@@ -104,17 +104,19 @@ fn telegram(settings: &Settings, enable: bool, disable: bool) -> Result<()> {
     if token.is_empty() {
         bail!("a bot token is required");
     }
-    let allowed = prompt_line("  Allowed Telegram user ids (comma-separated, blank for any): ")?
-        .trim()
-        .to_string();
-    let mut updates = vec![
+    let allowed =
+        prompt_line("  Allowed Telegram user ids (comma-separated, blank rejects everyone): ")?
+            .trim()
+            .to_string();
+    let updates = vec![
         ("TELEGRAM_BOT_TOKEN".into(), token),
         ("TELEGRAM_ENABLED".into(), "true".into()),
+        ("TELEGRAM_ALLOWED_USER_IDS".into(), allowed.clone()),
+        ("TELEGRAM_ALLOW_ANY_USER".into(), "false".into()),
     ];
     if allowed.is_empty() {
-        println!("  ! No allowed ids — ANYONE who finds the bot can talk to your assistant.");
-    } else {
-        updates.push(("TELEGRAM_ALLOWED_USER_IDS".into(), allowed));
+        println!("  ! No allowed ids — Telegram will reject everyone until configured.");
+        println!("    Unsafe public-bot mode requires TELEGRAM_ALLOW_ANY_USER=true.");
     }
     upsert_env(path, &updates)?;
     println!("Telegram configured + enabled. Start it with `lethe run`.");

@@ -1089,10 +1089,21 @@ fn require_auth(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
             "server misconfigured",
         ));
     }
-    if presented != expected {
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
         return Some(json_error(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     None
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    for index in 0..max_len {
+        let left = a.get(index).copied().unwrap_or(0);
+        let right = b.get(index).copied().unwrap_or(0);
+        diff |= (left ^ right) as usize;
+    }
+    diff == 0
 }
 
 fn presented_api_token(headers: &HeaderMap) -> String {
@@ -1152,10 +1163,11 @@ async fn wake(
             "Telegram bot token is not configured",
         );
     }
-    let chat_id = body
-        .chat_id
-        .or_else(|| state.settings.telegram.allowed_user_ids.first().copied())
-        .unwrap_or(0);
+    let chat_id = match resolve_wake_chat_id(&state.settings, body.chat_id) {
+        Ok(chat_id) => chat_id,
+        Err((status, message)) => return json_error(status, message),
+    };
+
     if chat_id == 0 {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1214,6 +1226,26 @@ async fn wake(
             )
         }
     }
+}
+
+fn resolve_wake_chat_id(
+    settings: &Settings,
+    requested_chat_id: Option<i64>,
+) -> Result<i64, (StatusCode, &'static str)> {
+    if let Some(chat_id) = requested_chat_id {
+        if settings.telegram.allow_any_user || settings.telegram.allowed_user_ids.contains(&chat_id)
+        {
+            return Ok(chat_id);
+        }
+        return Err((
+            StatusCode::FORBIDDEN,
+            "chat_id is not in TELEGRAM_ALLOWED_USER_IDS",
+        ));
+    }
+    settings.telegram.allowed_user_ids.first().copied().ok_or((
+        StatusCode::BAD_REQUEST,
+        "no chat_id given and no allowed user configured to deliver to",
+    ))
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
@@ -1286,6 +1318,14 @@ mod tests {
     }
 
     #[test]
+    fn api_token_compare_is_exact_and_length_sensitive() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secret2"));
+        assert!(!constant_time_eq(b"secret", b"secres"));
+        assert!(!constant_time_eq(b"", b"secret"));
+    }
+
+    #[test]
     fn workspace_file_resolution_rejects_traversal() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
@@ -1301,6 +1341,35 @@ mod tests {
             "ok.txt"
         );
         assert!(resolve_workspace_path(&workspace, "../outside.txt").is_none());
+    }
+
+    #[test]
+    fn wake_chat_defaults_to_first_allowed_recipient() {
+        let tmp = tempdir().unwrap();
+        let mut settings = test_settings(tmp.path());
+        settings.telegram.allowed_user_ids = vec![42, 43];
+
+        assert_eq!(resolve_wake_chat_id(&settings, None).unwrap(), 42);
+    }
+
+    #[test]
+    fn wake_chat_rejects_unlisted_recipient_by_default() {
+        let tmp = tempdir().unwrap();
+        let mut settings = test_settings(tmp.path());
+        settings.telegram.allowed_user_ids = vec![42];
+
+        let error = resolve_wake_chat_id(&settings, Some(99)).unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn wake_chat_allows_unlisted_recipient_only_in_allow_any_mode() {
+        let tmp = tempdir().unwrap();
+        let mut settings = test_settings(tmp.path());
+        settings.telegram.allowed_user_ids = vec![42];
+        settings.telegram.allow_any_user = true;
+
+        assert_eq!(resolve_wake_chat_id(&settings, Some(99)).unwrap(), 99);
     }
 
     #[test]

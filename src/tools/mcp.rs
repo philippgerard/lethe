@@ -21,12 +21,12 @@
 //! session-shaped error drops the cache and retries once. The tool list is
 //! cached for five minutes.
 
-use std::env;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use std::{env, fs};
 
 use serde_json::{Value, json};
 
@@ -47,11 +47,21 @@ fn mcp_config() -> Option<(String, String)> {
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())?;
-    let token = env::var("MCP_SERVER_TOKEN")
+    let token = env_string_or_file("MCP_SERVER_TOKEN")?;
+    Some((url, token))
+}
+
+fn env_string_or_file(key: &str) -> Option<String> {
+    env::var(key)
         .ok()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())?;
-    Some((url, token))
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            let path = env::var_os(format!("{key}_FILE"))?;
+            let value = fs::read_to_string(path).ok()?;
+            let value = value.trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        })
 }
 
 /// Whether a remote MCP server is configured (cached: the env is fixed for
@@ -524,8 +534,32 @@ mod tests {
         unsafe {
             env::remove_var("MCP_SERVER_URL");
             env::remove_var("MCP_SERVER_TOKEN");
+            env::remove_var("MCP_SERVER_TOKEN_FILE");
             env::remove_var("MCP_SERVER_LABEL");
         }
+    }
+
+    #[test]
+    fn mcp_token_reads_file_when_direct_env_is_empty() {
+        let _guard = env_lock().lock().unwrap();
+        reset_state();
+        clear_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let token_file = tmp.path().join("token");
+        fs::write(&token_file, "file-token\n").unwrap();
+        unsafe {
+            env::set_var("MCP_SERVER_URL", "https://mcp.example.com/mcp");
+            env::set_var("MCP_SERVER_TOKEN", "");
+            env::set_var("MCP_SERVER_TOKEN_FILE", &token_file);
+        }
+        assert_eq!(
+            mcp_config(),
+            Some((
+                "https://mcp.example.com/mcp".to_string(),
+                "file-token".to_string()
+            ))
+        );
+        clear_env();
     }
 
     #[test]

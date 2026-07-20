@@ -1,5 +1,5 @@
-use std::env;
 use std::path::PathBuf;
+use std::{env, fs};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,7 @@ pub struct Paths {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LlmConfig {
     pub openrouter_api_key: String,
+    pub anthropic_api_key: String,
     pub openai_api_key: String,
     /// Mistral API key — used only for Voxtral speech-to-text transcription
     /// (TRANSCRIPTION_PROVIDER=mistral), not for the chat LLM.
@@ -88,11 +89,9 @@ impl LlmConfig {
             );
         }
         let has_auth = !self.openrouter_api_key.trim().is_empty()
+            || !self.anthropic_api_key.trim().is_empty()
             || !self.openai_api_key.trim().is_empty()
             || !self.opencode_go_api_key.trim().is_empty()
-            || std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .is_some_and(|value| !value.trim().is_empty())
             // Subscription OAuth (Claude Pro/Max, ChatGPT Plus/Pro): tokens
             // live in ~/.lethe/credentials/, not in an env var. Without this
             // an OAuth-only setup would wrongly report "no auth".
@@ -147,7 +146,12 @@ pub struct TelegramConfig {
     pub enabled: bool,
     pub bot_token: String,
     pub allowed_user_ids: Vec<i64>,
+    /// Explicit unsafe escape hatch for public bots. Empty allowlists fail
+    /// closed unless this is true or first-user-lock is active.
+    pub allow_any_user: bool,
     pub transcription_enabled: bool,
+    /// Maximum Telegram media download size accepted into memory/disk.
+    pub download_max_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -231,23 +235,26 @@ impl Settings {
                 // a bot token is present (the pre-flag behavior).
                 enabled: env_bool(
                     "TELEGRAM_ENABLED",
-                    !env_string("TELEGRAM_BOT_TOKEN", "").is_empty(),
+                    !env_secret_string("TELEGRAM_BOT_TOKEN", "").is_empty(),
                 ),
-                bot_token: env_string("TELEGRAM_BOT_TOKEN", ""),
+                bot_token: env_secret_string("TELEGRAM_BOT_TOKEN", ""),
                 allowed_user_ids: env_i64_list("TELEGRAM_ALLOWED_USER_IDS"),
+                allow_any_user: env_bool("TELEGRAM_ALLOW_ANY_USER", false),
                 transcription_enabled: env_bool("TELEGRAM_TRANSCRIPTION_ENABLED", true),
+                download_max_bytes: env_u64("TELEGRAM_DOWNLOAD_MAX_BYTES", 50 * 1024 * 1024),
             },
             api: ApiServerConfig {
                 enabled: env_bool("API_ENABLED", true),
-                token: env_string("LETHE_API_TOKEN", ""),
+                token: env_secret_string("LETHE_API_TOKEN", ""),
                 host: env_string("LETHE_API_HOST", "127.0.0.1"),
                 port: env_u16("LETHE_API_PORT", 1373),
             },
             llm: LlmConfig {
-                openrouter_api_key: env_string("OPENROUTER_API_KEY", ""),
-                openai_api_key: env_string("OPENAI_API_KEY", ""),
-                mistral_api_key: env_string("MISTRAL_API_KEY", ""),
-                opencode_go_api_key: env_string("OPENCODE_GO_API_KEY", ""),
+                openrouter_api_key: env_secret_string("OPENROUTER_API_KEY", ""),
+                anthropic_api_key: env_secret_string("ANTHROPIC_API_KEY", ""),
+                openai_api_key: env_secret_string("OPENAI_API_KEY", ""),
+                mistral_api_key: env_secret_string("MISTRAL_API_KEY", ""),
+                opencode_go_api_key: env_secret_string("OPENCODE_GO_API_KEY", ""),
                 llm_model: env_string("LLM_MODEL", ""),
                 llm_model_aux: env_string("LLM_MODEL_AUX", ""),
                 llm_model_tool: env_string("LLM_MODEL_TOOL", ""),
@@ -303,6 +310,37 @@ fn env_string(key: &str, default: &str) -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn env_secret_string(key: &str, default: &str) -> String {
+    let direct = env_string(key, "");
+    if !direct.is_empty() {
+        return direct;
+    }
+    let file_key = format!("{key}_FILE");
+    let Some(path) = env_path(&file_key) else {
+        return default.to_string();
+    };
+    match fs::read_to_string(&path) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                default.to_string()
+            } else {
+                value
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                key,
+                file_key,
+                path = %path.display(),
+                error = %error,
+                "failed to read secret file"
+            );
+            default.to_string()
+        }
+    }
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -379,6 +417,7 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
         },
         llm: LlmConfig {
             openrouter_api_key: String::new(),
+            anthropic_api_key: String::new(),
             openai_api_key: String::new(),
             mistral_api_key: String::new(),
             opencode_go_api_key: String::new(),
@@ -395,7 +434,9 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
             enabled: false,
             bot_token: String::new(),
             allowed_user_ids: vec![],
+            allow_any_user: false,
             transcription_enabled: true,
+            download_max_bytes: 50 * 1024 * 1024,
         },
         api: ApiServerConfig {
             enabled: true,
@@ -449,5 +490,71 @@ mod tests {
         assert_eq!(settings.effective_tool_model(), "");
         settings.llm.llm_model_tool = "  deepseek/deepseek-v4-pro  ".to_string();
         assert_eq!(settings.effective_tool_model(), "deepseek/deepseek-v4-pro");
+    }
+
+    #[test]
+    fn secret_env_prefers_direct_value_over_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_file = temp.path().join("secret");
+        std::fs::write(&secret_file, "from-file\n").unwrap();
+        let _guard = EnvGuard::set(&[
+            ("LETHE_TEST_SECRET", Some("direct")),
+            (
+                "LETHE_TEST_SECRET_FILE",
+                Some(secret_file.to_str().unwrap()),
+            ),
+        ]);
+
+        assert_eq!(env_secret_string("LETHE_TEST_SECRET", ""), "direct");
+    }
+
+    #[test]
+    fn secret_env_reads_file_when_direct_value_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_file = temp.path().join("secret");
+        std::fs::write(&secret_file, "from-file\n").unwrap();
+        let _guard = EnvGuard::set(&[
+            ("LETHE_TEST_SECRET", Some("")),
+            (
+                "LETHE_TEST_SECRET_FILE",
+                Some(secret_file.to_str().unwrap()),
+            ),
+        ]);
+
+        assert_eq!(env_secret_string("LETHE_TEST_SECRET", ""), "from-file");
+    }
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap();
+            let old = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            Self { _lock: lock, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.old.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
     }
 }

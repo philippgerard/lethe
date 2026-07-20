@@ -40,10 +40,16 @@ struct DesiredTelegram {
     #[serde(default)]
     bot_token: String,
     #[serde(default)]
+    allowed_user_ids: Vec<i64>,
+    #[serde(default)]
     enabled: bool,
     /// When true and no user is locked yet, bind to the first user who messages.
     #[serde(default)]
     lock_to_first_user: bool,
+    /// Explicit unsafe public-bot mode. Empty allowlists fail closed unless
+    /// this or lock_to_first_user is set.
+    #[serde(default)]
+    allow_any_user: bool,
 }
 
 /// Runtime state, owned by lethe (this process). Read by the control plane.
@@ -59,9 +65,21 @@ struct TelegramRuntime {
     locked_user_id: Option<i64>,
 }
 
+#[derive(Clone)]
 struct Desired {
     token: String,
+    allowed_user_ids: Vec<i64>,
     lock_to_first_user: bool,
+    allow_any_user: bool,
+}
+
+impl Desired {
+    fn signature(&self) -> String {
+        format!(
+            "{}:{:?}:{}:{}",
+            self.token, self.allowed_user_ids, self.lock_to_first_user, self.allow_any_user
+        )
+    }
 }
 
 fn config_dir(settings: &Settings) -> PathBuf {
@@ -101,7 +119,9 @@ fn resolve_desired(dir: &Path, settings: &Settings) -> Option<Desired> {
         return match load_desired(dir).telegram {
             Some(tg) if tg.enabled && !tg.bot_token.trim().is_empty() => Some(Desired {
                 token: tg.bot_token.trim().to_string(),
+                allowed_user_ids: tg.allowed_user_ids,
                 lock_to_first_user: tg.lock_to_first_user,
+                allow_any_user: tg.allow_any_user,
             }),
             _ => None,
         };
@@ -109,7 +129,9 @@ fn resolve_desired(dir: &Path, settings: &Settings) -> Option<Desired> {
     if settings.telegram.enabled && !settings.telegram.bot_token.trim().is_empty() {
         Some(Desired {
             token: settings.telegram.bot_token.trim().to_string(),
+            allowed_user_ids: settings.telegram.allowed_user_ids.clone(),
             lock_to_first_user: false,
+            allow_any_user: settings.telegram.allow_any_user,
         })
     } else {
         None
@@ -121,31 +143,34 @@ fn spawn_telegram(
     mut settings: Settings,
     brainstem: BrainstemHandle,
     dir: PathBuf,
-    token: String,
-    lock_to_first_user: bool,
+    desired: Desired,
 ) -> JoinHandle<()> {
     let locked = load_state(&dir).telegram.and_then(|t| t.locked_user_id);
 
-    settings.telegram.bot_token = token;
+    settings.telegram.bot_token = desired.token;
     settings.telegram.enabled = true;
-    settings.telegram.allowed_user_ids = locked.map(|id| vec![id]).unwrap_or_default();
+    settings.telegram.allowed_user_ids = locked
+        .map(|id| vec![id])
+        .unwrap_or(desired.allowed_user_ids);
+    settings.telegram.allow_any_user = desired.allow_any_user;
 
     // Lock to the first user only when asked and not already bound. The callback
     // persists the binding so a later restart reuses the same owner.
-    let lock_on_first: Option<FirstUserLockCallback> = if lock_to_first_user && locked.is_none() {
-        let dir = dir.clone();
-        Some(Arc::new(move |uid: i64| {
-            let mut state = load_state(&dir);
-            state
-                .telegram
-                .get_or_insert_with(Default::default)
-                .locked_user_id = Some(uid);
-            save_state(&dir, &state);
-            tracing::info!(user_id = uid, "telegram transport locked to first user");
-        }))
-    } else {
-        None
-    };
+    let lock_on_first: Option<FirstUserLockCallback> =
+        if desired.lock_to_first_user && locked.is_none() {
+            let dir = dir.clone();
+            Some(Arc::new(move |uid: i64| {
+                let mut state = load_state(&dir);
+                state
+                    .telegram
+                    .get_or_insert_with(Default::default)
+                    .locked_user_id = Some(uid);
+                save_state(&dir, &state);
+                tracing::info!(user_id = uid, "telegram transport locked to first user");
+            }))
+        } else {
+            None
+        };
 
     tokio::spawn(async move {
         let options = AgentOptions::default();
@@ -180,9 +205,10 @@ pub async fn run(agent: Arc<Agent>, settings: Settings, brainstem: BrainstemHand
 
         match resolve_desired(&dir, &settings) {
             Some(desired) => {
+                let signature = desired.signature();
                 let same = running
                     .as_ref()
-                    .is_some_and(|(token, _)| *token == desired.token);
+                    .is_some_and(|(running_signature, _)| *running_signature == signature);
                 if !same {
                     if let Some((_, task)) = running.take() {
                         task.abort();
@@ -192,10 +218,9 @@ pub async fn run(agent: Arc<Agent>, settings: Settings, brainstem: BrainstemHand
                         settings.clone(),
                         brainstem.clone(),
                         dir.clone(),
-                        desired.token.clone(),
-                        desired.lock_to_first_user,
+                        desired.clone(),
                     );
-                    running = Some((desired.token, task));
+                    running = Some((signature, task));
                 }
             }
             None => {

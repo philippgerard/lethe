@@ -1104,18 +1104,53 @@ fn build_client(config: &LlmRouterConfig) -> Client {
 struct RouterTarget {
     endpoint: String,
     auth_env: String,
+    auth_key: Option<String>,
     adapter: AdapterKind,
     model_name: String,
 }
 
 impl RouterTarget {
+    fn new(
+        endpoint: impl Into<String>,
+        auth_env: impl Into<String>,
+        adapter: AdapterKind,
+        model_name: impl Into<String>,
+        _config: &LlmRouterConfig,
+    ) -> Self {
+        let auth_env = auth_env.into();
+        Self {
+            endpoint: endpoint.into(),
+            auth_key: secret_from_env_or_file(&auth_env),
+            auth_env,
+            adapter,
+            model_name: model_name.into(),
+        }
+    }
+
     fn into_service_target(self) -> ServiceTarget {
         ServiceTarget {
             endpoint: Endpoint::from_owned(self.endpoint),
-            auth: AuthData::from_env(self.auth_env),
+            auth: self
+                .auth_key
+                .map(AuthData::from_single)
+                .unwrap_or_else(|| AuthData::from_env(self.auth_env)),
             model: ModelIden::new(self.adapter, self.model_name),
         }
     }
+}
+
+fn secret_from_env_or_file(auth_env: &str) -> Option<String> {
+    if let Ok(value) = env::var(auth_env) {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    let file_env = format!("{auth_env}_FILE");
+    let path = env::var_os(&file_env)?;
+    let value = fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<RouterTarget> {
@@ -1135,21 +1170,23 @@ fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<
     }
 
     if let Some(endpoint) = api_base {
-        return Some(RouterTarget {
+        return Some(RouterTarget::new(
             endpoint,
-            auth_env: auth_env_for_provider(provider).to_string(),
-            adapter: adapter_for_provider(provider).unwrap_or(AdapterKind::OpenAI),
-            model_name: strip_slash_provider(model, provider).to_string(),
-        });
+            auth_env_for_provider(provider),
+            adapter_for_provider(provider).unwrap_or(AdapterKind::OpenAI),
+            strip_slash_provider(model, provider),
+            config,
+        ));
     }
 
     if provider == "openrouter" || slash_provider == Some("openrouter") {
-        return Some(RouterTarget {
-            endpoint: OPENROUTER_ENDPOINT.to_string(),
-            auth_env: "OPENROUTER_API_KEY".to_string(),
-            adapter: AdapterKind::OpenAI,
-            model_name: strip_slash_provider(model, "openrouter").to_string(),
-        });
+        return Some(RouterTarget::new(
+            OPENROUTER_ENDPOINT,
+            "OPENROUTER_API_KEY",
+            AdapterKind::OpenAI,
+            strip_slash_provider(model, "openrouter"),
+            config,
+        ));
     }
 
     // OpenCode Go fast-path: single endpoint, per-model protocol from catalog.
@@ -1163,23 +1200,25 @@ fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<
             "anthropic" => AdapterKind::Anthropic,
             _ => AdapterKind::OpenAI,
         };
-        return Some(RouterTarget {
-            endpoint: OPENCODE_GO_ENDPOINT.to_string(),
-            auth_env: "OPENCODE_GO_API_KEY".to_string(),
+        return Some(RouterTarget::new(
+            OPENCODE_GO_ENDPOINT,
+            "OPENCODE_GO_API_KEY",
             adapter,
             model_name,
-        });
+            config,
+        ));
     }
 
     if let Some(slash_provider) = slash_provider
         && let Some(endpoint) = default_endpoint_for_provider(slash_provider)
     {
-        return Some(RouterTarget {
-            endpoint: endpoint.to_string(),
-            auth_env: auth_env_for_provider(slash_provider).to_string(),
-            adapter: adapter_for_provider(slash_provider)?,
-            model_name: strip_slash_provider(model, slash_provider).to_string(),
-        });
+        return Some(RouterTarget::new(
+            endpoint,
+            auth_env_for_provider(slash_provider),
+            adapter_for_provider(slash_provider)?,
+            strip_slash_provider(model, slash_provider),
+            config,
+        ));
     }
 
     None
@@ -2466,6 +2505,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secret_from_env_or_file_prefers_direct_value_then_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_file = temp.path().join("provider-key");
+        std::fs::write(&secret_file, "from-file\n").unwrap();
+        let _guard = EnvGuard::set(&[
+            ("LETHE_LLM_TEST_KEY", Some("direct")),
+            (
+                "LETHE_LLM_TEST_KEY_FILE",
+                Some(secret_file.to_str().unwrap()),
+            ),
+        ]);
+        assert_eq!(
+            secret_from_env_or_file("LETHE_LLM_TEST_KEY").as_deref(),
+            Some("direct")
+        );
+
+        unsafe { std::env::set_var("LETHE_LLM_TEST_KEY", "") };
+        assert_eq!(
+            secret_from_env_or_file("LETHE_LLM_TEST_KEY").as_deref(),
+            Some("from-file")
+        );
+    }
+
+    #[test]
     fn drop_leading_non_user_messages_drops_orphaned_tool_results() {
         // A leading assistant(tool_use) whose results are the next (user-role)
         // message: dropping the assistant to satisfy "start with user" must also
@@ -2894,5 +2957,39 @@ mod tests {
             temperature_millidegrees: 500,
         };
         assert!(!should_use_openai_oauth(&config.model, &config));
+    }
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap();
+            let old = vars
+                .iter()
+                .map(|(key, _)| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for (key, value) in vars {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            Self { _lock: lock, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.old.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
     }
 }
