@@ -29,7 +29,7 @@ use crate::llm::{
     HistoricalToolCall, HistoricalToolResponse, LlmAttachment, LlmMessage, LlmRole, LlmRouter,
     LlmRouterConfig, PromptBuilder, dialect_for_model,
 };
-use crate::memory::message_metadata::MessageMetadata;
+use crate::memory::message_metadata::{MessageKind, MessageMetadata};
 use crate::memory::messages::{MessageHistoryError, MessageRole, StoredMessage};
 use crate::memory::recall::{Hippocampus, HippocampusConfig, HippocampusError};
 use crate::memory::{MemoryStore, MemoryStoreError};
@@ -929,12 +929,30 @@ fn is_visible_history_record(message: &StoredMessage) -> bool {
 
 fn drop_history_before_first_user(history: &mut Vec<StoredMessage>) {
     let Some(first_user) = history.iter().position(|message| message.role.is_user()) else {
-        history.clear();
+        // A proactive message can legitimately begin the conversation. Keep
+        // only those outbound rows; the conversion step renders them as one
+        // self-describing user-role context record so Anthropic's user-first
+        // protocol does not discard them.
+        history.retain(is_user_visible_proactive_assistant);
         return;
     };
     if first_user > 0 {
-        history.drain(0..first_user);
+        let proactive_prefix = history
+            .drain(0..first_user)
+            .filter(is_user_visible_proactive_assistant)
+            .collect::<Vec<_>>();
+        if !proactive_prefix.is_empty() {
+            history.splice(0..0, proactive_prefix);
+        }
     }
+}
+
+fn is_user_visible_proactive_assistant(message: &StoredMessage) -> bool {
+    if !message.role.is_assistant() {
+        return false;
+    }
+    let metadata = MessageMetadata::from_value(Some(&message.metadata));
+    !metadata.is_internal() && metadata.kind == Some(MessageKind::Proactive)
 }
 
 /// Convert a slice of stored messages into the LLM message stream, preserving
@@ -943,7 +961,29 @@ fn drop_history_before_first_user(history: &mut Vec<StoredMessage>) {
 /// matching ids). Orphans on either side are dropped.
 fn history_to_llm_messages(history: Vec<StoredMessage>) -> Vec<LlmMessage> {
     let mut out = Vec::new();
-    let mut iter = history.into_iter().peekable();
+    let leading_proactive = history
+        .iter()
+        .take_while(|message| is_user_visible_proactive_assistant(message))
+        .count();
+    if leading_proactive > 0 {
+        let messages = history[..leading_proactive]
+            .iter()
+            .map(|message| {
+                format!(
+                    "<proactive_assistant_message>\n{}\n</proactive_assistant_message>",
+                    message.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Anthropic requires the message list to start with `user`. Encode the
+        // outbound text inside one self-describing context record: compaction
+        // can drop that record as a unit but cannot orphan a leading assistant.
+        out.push(LlmMessage::user(format!(
+            "[Conversation context: before the user's first inbound turn, you initiated the conversation with the following message(s).]\n{messages}"
+        )));
+    }
+    let mut iter = history.into_iter().skip(leading_proactive).peekable();
 
     while let Some(message) = iter.next() {
         match message.role {
@@ -2193,6 +2233,82 @@ mod tests {
     }
 
     #[test]
+    fn prepare_turn_preserves_a_proactive_message_before_the_first_user_reply() {
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        let prompts = PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
+        let proactive = "How was your meeting with Katie?";
+
+        memory
+            .messages
+            .add(
+                MessageRole::Assistant,
+                proactive,
+                Some(metadata_value(
+                    MessageVisibility::UserVisible,
+                    MessageKind::Proactive,
+                    "brainstem",
+                )),
+            )
+            .unwrap();
+
+        let turn = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "Your meeting?",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let conversational = turn
+            .messages
+            .iter()
+            .filter(|message| message.role != LlmRole::System)
+            .collect::<Vec<_>>();
+
+        assert_eq!(conversational.len(), 2);
+        assert_eq!(conversational[0].role, LlmRole::User);
+        assert!(conversational[0].content.contains("you initiated"));
+        assert!(conversational[0].content.contains(proactive));
+        assert_eq!(conversational[1].role, LlmRole::User);
+        assert!(conversational[1].content.ends_with("Your meeting?"));
+
+        // If the first inbound turn was persisted but failed before producing
+        // an assistant row, its next retry/follow-up must retain the proactive
+        // message that user was replying to.
+        memory
+            .messages
+            .add(MessageRole::User, "Your meeting?", None)
+            .unwrap();
+        let retry = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "I mean the question you just asked.",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            retry
+                .messages
+                .iter()
+                .any(|message| message.content.contains(proactive)),
+            "a failed first reply must not sever the proactive context"
+        );
+    }
+
+    #[test]
     fn assistant_history_content_normalizes_message_envelope() {
         let normalized = assistant_history_content(
             r#"{"messages":["doing pretty well","I have thoughts when you have a sec"]}"#,
@@ -2294,9 +2410,7 @@ mod tests {
         assert_eq!(changed["model_deep"]["new"], "deep-next");
 
         // An explicit empty string clears the deep slot; a `None` leaves it.
-        let cleared = agent
-            .reconfigure_models(None, None, Some(""))
-            .unwrap();
+        let cleared = agent.reconfigure_models(None, None, Some("")).unwrap();
         assert_eq!(cleared["model_deep"]["new"], "");
         assert_eq!(agent.router_config().unwrap().deep_model, "");
     }

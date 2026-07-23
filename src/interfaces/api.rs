@@ -31,7 +31,7 @@ use crate::tools::registry::{
 };
 
 const SESSION_QUEUE_DEPTH: usize = 32;
-const PROACTIVE_QUEUE_DEPTH: usize = 64;
+const EVENT_QUEUE_DEPTH: usize = 64;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -39,7 +39,13 @@ pub struct ApiState {
     agent: Arc<Agent>,
     conversations: ConversationManager,
     sessions: Arc<Mutex<ApiSessions>>,
+    /// Auxiliary application-originated proactive events. Brainstem emissions
+    /// subscribe directly per `/events` connection below.
     proactive_tx: broadcast::Sender<ApiEvent>,
+    /// Shared Brainstem handle. Each live `/events` request subscribes
+    /// directly so an API server with no connected SSE client does not count
+    /// as a deliverable proactive-message transport.
+    brainstem: Option<BrainstemHandle>,
     /// Server-wide stream that fans out actor.* lifecycle events to any
     /// /events subscriber (TUI clients). Populated when an actor runtime
     /// is installed (see `install_actor_broadcaster`).
@@ -135,8 +141,8 @@ impl ApiState {
     /// (HTTP API + Telegram poller) can share one agent, one memory
     /// store, and one actor registry in the same process.
     pub fn with_shared_agent(settings: Settings, agent: Arc<Agent>) -> Self {
-        let (proactive_tx, _) = broadcast::channel(PROACTIVE_QUEUE_DEPTH);
-        let (stream_tx, _) = broadcast::channel(PROACTIVE_QUEUE_DEPTH);
+        let (proactive_tx, _) = broadcast::channel(EVENT_QUEUE_DEPTH);
+        let (stream_tx, _) = broadcast::channel(EVENT_QUEUE_DEPTH);
         // Hosted secure-input: the hub emits `secure_input.*` onto the same
         // `/events` broadcast the frontend already consumes.
         let secure_prompt = if crate::agent_id::is_enabled()
@@ -162,9 +168,15 @@ impl ApiState {
             agent,
             sessions: Arc::new(Mutex::new(ApiSessions::default())),
             proactive_tx,
+            brainstem: None,
             stream_tx,
             secure_prompt,
         }
+    }
+
+    fn with_brainstem(mut self, brainstem: BrainstemHandle) -> Self {
+        self.brainstem = Some(brainstem);
+        self
     }
 
     /// Subscribe the API to the agent's actor event bus and translate each
@@ -452,10 +464,8 @@ pub async fn serve(settings: Settings, port: u16) -> Result<()> {
 }
 
 /// Run the API server with optional shared agent + shared Brainstem.
-/// When `agent` is `None`, builds one from settings. The Brainstem's
-/// emissions are bridged into the existing `/events` broadcast so
-/// connected TUI clients see heartbeat-driven proactive messages with
-/// no special-case logic.
+/// When `agent` is `None`, builds one from settings. Each connected
+/// `/events` client subscribes to the Brainstem for its own SSE lifetime.
 pub async fn serve_with_agent(
     settings: Settings,
     port: u16,
@@ -469,7 +479,8 @@ pub async fn serve_with_agent(
     let state = match agent {
         Some(agent) => ApiState::with_shared_agent(settings.clone(), agent),
         None => ApiState::from_settings(settings.clone())?,
-    };
+    }
+    .with_brainstem(brainstem);
     if let Err(error) = state.install_actor_broadcaster().await {
         tracing::warn!(error = %error, "actor broadcaster not installed");
     }
@@ -506,27 +517,9 @@ pub async fn serve_with_agent(
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("Lethe Rust API listening on http://{bind}");
 
-    let brainstem_bridge = {
-        let state = state.clone();
-        let mut rx = brainstem.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(BrainstemEmission { message, .. }) => {
-                        state.send_proactive(&message).await;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
-    };
-
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
-    brainstem_bridge.abort();
-    let _ = brainstem_bridge.await;
     Ok(result?)
 }
 
@@ -933,6 +926,10 @@ async fn events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     if let Some(response) = require_auth(&state, &headers) {
         return response;
     }
+    // Subscription lifetime matches the authenticated SSE connection. Merely
+    // running the API server must not make the Brainstem believe a proactive
+    // message has somewhere user-visible to go.
+    let mut brainstem_rx = state.brainstem.as_ref().map(BrainstemHandle::subscribe);
     let mut proactive_rx = state.proactive_tx.subscribe();
     let mut stream_rx = state.stream_tx.subscribe();
     // Conversation messages from other transports (e.g. Telegram) so an open web
@@ -941,6 +938,21 @@ async fn events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     let event_stream = stream! {
         loop {
             tokio::select! {
+                emission = recv_brainstem(&mut brainstem_rx) => match emission {
+                    Ok(BrainstemEmission { message, .. }) => {
+                        yield Ok::<Event, Infallible>(ApiEvent::new(
+                            "text",
+                            json!({
+                                "content": message,
+                                "parse_mode": "Markdown",
+                                "message_id": 0,
+                                "proactive": true,
+                            }),
+                        ).into_sse())
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
                 event = proactive_rx.recv() => match event {
                     Ok(event) => yield Ok::<Event, Infallible>(event.into_sse()),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -962,6 +974,15 @@ async fn events(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+async fn recv_brainstem(
+    receiver: &mut Option<broadcast::Receiver<BrainstemEmission>>,
+) -> Result<BrainstemEmission, broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn list_actors(State(state): State<ApiState>, headers: HeaderMap) -> Response {
@@ -1308,6 +1329,32 @@ mod tests {
         let event = ApiEvent::new("text", json!({"content": "hello"}));
         assert_eq!(event.event, "text");
         assert_eq!(event.data["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn api_subscribes_to_brainstem_only_for_an_authenticated_event_stream() {
+        let tmp = tempdir().unwrap();
+        let brainstem = BrainstemHandle::new();
+        let state = ApiState::from_settings(test_settings(tmp.path()))
+            .unwrap()
+            .with_brainstem(brainstem.clone());
+        assert_eq!(brainstem.subscriber_count(), 0);
+
+        let unauthorized = events(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(brainstem.subscriber_count(), 0);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        let response = events(State(state), headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(brainstem.subscriber_count(), 1);
+
+        drop(response);
+        assert_eq!(brainstem.subscriber_count(), 0);
     }
 
     #[tokio::test]

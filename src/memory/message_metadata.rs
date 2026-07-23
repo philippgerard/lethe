@@ -31,6 +31,7 @@ impl MessageVisibility {
 pub enum MessageKind {
     Chat,
     Heartbeat,
+    Proactive,
     ActorUpdate,
     TelegramMedia,
     TelegramReaction,
@@ -41,6 +42,7 @@ impl MessageKind {
         match self {
             Self::Chat => "chat",
             Self::Heartbeat => "heartbeat",
+            Self::Proactive => "proactive",
             Self::ActorUpdate => "actor_update",
             Self::TelegramMedia => "telegram_media",
             Self::TelegramReaction => "telegram_reaction",
@@ -51,6 +53,7 @@ impl MessageKind {
         match value.trim() {
             "chat" | "telegram_text" => Some(Self::Chat),
             "heartbeat" | "background_heartbeat" => Some(Self::Heartbeat),
+            "proactive" => Some(Self::Proactive),
             "actor_update" => Some(Self::ActorUpdate),
             "telegram_media" | "telegram_audio" | "telegram_photo" | "telegram_document"
             | "telegram_sticker" => Some(Self::TelegramMedia),
@@ -203,5 +206,18 @@ mod tests {
         let value = json!({"source": "heartbeat"});
 
         assert!(MessageMetadata::from_value(Some(&value)).is_internal());
+    }
+
+    #[test]
+    fn proactive_metadata_is_user_visible() {
+        let value = metadata_value(
+            MessageVisibility::UserVisible,
+            MessageKind::Proactive,
+            "brainstem",
+        );
+        let metadata = MessageMetadata::from_value(Some(&value));
+
+        assert!(!metadata.is_internal());
+        assert_eq!(metadata.kind, Some(MessageKind::Proactive));
     }
 }
