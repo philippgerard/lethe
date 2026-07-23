@@ -14,6 +14,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use clap::Subcommand;
 use rand::Rng as _;
 use serde_json::json;
+use tokio::sync::broadcast;
 
 use lethe::actor::ActorNamedEvent;
 use lethe::agent::{Agent, AgentOptions, TurnRequest};
@@ -211,14 +212,18 @@ pub async fn run_telegram_with_agent(
         target_chat_id_state.clone(),
     );
 
-    let mut brainstem_rx = brainstem.subscribe();
+    // An unbound Telegram transport cannot deliver proactive messages yet.
+    // Do not subscribe until a target chat is known: Brainstem uses live
+    // subscriber presence as its publication boundary, so an eager receiver
+    // would make it persist messages that this loop can only drop.
+    let mut brainstem_rx = brainstem_receiver_for_target(brainstem, target_chat_id);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("telegram_runner_stopped: interrupt");
                 break;
             }
-            emission = brainstem_rx.recv() => {
+            emission = receive_brainstem_emission(&mut brainstem_rx) => {
                 match emission {
                     Ok(BrainstemEmission { message, .. }) => {
                         if let Some(chat_id) = target_chat_id {
@@ -260,6 +265,11 @@ pub async fn run_telegram_with_agent(
                 if let Some(chat_id) = last_chat_id {
                     target_chat_id = Some(chat_id);
                     target_chat_id_state.store(chat_id, Ordering::SeqCst);
+                    ensure_brainstem_subscription(
+                        &mut brainstem_rx,
+                        brainstem,
+                        target_chat_id,
+                    );
                 }
                 if processed > 0 {
                     println!("processed_updates: {processed}");
@@ -272,6 +282,32 @@ pub async fn run_telegram_with_agent(
         let _ = task.await;
     }
     Ok(())
+}
+
+fn brainstem_receiver_for_target(
+    brainstem: &BrainstemHandle,
+    target_chat_id: Option<i64>,
+) -> Option<broadcast::Receiver<BrainstemEmission>> {
+    target_chat_id.map(|_| brainstem.subscribe())
+}
+
+fn ensure_brainstem_subscription(
+    receiver: &mut Option<broadcast::Receiver<BrainstemEmission>>,
+    brainstem: &BrainstemHandle,
+    target_chat_id: Option<i64>,
+) {
+    if receiver.is_none() && target_chat_id.is_some() {
+        *receiver = Some(brainstem.subscribe());
+    }
+}
+
+async fn receive_brainstem_emission(
+    receiver: &mut Option<broadcast::Receiver<BrainstemEmission>>,
+) -> Result<BrainstemEmission, broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 pub fn parse_telegram_runtime_command(text: &str) -> Option<TelegramRuntimeCommand> {
@@ -1496,6 +1532,27 @@ fn telegram_inter_message_delay(chunk: &str) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brainstem_subscription_waits_until_a_target_chat_is_known() {
+        let brainstem = BrainstemHandle::new();
+        let mut receiver = brainstem_receiver_for_target(&brainstem, None);
+
+        assert!(receiver.is_none());
+
+        ensure_brainstem_subscription(&mut receiver, &brainstem, None);
+        assert!(receiver.is_none());
+
+        ensure_brainstem_subscription(&mut receiver, &brainstem, Some(42));
+        assert!(receiver.is_some());
+    }
+
+    #[test]
+    fn configured_target_subscribes_to_brainstem_immediately() {
+        let brainstem = BrainstemHandle::new();
+
+        assert!(brainstem_receiver_for_target(&brainstem, Some(42)).is_some());
+    }
 
     #[test]
     fn detects_llm_limit_errors() {

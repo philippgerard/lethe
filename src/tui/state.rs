@@ -615,4 +615,26 @@ mod tests {
         ]);
         assert_eq!(assistant_texts(&state), vec!["Hello there"]);
     }
+
+    #[test]
+    fn history_keeps_proactive_brainstem_messages() {
+        let item = history_entry_to_item(serde_json::json!({
+            "role": "assistant",
+            "content": "How was your meeting with Katie?",
+            "created_at": "2026-07-23T08:00:00Z",
+            "metadata": {
+                "lethe_visibility": "user_visible",
+                "lethe_message_kind": "proactive",
+                "lethe_source": "brainstem"
+            }
+        }))
+        .expect("proactive brainstem message should be shown");
+
+        match item {
+            TranscriptItem::Assistant { content, .. } => {
+                assert_eq!(content, "How was your meeting with Katie?");
+            }
+            _ => panic!("expected assistant transcript item"),
+        }
+    }
 }

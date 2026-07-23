@@ -111,10 +111,14 @@ impl ProactiveOutbox {
         self.take_ready_at(limiter, epoch_seconds())
     }
 
-    /// Pop the deferred message if the limiter would allow a send right now.
-    /// Stale entries are discarded. Does NOT record the send — the caller
-    /// records only after actually delivering.
-    pub fn take_ready_at(
+    /// Clone a ready message without removing it. The caller can attempt
+    /// publication and call [`Self::clear`] only after success, preserving the
+    /// original staleness deadline across transient delivery failures.
+    pub fn peek_ready(&mut self, limiter: &mut ProactiveRateLimiter) -> Option<String> {
+        self.peek_ready_at(limiter, epoch_seconds())
+    }
+
+    pub fn peek_ready_at(
         &mut self,
         limiter: &mut ProactiveRateLimiter,
         now: u64,
@@ -128,7 +132,24 @@ impl ProactiveOutbox {
         if !limiter.allowed_at(now) {
             return None;
         }
-        self.deferred.take().map(|deferred| deferred.message)
+        Some(deferred.message.clone())
+    }
+
+    /// Pop the deferred message if the limiter would allow a send right now.
+    /// Stale entries are discarded. Does NOT record the send — the caller
+    /// records only after actually delivering.
+    pub fn take_ready_at(
+        &mut self,
+        limiter: &mut ProactiveRateLimiter,
+        now: u64,
+    ) -> Option<String> {
+        let message = self.peek_ready_at(limiter, now)?;
+        self.clear();
+        Some(message)
+    }
+
+    pub fn clear(&mut self) {
+        self.deferred = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -237,6 +258,28 @@ mod tests {
             None
         );
         assert!(outbox.is_empty());
+    }
+
+    #[test]
+    fn peeking_does_not_renew_a_deferred_messages_ttl() {
+        let mut limiter = ProactiveRateLimiter::new(5, 0);
+        let mut outbox = ProactiveOutbox::default();
+        outbox.defer_at("waiting for a transport", 1_000);
+
+        assert_eq!(
+            outbox.peek_ready_at(&mut limiter, 1_001).as_deref(),
+            Some("waiting for a transport")
+        );
+        assert!(!outbox.is_empty());
+
+        assert_eq!(
+            outbox.peek_ready_at(&mut limiter, 1_000 + DEFERRED_TTL_SECONDS + 1),
+            None
+        );
+        assert!(
+            outbox.is_empty(),
+            "the original deferred timestamp must still expire"
+        );
     }
 
     #[test]
