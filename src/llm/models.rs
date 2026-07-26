@@ -83,6 +83,21 @@ pub fn model_catalog() -> &'static ModelCatalog {
     MODEL_CATALOG.get_or_init(load_embedded_catalog)
 }
 
+/// Friendly catalog name for a configured model id. Custom model ids are
+/// returned unchanged so transport notices remain useful even when the model
+/// is not part of the embedded catalog.
+pub fn model_display_name(model_id: &str) -> String {
+    let model_id = model_id.trim();
+    for groups in model_catalog().values() {
+        for entries in groups.values() {
+            if let Some(entry) = entries.iter().find(|entry| entry.model_id() == model_id) {
+                return entry.name().to_string();
+            }
+        }
+    }
+    model_id.to_string()
+}
+
 pub fn available_providers() -> Vec<ProviderInfo> {
     available_providers_with(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
 }
@@ -242,6 +257,15 @@ mod tests {
             catalog["openrouter"]["main"]
                 .iter()
                 .any(|entry| entry.model_id().starts_with("openrouter/"))
+        );
+    }
+
+    #[test]
+    fn model_display_name_uses_catalog_and_falls_back_to_trimmed_id() {
+        assert_eq!(model_display_name("claude-opus-4-8"), "Claude Opus 4.8");
+        assert_eq!(
+            model_display_name("  custom/provider-model  "),
+            "custom/provider-model"
         );
     }
 
