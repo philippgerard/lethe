@@ -1,0 +1,66 @@
+# Lethe's development profile keeps Codex capable while separating development
+# work from the live assistant runtime and its credentials.
+web_search = "live"
+default_permissions = "lethe-development"
+
+# Do not let development commands inherit a live Lethe/provider configuration.
+# Tests that need these variables set isolated values themselves.
+[shell_environment_policy]
+ignore_default_excludes = false
+exclude = [
+  "LETHE_*",
+  "LLM_*",
+  "OPENAI_*",
+  "ANTHROPIC_*",
+  "OPENROUTER_*",
+  "OPENCODE_*",
+  "MISTRAL_*",
+  "TELEGRAM_*",
+  "EXA_*",
+  "MCP_SERVER_*",
+  "AGENT_ID_*",
+]
+
+[permissions.lethe-development]
+description = "Lethe development with full network access and isolated live credentials."
+
+[permissions.lethe-development.filesystem]
+glob_scan_max_depth = 6
+":root" = "read"
+":tmpdir" = "write"
+":slash_tmp" = "write"
+"~/.cargo" = "write"
+"~/.lethe" = "deny"
+"~/.codex/auth.json" = "deny"
+"~/.codex/archived_sessions" = "deny"
+"~/.codex/memories" = "deny"
+"~/.codex/rollouts" = "deny"
+"~/.ssh" = "deny"
+"~/.gnupg" = "deny"
+"~/.aws" = "deny"
+"~/.config/gcloud" = "deny"
+"~/.config/gh" = "deny"
+"~/.kube" = "deny"
+"~/Library/Keychains" = "deny"
+"~/Library/Application Support/Google/Chrome" = "deny"
+"~/Library/Safari" = "deny"
+
+[permissions.lethe-development.filesystem.":workspace_roots"]
+"." = "write"
+"**/.env" = "deny"
+"**/.env.local" = "deny"
+"**/credentials/**" = "deny"
+"**/*oauth_tokens*.json" = "deny"
+
+[permissions.lethe-development.network]
+enabled = true
+allow_local_binding = true
+
+[[hooks.PreToolUse]]
+matcher = "^(Bash|apply_patch|Edit|Write)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = 'sh "$(git rev-parse --show-toplevel)/.codex/hooks/require-worktree-for-mutations.sh"'
+timeout = 5
+statusMessage = "Checking Lethe worktree policy"
