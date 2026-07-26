@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::llm::models::model_display_name;
 use crate::memory::message_metadata::{
     MessageKind, MessageVisibility, annotate_map, annotate_value,
 };
@@ -1730,8 +1731,8 @@ pub type SharedTelegramTurnGuard = Arc<Mutex<TelegramTurnGuard>>;
 
 const TELEGRAM_TOOL_TYPING_REFRESH_SECONDS: u64 = 3;
 
-/// [`crate::tools::registry::TurnObserver`] that keeps the Telegram "typing"
-/// indicator alive for the duration of every tool call.
+/// Telegram turn observer: keeps the "typing" indicator alive for tool calls
+/// and surfaces otherwise-quiet deep-model escalation.
 #[derive(Clone, Debug)]
 pub struct TelegramTypingObserver {
     token: String,
@@ -1767,6 +1768,37 @@ impl crate::tools::registry::TurnObserver for TelegramTypingObserver {
             output
         })
     }
+
+    fn on_model_escalation<'a>(
+        &'a self,
+        model_id: &'a str,
+    ) -> crate::tools::registry::BoxObserverFuture<'a> {
+        let token = self.token.clone();
+        let chat_id = self.chat_id;
+        Box::pin(async move {
+            let Ok(client) = TelegramClient::new(token, Vec::new()) else {
+                return;
+            };
+            if let Err(error) = client
+                .send_message(chat_id, &power_mode_notice(model_id))
+                .await
+            {
+                tracing::warn!(
+                    chat_id,
+                    model = model_id,
+                    error = %error,
+                    "failed to send Telegram power-mode notice"
+                );
+            }
+        })
+    }
+}
+
+fn power_mode_notice(model_id: &str) -> String {
+    format!(
+        "Using deep thinking model ({}) for this query.",
+        model_display_name(model_id)
+    )
 }
 
 async fn typing_refresh_loop(client: TelegramClient, chat_id: i64) {
@@ -2230,6 +2262,18 @@ mod tests {
         assert_eq!(
             llm_limit_reply(&anyhow::anyhow!("connection reset by peer")),
             None
+        );
+    }
+
+    #[test]
+    fn power_mode_notice_uses_friendly_or_custom_model_name() {
+        assert_eq!(
+            power_mode_notice("claude-opus-4-8"),
+            "Using deep thinking model (Claude Opus 4.8) for this query."
+        );
+        assert_eq!(
+            power_mode_notice("custom/provider-model"),
+            "Using deep thinking model (custom/provider-model) for this query."
         );
     }
 

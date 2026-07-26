@@ -21,7 +21,9 @@ use crate::actor::ActorEvent;
 use crate::agent::{Agent, TurnRequest};
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
-use crate::interfaces::telegram::{TelegramClient, TelegramToolContext, llm_limit_reply};
+use crate::interfaces::telegram::{
+    TelegramClient, TelegramToolContext, TelegramTypingObserver, llm_limit_reply,
+};
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
 use crate::scheduler::brainstem::{BrainstemEmission, BrainstemHandle};
@@ -1198,7 +1200,7 @@ async fn wake(
     };
     let runtime = ToolRuntime {
         telegram: Some(TelegramToolContext {
-            token,
+            token: token.clone(),
             chat_id,
             user_id: Some(chat_id),
             last_message_id: None,
@@ -1206,6 +1208,7 @@ async fn wake(
             dry_run: false,
             sent_messages: None,
         }),
+        observer: Some(Arc::new(TelegramTypingObserver::new(token, chat_id))),
         secure_prompt: state.secure_prompt.clone(),
         ..ToolRuntime::default()
     };

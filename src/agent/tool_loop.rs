@@ -21,7 +21,9 @@ use crate::config::Settings;
 use crate::llm::{LlmAttachment, LlmMessage, LlmRouter, build_chat_request};
 use crate::memory::MemoryStore;
 use crate::memory::MessageRole;
-use crate::tools::registry::{ActorToolContext, BoxToolFuture, ToolRegistry, ToolRuntime};
+use crate::tools::registry::{
+    ActorToolContext, BoxToolFuture, SharedTurnObserver, ToolRegistry, ToolRuntime,
+};
 use crate::tools::shell::ShellTools;
 
 use super::{AgentError, AgentResult};
@@ -444,6 +446,9 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // remaining model call this turn — including the post-chain reply — runs on the
     // powerful model. Escalation outranks the tool-model switch. Resets next turn.
     let mut escalated = start_escalated;
+    // Telegram surfaces the otherwise-quiet switch once, immediately before
+    // the first request that actually uses the deep model.
+    let mut power_mode_notified = false;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         request.tools = Some(registry.tools_for_active(&active_tools));
@@ -462,13 +467,21 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         // Model for this call, in priority order: an active deep-thinking
         // escalation wins; else the dedicated tool model once inside a tool
         // chain; else the base model selected by `use_aux` for this turn.
-        let model_id = if escalated && router.config().has_deep_model() {
+        let using_deep_model = escalated && router.config().has_deep_model();
+        let model_id = if using_deep_model {
             router.config().deep_model().to_string()
         } else if entered_tool_chain && router.config().has_tool_model() {
             router.config().tool_model().to_string()
         } else {
             router.config().model_for(use_aux).to_string()
         };
+        notify_power_mode_once(
+            registry.turn_observer(),
+            &model_id,
+            using_deep_model,
+            &mut power_mode_notified,
+        )
+        .await;
         let observer_for_stream = registry.turn_observer().cloned();
         let response = match observer_for_stream {
             Some(observer) => {
@@ -817,13 +830,21 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // The wrap-up reply is the user-facing answer, so honor the same priority as
     // the loop: a live escalation writes the final answer on the deep model; else
     // the tool model when we entered a tool chain; else the base model.
-    let wrap_model = if escalated && router.config().has_deep_model() {
+    let wrap_uses_deep_model = escalated && router.config().has_deep_model();
+    let wrap_model = if wrap_uses_deep_model {
         router.config().deep_model().to_string()
     } else if entered_tool_chain && router.config().has_tool_model() {
         router.config().tool_model().to_string()
     } else {
         router.config().model_for(use_aux).to_string()
     };
+    notify_power_mode_once(
+        registry.turn_observer(),
+        &wrap_model,
+        wrap_uses_deep_model,
+        &mut power_mode_notified,
+    )
+    .await;
     // Stream the wrap-up like any loop iteration: it IS the user-facing answer
     // for this turn, and a non-streaming call here meant minutes of dead air
     // followed by a reply the streaming UI had no deltas for.
@@ -869,6 +890,21 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         text,
         stop_reason: Some(stop_reason),
     })
+}
+
+async fn notify_power_mode_once(
+    observer: Option<&SharedTurnObserver>,
+    model_id: &str,
+    using_deep_model: bool,
+    notified: &mut bool,
+) {
+    if !using_deep_model || *notified {
+        return;
+    }
+    if let Some(observer) = observer {
+        observer.on_model_escalation(model_id).await;
+    }
+    *notified = true;
 }
 
 /// The forced wrap-up is not just "stop talking" — it demands a resumable
@@ -1068,6 +1104,47 @@ pub(super) fn image_view_message(image: ImageView) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        escalations: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::tools::registry::TurnObserver for RecordingObserver {
+        fn wrap_tool_call<'a>(
+            &'a self,
+            _name: &'a str,
+            inner: BoxToolFuture<'a>,
+        ) -> BoxToolFuture<'a> {
+            inner
+        }
+
+        fn on_model_escalation<'a>(
+            &'a self,
+            model_id: &'a str,
+        ) -> crate::tools::registry::BoxObserverFuture<'a> {
+            Box::pin(async move {
+                self.escalations.lock().unwrap().push(model_id.to_string());
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn power_mode_notification_fires_once_on_first_deep_model_use() {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: SharedTurnObserver = recording.clone();
+        let mut notified = false;
+
+        notify_power_mode_once(Some(&observer), "main-model", false, &mut notified).await;
+        notify_power_mode_once(Some(&observer), "deep-model", true, &mut notified).await;
+        notify_power_mode_once(Some(&observer), "deep-model", true, &mut notified).await;
+
+        assert!(notified);
+        assert_eq!(
+            recording.escalations.lock().unwrap().as_slice(),
+            ["deep-model"]
+        );
+    }
 
     #[test]
     fn recover_text_tool_calls_parses_gemma_style() {

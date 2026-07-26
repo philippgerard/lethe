@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub type BoxToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+pub type BoxObserverFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// Transport-side hook called around each tool execution. Lets a transport
 /// (e.g. Telegram) keep its "typing" indicator alive for the duration of a
@@ -33,6 +34,13 @@ pub trait TurnObserver: Send + Sync {
     /// answer. Lets clients render a live "thinking…" indicator. Default
     /// impl does nothing.
     fn on_reasoning_delta(&self, _reasoning: &str) {}
+
+    /// The turn is about to make its first request on the configured
+    /// deep-thinking model. Transports may surface this otherwise-quiet routing
+    /// decision; failures must remain best-effort and must not fail the turn.
+    fn on_model_escalation<'a>(&'a self, _model_id: &'a str) -> BoxObserverFuture<'a> {
+        Box::pin(async {})
+    }
 }
 
 /// Convenience alias used inside `ToolRuntime`.
