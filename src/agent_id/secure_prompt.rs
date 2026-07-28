@@ -276,6 +276,30 @@ async fn handle_conn(hub: SecurePromptHub, stream: UnixStream) -> std::io::Resul
         }
     };
 
+    // A notice raises a card and returns immediately — no key exchange, nothing
+    // to collect. It exists for challenges the owner answers somewhere else
+    // entirely: a Google "tap Yes on your phone" prompt is approved in Google's
+    // own app, so the browser child needs to tell the owner and keep waiting,
+    // not ask them to type anything here.
+    if spec.get("kind").and_then(Value::as_str) == Some("notice") {
+        let event = spec.get("event").and_then(Value::as_str).unwrap_or_default();
+        // Scope what a child may raise to its own namespace, so a compromised
+        // CLI cannot forge identity or secure-input lifecycle events.
+        if !event.starts_with("browser.") {
+            write_http(
+                &mut write_half,
+                400,
+                &json!({ "error": "notice event must be under `browser.`" }),
+            )
+            .await?;
+            return Ok(());
+        }
+        let data = spec.get("data").cloned().unwrap_or_else(|| json!({}));
+        hub.emit(event, data);
+        write_http(&mut write_half, 200, &json!({ "ok": true })).await?;
+        return Ok(());
+    }
+
     let request_id = uuid::Uuid::new_v4().to_string();
     let server = ServerEphemeral::generate();
     let requested_ms = spec
@@ -650,6 +674,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("no secure_input.request emitted");
+    }
+
+    /// A notice raises a card and returns at once, for challenges the owner
+    /// answers elsewhere — a Google push prompt is approved in Google's own app,
+    /// so the browser child must tell the owner and keep polling the page rather
+    /// than block on a value nobody will type here.
+    #[tokio::test]
+    async fn notice_emits_an_event_and_returns_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sp.sock");
+        let (hub, events) = test_hub(socket.clone());
+        let listener = hub.bind().unwrap();
+        tokio::spawn(serve(hub.clone(), listener));
+        hub.authorize(std::process::id());
+
+        let notice = json!({
+            "kind": "notice",
+            "event": "browser.confirmation_required",
+            "data": { "profile": "google", "prompt": "Tap 42 on your phone" },
+        });
+        let (status, body) = cli_post(&socket, &notice.to_string()).await;
+        assert_eq!(status, 200, "body: {body}");
+
+        let captured = events.lock().unwrap().clone();
+        let (name, data) = captured.first().expect("an event was emitted").clone();
+        assert_eq!(name, "browser.confirmation_required");
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));
+        assert_eq!(
+            data.get("prompt").and_then(Value::as_str),
+            Some("Tap 42 on your phone")
+        );
+        // Nothing is pending: a notice asks for no value, so it must not leave a
+        // card the client would try to fill.
+        assert!(hub.list_pending().is_empty());
+    }
+
+    /// A child may only raise events in its own namespace, so a compromised CLI
+    /// cannot forge identity or secure-input lifecycle events.
+    #[tokio::test]
+    async fn notice_refuses_events_outside_the_browser_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sp.sock");
+        let (hub, events) = test_hub(socket.clone());
+        let listener = hub.bind().unwrap();
+        tokio::spawn(serve(hub.clone(), listener));
+        hub.authorize(std::process::id());
+
+        for forged in ["secure_input.resolved", "agent_id.bound", ""] {
+            let notice = json!({ "kind": "notice", "event": forged, "data": {} });
+            let (status, _) = cli_post(&socket, &notice.to_string()).await;
+            assert_eq!(status, 400, "event '{forged}' should be refused");
+        }
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

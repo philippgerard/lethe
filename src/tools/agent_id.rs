@@ -94,10 +94,69 @@ fn note_secret_collected(result: String, hosted: bool) -> String {
     value.to_string()
 }
 
+/// The event name raised when a sealed browser profile's stored session is dead.
+pub const REAUTH_EVENT: &str = "browser.reauth_required";
+
+/// Raise a re-auth card when an agent-id browser result reports a dead session.
+///
+/// agent-id sets `sessionExpired` when a navigation or authenticated request
+/// lands on a known identity-provider host or reads like a sign-in page (see
+/// `lib/session.mjs`). For a Google-SSO profile that means the one session every
+/// "Sign in with Google" site rides on is gone, and only the owner can revive it
+/// — the agent cannot, by design. The tool result is returned untouched (it
+/// already carries `action: "re_login"` for the model); this is purely the
+/// out-of-band nudge to the human, who may not be looking at the chat.
+///
+/// The hub is the agent-id event channel on both hosts: standalone Lethe puts it
+/// on `/events`, and a multiplexer forwards the name verbatim to its own stream.
+fn note_session_expired(result: String, hub: Option<&SecurePromptHub>, profile: &str) -> String {
+    let Some(hub) = hub else {
+        return result;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&result) else {
+        return result;
+    };
+    if value.get("sessionExpired").and_then(Value::as_bool) != Some(true) {
+        return result;
+    }
+    hub.emit_event(REAUTH_EVENT, reauth_payload(&value, profile));
+    result
+}
+
+/// Shape the client-facing payload. `profile` is what the owner must re-login,
+/// so it is always present even when agent-id omits it from its own result.
+fn reauth_payload(value: &Value, profile: &str) -> Value {
+    json!({
+        "profile": profile,
+        "final_url": value.get("finalUrl").and_then(Value::as_str),
+        "message": value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("The stored browser session is signed out and needs the owner to sign in again."),
+    })
+}
+
 /// Run a fast subcommand and return its JSON as the tool string.
 async fn fast(bin: Bin, sd: &Path, argv: &[String]) -> String {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     cli::run_json(bin, sd, &refs).await.to_string()
+}
+
+/// `fast` for the browser CLI, with the dead-session check applied to the result.
+/// Every page-touching verb goes through here so a profile that has been signed
+/// out is reported the first time anything notices, whichever verb noticed.
+async fn browser_fast(
+    r: &ToolRegistry<'_>,
+    sd: &Path,
+    argv: &[String],
+    profile: &str,
+) -> String {
+    note_session_expired(fast(Bin::Browser, sd, argv).await, hub_of(r), profile)
+}
+
+/// The session name a browser tool call targets; agent-id defaults to `main`.
+fn profile_of(args: &Value) -> String {
+    nonempty_string(args, "name").unwrap_or_else(|| "main".to_string())
 }
 
 /// Run a subcommand that can block on a human (secure form / headed window).
@@ -394,9 +453,20 @@ fn exec_vault_set_totp<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFutur
 fn exec_browser_login<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
         if !crate::agent_id::browser_headed_available() {
-            return err(
-                "A headed browser login needs a GUI session (none detected). Use auto_login with stored credentials instead.",
-            );
+            // Do NOT send the model to auto_login here. auto_login's own dead
+            // ends advise a headed login, so the two pointed at each other and
+            // the agent bounced between them — or asked for a password that,
+            // for an account created through "Sign in with Google", does not
+            // exist. The viewport is the one real exit.
+            return json!({
+                "error": "A headed browser login needs a GUI session, and none is available here.",
+                "action": "owner_must_drive",
+                "reason": "no_display",
+                "message": "Call alien_browser_request_viewport to ask the owner to sign in from \
+                            their device, then continue once they say they are done. Do NOT retry \
+                            headed login and do NOT ask for the password.",
+            })
+            .to_string();
         }
         let sd = state_dir_of(r);
         let mut argv = vec!["login".to_string()];
@@ -482,10 +552,15 @@ fn exec_browser_open<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<
                         "--url".to_string(),
                         url,
                         "--name".to_string(),
-                        name,
+                        name.clone(),
                     ],
                 )
                 .await;
+                if navigation.get("sessionExpired").and_then(Value::as_bool) == Some(true)
+                    && let Some(hub) = hub_of(r)
+                {
+                    hub.emit_event(REAUTH_EVENT, reauth_payload(&navigation, &name));
+                }
                 json!({
                     "ok": navigation.get("ok").and_then(Value::as_bool) == Some(true),
                     "session": ready,
@@ -495,6 +570,51 @@ fn exec_browser_open<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<
             }
             Err(message) => err(message),
         }
+    })
+}
+
+/// The event a client listens for to offer the owner the browser viewport.
+pub const VIEWPORT_EVENT: &str = "browser.viewport_requested";
+
+/// Hand the browser to the owner.
+///
+/// Some sign-ins cannot be completed by any credential — a bot challenge, or an
+/// identity provider that refuses automated entry. Before this existed the agent
+/// had no way to act on that: it could only say "please open the browser" in
+/// prose, with no card raised and no way to know if anyone did. That left the
+/// dead ends genuinely dead on a host with no display.
+fn exec_browser_request_viewport<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+    Box::pin(async move {
+        let profile = profile_of(args);
+        let reason = nonempty_string(args, "reason").unwrap_or_else(|| "owner_must_drive".into());
+        let Some(hub) = hub_of(r) else {
+            return err(
+                "No client is attached to show the browser to. Ask the owner to open Lethe on a \
+                 device with the browser view, then try again.",
+            );
+        };
+        let what = nonempty_string(args, "what_to_do").unwrap_or_else(|| {
+            "Finish the sign-in in the browser view, then come back here.".to_string()
+        });
+        hub.emit_event(
+            VIEWPORT_EVENT,
+            json!({ "profile": profile, "reason": reason, "message": what }),
+        );
+        // Non-blocking on purpose: driving a login takes minutes, and holding a
+        // tool call open for that would burn the turn's budget. The owner's
+        // reply in chat is the resume signal.
+        json!({
+            "ok": true,
+            "requested": true,
+            "profile": profile,
+            "note": format!(
+                "The owner has been shown a card asking them to open the browser view for \
+                 profile '{profile}'. Tell them what to do there in your reply and STOP — do not \
+                 poll, do not retry the login, and do not ask for a password. Continue when they \
+                 say they are done."
+            ),
+        })
+        .to_string()
     })
 }
 
@@ -547,7 +667,7 @@ fn exec_browser_act<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'
         let mut argv = vec![action];
         append_flags(&mut argv, &params);
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
-        fast(Bin::Browser, &sd, &argv).await
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
     })
 }
 
@@ -556,7 +676,7 @@ fn exec_browser_inspect_form<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> Bo
         let sd = state_dir_of(r);
         let mut argv = vec!["form-inspect".to_string()];
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
-        fast(Bin::Browser, &sd, &argv).await
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
     })
 }
 
@@ -574,7 +694,7 @@ fn exec_browser_fill_form<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFu
         };
         let mut argv = vec!["form-fill".to_string(), "--spec".to_string(), spec];
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
-        fast(Bin::Browser, &sd, &argv).await
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
     })
 }
 
@@ -631,7 +751,7 @@ fn exec_browser_fill_secret<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> Box
             argv.push("--submit".to_string());
         }
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
-        fast(Bin::Browser, &sd, &argv).await
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
     })
 }
 
@@ -909,6 +1029,17 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         execute: ToolExecutor::Async(exec_browser_open),
     },
     ToolDef {
+        name: "alien_browser_request_viewport",
+        description: "Ask the OWNER to take over the browser on their own device, and stop. Call this — and nothing else — whenever a result carries `action: \"owner_must_drive\"`: a bot challenge, or a sign-in the provider will not let an agent complete (Google/Microsoft SSO). Those cannot be solved by any stored credential, so do NOT retry the login, do NOT call alien_browser_login, and do NOT ask for a password (an account created via 'Sign in with Google' has none). Raises a card on the owner's client; they finish the sign-in there and tell you when done.",
+        params: &[
+            p_str("name", "Session name whose browser the owner should drive (default 'main')."),
+            p_str("reason", "Why a human is needed: bot_challenge, idp_refuses_automation, no_display, or device_approval."),
+            p_str("what_to_do", "One sentence telling the owner exactly what to do in the browser view, e.g. 'Sign in to Google, then close the view.'"),
+        ],
+        category: ToolCategory::AgentIdBrowser,
+        execute: ToolExecutor::Async(exec_browser_request_viewport),
+    },
+    ToolDef {
         name: "alien_browser_close",
         description: "Close a running browser session; the profile is re-sealed into the vault and the working copy wiped.",
         params: &[p_str("name", "Session name (default 'main').")],
@@ -1103,5 +1234,249 @@ mod tests {
         // No path separators or parent refs survive.
         let slug = sanitize_session_name("..\\..\\win");
         assert!(!slug.contains('/') && !slug.contains('\\') && !slug.contains(".."));
+    }
+}
+
+/// End-to-end over the agent-id CLI seam: a browser tool call whose result says
+/// the sealed profile is signed out must raise `browser.reauth_required` on the
+/// agent-id event channel. The real CLI is replaced by a stub script through
+/// `AGENT_ID_BROWSER_BIN`, so this runs with no Chrome, no vault, and no network.
+#[cfg(test)]
+mod browser_reauth_tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{REAUTH_EVENT, reauth_payload};
+    use crate::agent_id::secure_prompt::{Emit, SecurePromptHub};
+    use crate::memory::MemoryStore;
+    use crate::tools::registry::{ToolRegistry, ToolRuntime};
+    use crate::tools::shell::ShellTools;
+
+    type Events = Arc<StdMutex<Vec<(String, Value)>>>;
+
+    /// `AGENT_ID_BROWSER_BIN` is process-global, so the tests that install a stub
+    /// binary must not run concurrently with each other.
+    static BIN_ENV: StdMutex<()> = StdMutex::new(());
+
+    const EXPIRED: &str = r#"{"ok":true,"sessionExpired":true,"action":"re_login","message":"Session looks logged out (landed on https://accounts.google.com/signin).","finalUrl":"https://accounts.google.com/signin","httpStatus":200,"title":"Sign in","loggedOut":true,"text":"Sign in to continue"}"#;
+
+    const LIVE: &str = r#"{"ok":true,"sessionExpired":false,"finalUrl":"https://app.example.com/inbox","httpStatus":200,"title":"Inbox","loggedOut":false,"text":"signed in"}"#;
+
+    /// Write a stub that prints `payload` as the CLI's single stdout JSON object.
+    fn stub_browser_bin(dir: &TempDir, payload: &str) -> std::path::PathBuf {
+        let path = dir.path().join("fake-agent-id-browser");
+        std::fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{payload}\nEOF\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn capturing_hub(dir: &TempDir) -> (SecurePromptHub, Events) {
+        let events: Events = Arc::new(StdMutex::new(Vec::new()));
+        let sink = events.clone();
+        let emit: Emit = Arc::new(move |event: &str, data| {
+            sink.lock().unwrap().push((event.to_string(), data));
+        });
+        // Never bound: this path runs `run_json`, which needs no prompt socket.
+        (
+            SecurePromptHub::new(dir.path().join("secure-prompt.sock"), emit),
+            events,
+        )
+    }
+
+    /// Run `alien_browser_act` against a stub CLI and return (result, events).
+    async fn act_against_stub(payload: &str, args: Value) -> (String, Vec<(String, Value)>) {
+        let _guard = BIN_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = stub_browser_bin(&tmp, payload);
+        // SAFETY: serialized by BIN_ENV; `find_bin` is the only reader.
+        unsafe { std::env::set_var("AGENT_ID_BROWSER_BIN", &bin) };
+
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+        let (hub, events) = capturing_hub(&tmp);
+        let runtime = ToolRuntime {
+            secure_prompt: Some(hub),
+            agent_id_state_dir: Some(tmp.path().join("agent-id")),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            runtime,
+        );
+        let result = registry.execute_async("alien_browser_act", &args).await;
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    #[tokio::test]
+    async fn signed_out_profile_raises_a_reauth_event_naming_the_profile() {
+        let (result, events) = act_against_stub(
+            EXPIRED,
+            json!({
+                "action": "read",
+                "name": "google",
+                "params": { "url": "https://app.example.com/inbox" }
+            }),
+        )
+        .await;
+
+        let reauth: Vec<_> = events.iter().filter(|(e, _)| e == REAUTH_EVENT).collect();
+        assert_eq!(reauth.len(), 1, "expected one {REAUTH_EVENT}, got {events:?}");
+        let data = &reauth[0].1;
+        // The client needs to know WHICH login to redo.
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));
+        assert_eq!(
+            data.get("final_url").and_then(Value::as_str),
+            Some("https://accounts.google.com/signin")
+        );
+        assert!(
+            data.get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("logged out"))
+        );
+
+        // The tool result reaches the model unchanged, carrying `re_login`.
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("action").and_then(Value::as_str),
+            Some("re_login")
+        );
+        assert_eq!(
+            parsed.get("sessionExpired").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_session_raises_nothing() {
+        let (result, events) = act_against_stub(
+            LIVE,
+            json!({ "action": "page-text", "name": "google", "params": {} }),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "a live session must stay silent, got {events:?}"
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("title").and_then(Value::as_str), Some("Inbox"));
+    }
+
+    /// The escalation exit: a result carrying `owner_must_drive` has exactly one
+    /// next move, and it raises a card rather than leaving the agent to ask for
+    /// a password that an SSO-only account does not have.
+    #[tokio::test]
+    async fn requesting_the_viewport_raises_a_card_naming_the_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+        let (hub, events) = capturing_hub(&tmp);
+        let runtime = ToolRuntime {
+            secure_prompt: Some(hub),
+            agent_id_state_dir: Some(tmp.path().join("agent-id")),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            runtime,
+        );
+
+        let result = registry
+            .execute_async(
+                "alien_browser_request_viewport",
+                &json!({
+                    "name": "google",
+                    "reason": "idp_refuses_automation",
+                    "what_to_do": "Sign in to Google, then close the view.",
+                }),
+            )
+            .await;
+
+        let captured = events.lock().unwrap().clone();
+        let (name, data) = captured.first().expect("a card was raised").clone();
+        assert_eq!(name, super::VIEWPORT_EVENT);
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("idp_refuses_automation")
+        );
+        assert_eq!(
+            data.get("message").and_then(Value::as_str),
+            Some("Sign in to Google, then close the view.")
+        );
+
+        // The model must be told to stop, or it retries the login it cannot win.
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let note = parsed.get("note").and_then(Value::as_str).unwrap();
+        assert!(note.contains("STOP"));
+        assert!(note.contains("do not ask for a password"));
+    }
+
+    /// With nothing attached there is no one to show a browser to, and saying so
+    /// beats raising a card into the void.
+    #[tokio::test]
+    async fn requesting_the_viewport_without_a_client_is_an_honest_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            ToolRuntime::default(),
+        );
+        let result = registry
+            .execute_async("alien_browser_request_viewport", &json!({}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("No client"))
+        );
+    }
+
+    #[test]
+    fn payload_defaults_the_message_when_agent_id_omits_it() {
+        let data = reauth_payload(&json!({ "sessionExpired": true }), "main");
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("main"));
+        assert!(data.get("final_url").unwrap().is_null());
+        assert!(
+            data.get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("sign in again"))
+        );
     }
 }
