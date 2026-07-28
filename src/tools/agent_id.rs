@@ -1006,7 +1006,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_auto_login",
-        description: "Headlessly log in using a stored `login` credential (username + password + 2FA policy) and SEAL the resulting signed-in session into a browser-profile for reuse. Public browsing does not require this: alien_browser_open auto-creates the anonymous default profile. Use auto-login only when the task actually needs an account. Requires the login credential to have a login_url (set it on vault_add). 2FA is answered from a stored TOTP seed, or via a secure prompt to the owner.",
+        description: "Headlessly log in using a stored `login` credential (username + password + 2FA policy) and SEAL the resulting signed-in session into a browser-profile for reuse. Public browsing does not require this: alien_browser_open auto-creates the anonymous default profile. Use auto-login only when the task actually needs an account and no connected-account API operation already covers it. Requires the login credential to have a login_url (set it on vault_add). 2FA is answered from a stored TOTP seed, or via a secure prompt to the owner.",
         params: &[
             p_str_req("cred", "Name of a `login` credential in the vault."),
             p_str(
@@ -1019,7 +1019,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_open",
-        description: "Start the persistent Alien browser and optionally navigate in the same call. The shared `main` profile is created automatically as an anonymous L0 profile on first use, so public pages need no login/setup. Returns once ready; use the typed form tools for forms and alien_browser_act for other actions.",
+        description: "Start the persistent Alien browser and optionally navigate in the same call. When MCP or API operations covering the task are available (e.g. connectors_search / connectors_execute on deployments that have them), prefer them over the browser: they call the service's API directly and are faster and more reliable than driving web pages — browse only for what no operation covers. The shared `main` profile is created automatically as an anonymous L0 profile on first use, so public pages need no login/setup. Returns once ready; use the typed form tools for forms and alien_browser_act for other actions.",
         params: &[
             p_str("name", "Session name (default 'main'). Only 'main' auto-creates; any other name must match a profile sealed by alien_browser_login/auto_login, else open fails with NO_PROFILE. For public browsing omit this."),
             p_str("url", "Optional http(s) URL to open immediately."),
