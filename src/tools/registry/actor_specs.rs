@@ -6,7 +6,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::actor::{ActorState, ActorToolCommand, Outcome, SpawnReport, SpawnSubagent};
+use crate::actor::{
+    ActorCompletionDelivery, ActorState, ActorToolCommand, Outcome, SpawnReport, SpawnSubagent,
+};
 use crate::llm::truncate::truncate_with_ellipsis;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::args::{
@@ -221,6 +223,7 @@ async fn spawn_chain(registry: &ToolRegistry<'_>, args: &Value) -> String {
                 tools: tools.clone(),
                 model: model.clone(),
                 max_turns,
+                completion_delivery: ActorCompletionDelivery::ParentMessage,
             })
             .await;
         let child_id = match spawn {

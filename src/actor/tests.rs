@@ -57,6 +57,21 @@ fn event_bus_keeps_only_recent_events() {
     assert_eq!(bus.query(None, Some("a"), None, 10).len(), 1);
 }
 
+#[test]
+fn actor_config_without_completion_delivery_defaults_to_parent_message() {
+    let mut encoded = serde_json::to_value(ActorConfig::new("worker", "Do work")).unwrap();
+    encoded
+        .as_object_mut()
+        .unwrap()
+        .remove("completion_delivery");
+
+    let decoded: ActorConfig = serde_json::from_value(encoded).unwrap();
+    assert_eq!(
+        decoded.completion_delivery,
+        ActorCompletionDelivery::ParentMessage
+    );
+}
+
 fn registry_with_principal_and_worker() -> (ActorRegistry, String, String) {
     let mut registry = ActorRegistry::new();
     let principal = registry.spawn(
@@ -319,6 +334,47 @@ fn actor_state_survives_simulated_process_restart() {
 }
 
 #[test]
+fn restored_poll_only_actor_falls_back_to_parent_delivery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_path = tmp.path().join("actors.db");
+    let worker_id;
+
+    {
+        let mut registry = ActorRegistry::new();
+        registry.set_store(ActorStore::open(&store_path).unwrap());
+        let principal = registry.spawn(
+            ActorConfig::new("cortex", "Serve the user").in_group("main"),
+            None,
+            true,
+        );
+        let mut config =
+            ActorConfig::new("research-hyp-test", "Investigate one hypothesis").in_group("main");
+        config.completion_delivery = ActorCompletionDelivery::PollOnly;
+        worker_id = registry.spawn(config, Some(&principal), false);
+    }
+
+    let mut registry = ActorRegistry::new();
+    registry.set_store(ActorStore::open(&store_path).unwrap());
+    let principal = registry.spawn(
+        ActorConfig::new("cortex", "Serve the user").in_group("main"),
+        None,
+        true,
+    );
+    assert_eq!(registry.restore_unfinished(&principal), 1);
+    assert_eq!(
+        registry.get(&worker_id).unwrap().config.completion_delivery,
+        ActorCompletionDelivery::ParentMessage
+    );
+
+    registry
+        .terminate(&worker_id, Outcome::Success, "restored research result")
+        .unwrap();
+    let completion = registry.pop_inbox(&principal).unwrap();
+    assert_eq!(completion.intent, MessageIntent::Done);
+    assert!(completion.content.contains("restored research result"));
+}
+
+#[test]
 fn registry_spawns_discovers_and_cleans_terminated_actors() {
     let (mut registry, principal, worker) = registry_with_principal_and_worker();
 
@@ -459,6 +515,59 @@ fn termination_and_kill_notify_parent_once() {
 }
 
 #[test]
+fn poll_only_completion_keeps_result_without_notifying_parent() {
+    let (mut registry, principal, _worker) = registry_with_principal_and_worker();
+    let report = registry
+        .spawn_child_for_actor(
+            &principal,
+            ActorSpawnRequest {
+                name: "research-framer-test",
+                goals: "Frame a research question",
+                group: None,
+                tools: "",
+                model: "aux",
+                max_turns: 4,
+                completion_delivery: ActorCompletionDelivery::PollOnly,
+            },
+        )
+        .unwrap();
+    let actor_id = report.actor_id().unwrap().to_string();
+    let prompt = registry.build_system_prompt(&actor_id).unwrap();
+    assert!(prompt.contains("synchronously polling your actor state"));
+    assert!(prompt.contains("Do not send messages to your parent"));
+
+    assert!(
+        registry
+            .terminate(&actor_id, Outcome::Success, r#"{"hypotheses":["a","b"]}"#)
+            .unwrap()
+    );
+
+    let info = registry.get(&actor_id).unwrap().info();
+    assert_eq!(info.state, ActorState::Terminated);
+    assert_eq!(info.outcome, Some(Outcome::Success));
+    assert_eq!(info.result.as_deref(), Some(r#"{"hypotheses":["a","b"]}"#));
+    assert!(
+        registry.pop_inbox(&principal).is_none(),
+        "poll-only completion must not enqueue a parent message"
+    );
+    assert!(
+        registry
+            .events
+            .query(Some("actor_message"), Some(&actor_id), Some("main"), 10)
+            .is_empty(),
+        "poll-only completion must not emit an actor_message wake"
+    );
+    assert_eq!(
+        registry
+            .events
+            .query(Some("actor_terminated"), Some(&actor_id), Some("main"), 10)
+            .len(),
+        1,
+        "the actor lifecycle event remains available"
+    );
+}
+
+#[test]
 fn task_state_transitions_are_validated() {
     let (mut registry, _principal, worker) = registry_with_principal_and_worker();
 
@@ -540,6 +649,7 @@ fn actor_tool_methods_spawn_discover_send_and_ping() {
                 tools: "read_file,write_file",
                 model: "main",
                 max_turns: 10,
+                completion_delivery: ActorCompletionDelivery::ParentMessage,
             },
         )
         .unwrap();
@@ -558,6 +668,7 @@ fn actor_tool_methods_spawn_discover_send_and_ping() {
                 tools: "",
                 model: "aux",
                 max_turns: 20,
+                completion_delivery: ActorCompletionDelivery::ParentMessage,
             },
         )
         .unwrap();
@@ -710,6 +821,87 @@ async fn runtime_returns_principal_task_update_events() {
         Some(&json!("progress"))
     );
     assert_eq!(events[1].event.payload.get("intent"), Some(&json!("done")));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event.payload.get("parent_wake") == Some(&json!(true)))
+    );
+}
+
+#[tokio::test]
+async fn runtime_suppresses_poll_only_parent_task_update_wakes() {
+    let mut registry = ActorRegistry::new();
+    let principal = registry.spawn(
+        ActorConfig::new("cortex", "Serve the user").in_group("main"),
+        None,
+        true,
+    );
+    let mut config =
+        ActorConfig::new("research-hyp-test", "Investigate a hypothesis").in_group("main");
+    config.completion_delivery = ActorCompletionDelivery::PollOnly;
+    let worker = registry.spawn(config, Some(&principal), false);
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("channel".to_string(), json!("task_update"));
+    metadata.insert("kind".to_string(), json!("progress"));
+    registry
+        .send_to(
+            &worker,
+            &principal,
+            "Still researching",
+            None,
+            metadata,
+            None,
+        )
+        .unwrap();
+    let mut alert_metadata = serde_json::Map::new();
+    alert_metadata.insert("channel".to_string(), json!("user_notify"));
+    alert_metadata.insert("kind".to_string(), json!("alert"));
+    registry
+        .send_to(
+            &worker,
+            &principal,
+            "Research alert that must stay internal",
+            None,
+            alert_metadata,
+            None,
+        )
+        .unwrap();
+    assert!(
+        registry.pop_inbox(&principal).is_none(),
+        "poll-only messages must not leak into the parent context"
+    );
+    registry
+        .terminate(&worker, Outcome::Success, "pollable result")
+        .unwrap();
+
+    let emitted = registry
+        .events
+        .query(Some("actor_message"), Some(&worker), Some("main"), 10);
+    assert_eq!(emitted.len(), 2, "explicit messages remain as audit events");
+    assert!(
+        emitted
+            .iter()
+            .all(|event| event.payload.get("parent_wake") == Some(&json!(false)))
+    );
+    assert!(
+        registry
+            .events
+            .query(Some("user_notify"), Some(&worker), Some("main"), 10)
+            .is_empty(),
+        "poll-only actors must not bypass the parent through user notifications"
+    );
+
+    let runtime = ActorRuntime::new(registry);
+    assert!(
+        runtime
+            .principal_task_update_events(&principal, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let info = runtime.actor_info(&worker).await.unwrap();
+    assert_eq!(info.state, ActorState::Terminated);
+    assert_eq!(info.result.as_deref(), Some("pollable result"));
 }
 
 #[tokio::test]

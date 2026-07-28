@@ -421,11 +421,16 @@ fn history_entry_to_item(value: Value) -> Option<TranscriptItem> {
         return None;
     }
     let metadata = value.get("metadata");
-    let visibility = metadata
+    let typed_visibility = metadata
         .and_then(|m| m.get("lethe_visibility"))
-        .and_then(Value::as_str)
-        .unwrap_or("user_visible");
-    if visibility == "internal" {
+        .and_then(Value::as_str);
+    if typed_visibility == Some("internal") {
+        return None;
+    }
+    let legacy_source = metadata
+        .and_then(|m| m.get("source"))
+        .and_then(Value::as_str);
+    if typed_visibility.is_none() && legacy_source == Some("actor_update") {
         return None;
     }
     let kind = metadata
@@ -633,6 +638,38 @@ mod tests {
         match item {
             TranscriptItem::Assistant { content, .. } => {
                 assert_eq!(content, "How was your meeting with Katie?");
+            }
+            _ => panic!("expected assistant transcript item"),
+        }
+    }
+
+    #[test]
+    fn history_hides_legacy_actor_update_rows_but_keeps_typed_delivery() {
+        let legacy = history_entry_to_item(serde_json::json!({
+            "role": "assistant",
+            "content": "ok",
+            "created_at": "2026-07-23T08:00:00Z",
+            "metadata": {
+                "source": "actor_update"
+            }
+        }));
+        assert!(legacy.is_none());
+
+        let delivered = history_entry_to_item(serde_json::json!({
+            "role": "assistant",
+            "content": "The background task finished.",
+            "created_at": "2026-07-23T08:00:00Z",
+            "metadata": {
+                "lethe_visibility": "user_visible",
+                "lethe_message_kind": "proactive",
+                "lethe_source": "actor_update"
+            }
+        }))
+        .expect("delivered actor update should stay in the transcript");
+
+        match delivered {
+            TranscriptItem::Assistant { content, .. } => {
+                assert_eq!(content, "The background task finished.");
             }
             _ => panic!("expected assistant transcript item"),
         }

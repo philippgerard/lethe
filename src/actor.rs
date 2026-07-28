@@ -59,6 +59,36 @@ pub enum TaskState {
     Done,
 }
 
+/// How an actor communicates with its parent.
+///
+/// Most subagents notify their parent immediately. Synchronous orchestrators
+/// such as the `research` tool poll [`ActorInfo`] themselves, so their
+/// implementation actors use `PollOnly` to suppress parent messages and avoid
+/// generating additional user-facing turns for the same work.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorCompletionDelivery {
+    #[default]
+    ParentMessage,
+    PollOnly,
+}
+
+impl ActorCompletionDelivery {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentMessage => "parent_message",
+            Self::PollOnly => "poll_only",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Self {
+        match value {
+            "poll_only" => Self::PollOnly,
+            _ => Self::ParentMessage,
+        }
+    }
+}
+
 /// Why an actor stopped running. Set on every termination so callers (the
 /// chain runner, the parent-notification path, the user-facing actor info)
 /// never have to parse the result text to learn the verdict.
@@ -298,6 +328,8 @@ pub struct ActorConfig {
     pub max_turns: usize,
     pub max_messages: usize,
     pub persistent: bool,
+    #[serde(default)]
+    pub completion_delivery: ActorCompletionDelivery,
 }
 
 impl ActorConfig {
@@ -311,6 +343,7 @@ impl ActorConfig {
             max_turns: 20,
             max_messages: 50,
             persistent: false,
+            completion_delivery: ActorCompletionDelivery::default(),
         }
     }
 
@@ -341,6 +374,7 @@ pub struct ActorSpawnRequest<'a> {
     pub tools: &'a str,
     pub model: &'a str,
     pub max_turns: usize,
+    pub completion_delivery: ActorCompletionDelivery,
 }
 
 /// Typed result of a spawn attempt. Callers that need the new actor id read
@@ -385,6 +419,8 @@ pub struct ActorRunSpec {
     pub model: ModelTier,
     pub has_pending_messages: bool,
     pub requested_tools: Vec<String>,
+    #[serde(default)]
+    pub completion_delivery: ActorCompletionDelivery,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
