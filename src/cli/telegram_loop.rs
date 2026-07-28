@@ -43,6 +43,23 @@ const TELEGRAM_ACTOR_UPDATE_POLL_SECONDS: u64 = 1;
 const TELEGRAM_ACTOR_UPDATE_QUERY_LIMIT: usize = 50;
 const CONSUMED_CALLBACK_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Serializes user-facing cortex turns for this Telegram agent.
+///
+/// The conversation manager owns interactive turn batching, while the actor
+/// monitor can initiate a synthetic turn independently. Sharing this gate
+/// prevents those two paths from entering the shared `Agent::chat_once`
+/// concurrently, including when more than one chat is allowed.
+#[derive(Clone, Debug, Default)]
+struct TelegramTurnCoordinator {
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl TelegramTurnCoordinator {
+    fn gate(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.gate.clone()
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TelegramCommand {
     /// Split a response into Telegram message chunks without sending it.
@@ -195,11 +212,13 @@ pub async fn run_telegram_with_agent(
     let conversation_manager = ConversationManager::new(std::time::Duration::from_secs_f64(
         settings.background.debounce_seconds.max(0.0),
     ));
+    let turn_coordinator = TelegramTurnCoordinator::default();
     let process_callback = telegram_process_callback(
         client.clone(),
         agent.clone(),
         settings.clone(),
         options.clone(),
+        turn_coordinator.clone(),
     );
     let mut offset = None;
     let mut target_chat_id = settings.telegram.allowed_user_ids.first().copied();
@@ -210,6 +229,8 @@ pub async fn run_telegram_with_agent(
         settings.clone(),
         options.clone(),
         target_chat_id_state.clone(),
+        conversation_manager.clone(),
+        turn_coordinator,
     );
 
     // An unbound Telegram transport cannot deliver proactive messages yet.
@@ -557,13 +578,17 @@ fn telegram_process_callback(
     agent: Arc<Agent>,
     settings: Settings,
     options: AgentOptions,
+    turn_coordinator: TelegramTurnCoordinator,
 ) -> ProcessCallback {
     Arc::new(move |context: ProcessContext| {
         let client = client.clone();
         let agent = agent.clone();
         let settings = settings.clone();
         let options = options.clone();
+        let turn_coordinator = turn_coordinator.clone();
         Box::pin(async move {
+            let turn_gate = turn_coordinator.gate();
+            let _turn_lease = turn_gate.lock().await;
             if context.interrupt.is_interrupted() {
                 return Ok(());
             }
@@ -859,6 +884,8 @@ fn spawn_telegram_actor_update_monitor(
     settings: Settings,
     options: AgentOptions,
     target_chat_id: Arc<AtomicI64>,
+    conversation_manager: ConversationManager,
+    turn_coordinator: TelegramTurnCoordinator,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let actor_runtime = agent.actor_registry()?;
     let principal_actor_id = agent.principal_actor_id()?.to_string();
@@ -874,6 +901,13 @@ fn spawn_telegram_actor_update_monitor(
             if chat_id == 0 {
                 continue;
             }
+            // The interactive conversation loop owns the user-facing turn.
+            // Actor completions remain queryable on the event bus, so leave
+            // them unprocessed until that turn (and any follow-up debounce)
+            // finishes instead of launching a competing cortex `chat_once`.
+            if telegram_conversation_is_busy(&conversation_manager, chat_id).await {
+                continue;
+            }
             let events = match actor_runtime
                 .principal_task_update_events(
                     &principal_actor_id,
@@ -887,14 +921,21 @@ fn spawn_telegram_actor_update_monitor(
                     continue;
                 }
             };
-            let fresh_events = events
-                .into_iter()
-                .filter(|event| processed_event_ids.insert(event.event.id.clone()))
-                .collect::<Vec<_>>();
+            // Acquire the same process-wide Telegram turn gate used by the
+            // interactive callback. Re-checking the manager after acquisition
+            // gives an already-queued user turn priority; holding the gate
+            // then makes overlap impossible even if a user message arrives
+            // immediately after this check.
+            let turn_gate = turn_coordinator.gate();
+            let _turn_lease = turn_gate.lock().await;
+            if telegram_conversation_is_busy(&conversation_manager, chat_id).await {
+                continue;
+            }
+            let fresh_events = unprocessed_actor_updates(events, &processed_event_ids);
             if fresh_events.is_empty() {
                 continue;
             }
-            if let Err(error) = process_telegram_actor_updates(
+            let result = process_telegram_actor_updates(
                 &client,
                 &agent,
                 &settings,
@@ -902,12 +943,43 @@ fn spawn_telegram_actor_update_monitor(
                 chat_id,
                 &fresh_events,
             )
-            .await
-            {
+            .await;
+            acknowledge_actor_update_batch(&mut processed_event_ids, &fresh_events, result.is_ok());
+            if let Err(error) = result {
+                // Leave the ids unacknowledged so a transient model,
+                // network, or Telegram failure before delivery can be retried.
                 tracing::warn!(error = %error, "actor update cortex turn failed");
             }
         }
     }))
+}
+
+fn unprocessed_actor_updates(
+    events: Vec<ActorNamedEvent>,
+    processed_event_ids: &HashSet<String>,
+) -> Vec<ActorNamedEvent> {
+    events
+        .into_iter()
+        .filter(|event| !processed_event_ids.contains(&event.event.id))
+        .collect()
+}
+
+fn acknowledge_actor_update_batch(
+    processed_event_ids: &mut HashSet<String>,
+    updates: &[ActorNamedEvent],
+    succeeded: bool,
+) {
+    if succeeded {
+        processed_event_ids.extend(updates.iter().map(|event| event.event.id.clone()));
+    }
+}
+
+async fn telegram_conversation_is_busy(
+    conversation_manager: &ConversationManager,
+    chat_id: i64,
+) -> bool {
+    conversation_manager.is_processing(chat_id).await
+        || conversation_manager.is_debouncing(chat_id).await
 }
 
 async fn process_telegram_actor_updates(
@@ -918,17 +990,7 @@ async fn process_telegram_actor_updates(
     chat_id: i64,
     updates: &[ActorNamedEvent],
 ) -> Result<()> {
-    let guard = Arc::new(Mutex::new(TelegramTurnGuard::new()));
     let runtime = ToolRuntime {
-        telegram: Some(TelegramToolContext {
-            token: settings.telegram.bot_token.clone(),
-            chat_id,
-            user_id: None,
-            last_message_id: None,
-            guard: Some(guard.clone()),
-            dry_run: false,
-            sent_messages: Some(client.sent_message_log()),
-        }),
         observer: Some(Arc::new(TelegramTypingObserver::new(
             settings.telegram.bot_token.clone(),
             chat_id,
@@ -962,23 +1024,82 @@ async fn process_telegram_actor_updates(
     // Anything else is forwarded. This is a sentinel contract, not pattern
     // matching arbitrary acknowledgments.
     let is_idle_ack = response.trim().eq_ignore_ascii_case("ok");
-    if !is_idle_ack {
-        send_guarded_telegram_final_response(client, chat_id, &response, guard).await?;
-    }
-    if !response.trim().is_empty() {
-        agent.memory().messages.add(
-            MessageRole::Assistant,
-            &response,
-            Some(json!({
-                "source": "actor_update",
-                "actor_event_ids": updates
+    let final_text_delivered = if is_idle_ack {
+        false
+    } else {
+        send_telegram_actor_update_response(client, chat_id, &response).await?
+    };
+    // Synthetic requests are intentionally excluded from normal history.
+    // Persist a companion assistant row only when this exact final text was
+    // actually delivered. In particular, do not retain the idle `ok`
+    // sentinel or a response whose multi-chunk delivery was incomplete.
+    if final_text_delivered {
+        let mut metadata = serde_json::Map::new();
+        annotate_map(
+            &mut metadata,
+            MessageVisibility::UserVisible,
+            MessageKind::Proactive,
+            "actor_update",
+        );
+        metadata.insert(
+            "actor_event_ids".to_string(),
+            json!(
+                updates
                     .iter()
                     .map(|update| update.event.id.clone())
-                    .collect::<Vec<_>>(),
-            })),
-        )?;
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if let Err(error) = agent.memory().messages.add(
+            MessageRole::Assistant,
+            &response,
+            Some(serde_json::Value::Object(metadata)),
+        ) {
+            // The user already received this response. A local history failure
+            // must not cause the actor event to be retried and delivered twice.
+            tracing::warn!(error = %error, "failed to persist delivered actor update");
+        }
     }
     Ok(())
+}
+
+/// Deliver a generated actor update without retrying a partially-sent batch.
+///
+/// Once any Telegram chunk is visible, replaying the event could duplicate
+/// that chunk. A failure before the first chunk remains retryable; a later
+/// failure is logged and treated as consumed (and is not persisted as a
+/// complete transcript row).
+async fn send_telegram_actor_update_response(
+    client: &TelegramClient,
+    chat_id: i64,
+    response: &str,
+) -> Result<bool> {
+    let chunks = split_telegram_messages(response);
+    if chunks.is_empty() {
+        return Ok(false);
+    }
+    let total = chunks.len();
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        if let Err(error) = client.send_message(chat_id, &chunk).await {
+            if index == 0 {
+                return Err(error.into());
+            }
+            tracing::warn!(
+                chat_id,
+                delivered_chunks = index,
+                total_chunks = total,
+                error = %error,
+                "actor update partially delivered; consuming event to avoid duplicate retry"
+            );
+            return Ok(false);
+        }
+        if index + 1 < total {
+            let delay = telegram_inter_message_delay(&chunk);
+            let _ = client.send_chat_action(chat_id, "typing").await;
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Ok(true)
 }
 
 fn actor_update_synthetic_message(updates: &[ActorNamedEvent]) -> String {
@@ -1532,6 +1653,91 @@ fn telegram_inter_message_delay(chunk: &str) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn actor_updates_wait_for_an_interactive_conversation_turn() {
+        let manager = ConversationManager::new(Duration::ZERO);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let callback: ProcessCallback = {
+            let started = started.clone();
+            let release = release.clone();
+            Arc::new(move |_context: ProcessContext| {
+                let started = started.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(())
+                })
+            })
+        };
+
+        manager
+            .add_message(42, 7, "research this", None, Some(callback))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("interactive turn started");
+
+        assert!(telegram_conversation_is_busy(&manager, 42).await);
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while telegram_conversation_is_busy(&manager, 42).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interactive turn finished");
+    }
+
+    #[tokio::test]
+    async fn telegram_turn_coordinator_serializes_shared_agent_turns() {
+        let coordinator = TelegramTurnCoordinator::default();
+        let first_gate = coordinator.gate();
+        let second_gate = coordinator.gate();
+        assert!(Arc::ptr_eq(&first_gate, &second_gate));
+
+        let first_lease = first_gate.lock().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), second_gate.lock())
+                .await
+                .is_err(),
+            "a second turn for the shared agent must wait"
+        );
+        drop(first_lease);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), second_gate.lock())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn actor_update_batch_is_acknowledged_only_after_success() {
+        fn named_event(id: &str) -> ActorNamedEvent {
+            let mut event = lethe::actor::ActorEvent::new("actor_message", "worker");
+            event.id = id.to_string();
+            ActorNamedEvent {
+                event,
+                actor_name: "worker".to_string(),
+            }
+        }
+
+        let events = vec![named_event("one"), named_event("two")];
+        let mut processed = HashSet::new();
+        acknowledge_actor_update_batch(&mut processed, &events, false);
+        assert!(processed.is_empty(), "failed work must remain retryable");
+        assert_eq!(
+            unprocessed_actor_updates(events.clone(), &processed).len(),
+            2
+        );
+
+        acknowledge_actor_update_batch(&mut processed, &events, true);
+        assert_eq!(processed.len(), 2);
+        assert!(unprocessed_actor_updates(events, &processed).is_empty());
+    }
 
     #[test]
     fn brainstem_subscription_waits_until_a_target_chat_is_known() {

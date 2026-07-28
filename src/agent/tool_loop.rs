@@ -955,6 +955,17 @@ pub(super) fn actor_turn_instruction(spec: &ActorRunSpec) -> String {
     } else {
         "No pending inbox messages are visible beyond the actor context."
     };
+    if spec.completion_delivery == crate::actor::ActorCompletionDelivery::PollOnly {
+        let action = if spec.turn_number == 1 {
+            "Begin your actor task now."
+        } else {
+            "Continue your actor task."
+        };
+        return format!(
+            "{action} {inbox}\nThe caller is polling your actor state. Do not send messages to your parent; call terminate(...) with the final result when done. This is turn {}/{}.",
+            spec.turn_number, spec.max_turns
+        );
+    }
     if spec.turn_number == 1 {
         format!(
             "Begin your actor task now. {inbox}\nUse tools as needed. If you finish, call terminate(result=..., outcome=\"success\"). This is turn {}/{}.",

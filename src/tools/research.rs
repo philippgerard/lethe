@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::actor::{ActorState, Outcome, SpawnReport, SpawnSubagent};
+use crate::actor::{ActorCompletionDelivery, ActorState, Outcome, SpawnReport, SpawnSubagent};
 use crate::tools::registry::ActorToolContext;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::args::{string_arg, string_arg_default, usize_arg};
@@ -25,6 +25,26 @@ const JUDGE_MAX_TURNS: usize = 6;
 const JUDGE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 const DEPTH_VALUES: &[&str] = &["shallow", "deep"];
 const MISSING_ACTOR_CONTEXT: &str = "Error: research tool only works inside an actor.";
+
+fn research_actor_request(
+    actor_id: &str,
+    name: String,
+    goals: String,
+    tools: &str,
+    model: &str,
+    max_turns: usize,
+) -> SpawnSubagent {
+    SpawnSubagent {
+        actor_id: actor_id.to_string(),
+        name,
+        goals,
+        group: None,
+        tools: tools.to_string(),
+        model: model.to_string(),
+        max_turns,
+        completion_delivery: ActorCompletionDelivery::PollOnly,
+    }
+}
 
 fn exec_research<'a>(
     registry: &'a ToolRegistry<'a>,
@@ -91,15 +111,14 @@ async fn execute_research(registry: &ToolRegistry<'_>, args: &Value) -> String {
         let name = format!("research-hyp-{}-{session_id}", index + 1);
         let spawn = context
             .runtime
-            .spawn_subagent(SpawnSubagent {
-                actor_id: context.actor_id.clone(),
-                name: name.clone(),
+            .spawn_subagent(research_actor_request(
+                &context.actor_id,
+                name.clone(),
                 goals,
-                group: None,
-                tools: "web_search,fetch_webpage".to_string(),
-                model: "aux".to_string(),
-                max_turns: max_turns_per_hyp,
-            })
+                "web_search,fetch_webpage",
+                "aux",
+                max_turns_per_hyp,
+            ))
             .await;
         match spawn {
             Ok(SpawnReport::Spawned { actor_id, .. }) => child_ids.push(actor_id),
@@ -163,15 +182,14 @@ async fn execute_research(registry: &ToolRegistry<'_>, args: &Value) -> String {
     let judge_name = format!("research-judge-{session_id}");
     let spawn = context
         .runtime
-        .spawn_subagent(SpawnSubagent {
-            actor_id: context.actor_id.clone(),
-            name: judge_name,
-            goals: judge_goals,
-            group: None,
-            tools: String::new(),
-            model: "main".to_string(),
-            max_turns: JUDGE_MAX_TURNS,
-        })
+        .spawn_subagent(research_actor_request(
+            &context.actor_id,
+            judge_name,
+            judge_goals,
+            "",
+            "main",
+            JUDGE_MAX_TURNS,
+        ))
         .await;
     let judge_id = match spawn {
         Ok(SpawnReport::Spawned { actor_id, .. }) => actor_id,
@@ -201,15 +219,14 @@ async fn generate_hypotheses(
     let name = format!("research-framer-{session_id}");
     let spawn = context
         .runtime
-        .spawn_subagent(SpawnSubagent {
-            actor_id: context.actor_id.clone(),
+        .spawn_subagent(research_actor_request(
+            &context.actor_id,
             name,
             goals,
-            group: None,
-            tools: String::new(),
-            model: "aux".to_string(),
-            max_turns: FRAMER_MAX_TURNS,
-        })
+            "",
+            "aux",
+            FRAMER_MAX_TURNS,
+        ))
         .await;
     let framer_id = match spawn {
         Ok(SpawnReport::Spawned { actor_id, .. }) => actor_id,
@@ -296,3 +313,25 @@ pub const TOOL_DEFS: &[ToolDef] = &[ToolDef {
     category: ToolCategory::CortexOnly,
     execute: ToolExecutor::Async(exec_research),
 }];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn research_actors_use_poll_only_completion_delivery() {
+        let request = research_actor_request(
+            "cortex",
+            "research-framer-test".to_string(),
+            "Frame the question".to_string(),
+            "",
+            "aux",
+            4,
+        );
+
+        assert_eq!(
+            request.completion_delivery,
+            ActorCompletionDelivery::PollOnly
+        );
+    }
+}

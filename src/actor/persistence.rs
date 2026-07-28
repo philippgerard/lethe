@@ -18,7 +18,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
 use super::helpers::{intent_model_name, parse_model_tier, parse_task_state};
-use super::{Actor, ActorConfig, ActorError, ActorResult, ActorState, TaskState};
+use super::{
+    Actor, ActorCompletionDelivery, ActorConfig, ActorError, ActorResult, ActorState, TaskState,
+};
 
 #[derive(Clone, Debug)]
 pub struct ActorStore {
@@ -58,9 +60,9 @@ impl ActorStore {
             "INSERT OR REPLACE INTO actors (
                 id, name, group_name, goals, spawned_by, is_principal, state,
                 task_state, task_state_note, turn_count, max_turns, max_messages,
-                model, tools, persistent, outcome, result, last_response,
-                created_at, terminated_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                model, tools, persistent, completion_delivery, outcome, result,
+                last_response, created_at, terminated_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 actor.id,
                 actor.config.name,
@@ -77,6 +79,7 @@ impl ActorStore {
                 actor.config.model.map(intent_model_name),
                 tools_json,
                 actor.config.persistent as i64,
+                actor.config.completion_delivery.as_str(),
                 actor.outcome.map(|outcome| outcome.as_str()),
                 actor.result(),
                 last_self_response_text(actor),
@@ -100,7 +103,8 @@ impl ActorStore {
             .prepare(
                 "SELECT id, name, group_name, goals, spawned_by, task_state,
                         task_state_note, turn_count, max_turns, max_messages,
-                        model, tools, persistent, last_response, created_at
+                        model, tools, persistent, completion_delivery, last_response,
+                        created_at
                  FROM actors
                  WHERE state != 'terminated' AND is_principal = 0",
             )
@@ -120,6 +124,9 @@ impl ActorStore {
                 config.max_turns = row.get::<_, i64>("max_turns")?.max(1) as usize;
                 config.max_messages = row.get::<_, i64>("max_messages")?.max(1) as usize;
                 config.persistent = row.get::<_, i64>("persistent")? != 0;
+                let completion_delivery: String = row.get("completion_delivery")?;
+                config.completion_delivery =
+                    ActorCompletionDelivery::from_str(&completion_delivery);
                 let task_state_raw: String = row.get("task_state")?;
                 let actor = Actor {
                     id: row.get("id")?,
@@ -172,6 +179,7 @@ impl ActorStore {
                 model TEXT,
                 tools TEXT NOT NULL DEFAULT '[]',
                 persistent INTEGER NOT NULL DEFAULT 0,
+                completion_delivery TEXT NOT NULL DEFAULT 'parent_message',
                 outcome TEXT,
                 result TEXT,
                 last_response TEXT,
@@ -181,6 +189,23 @@ impl ActorStore {
             );",
         )
         .map_err(sql_error)?;
+        let has_completion_delivery = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('actors')
+                 WHERE name = 'completion_delivery'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error)?
+            > 0;
+        if !has_completion_delivery {
+            conn.execute(
+                "ALTER TABLE actors
+                 ADD COLUMN completion_delivery TEXT NOT NULL DEFAULT 'parent_message'",
+                [],
+            )
+            .map_err(sql_error)?;
+        }
         Ok(())
     }
 
@@ -250,6 +275,7 @@ mod tests {
             ActorConfig::new("researcher", "Survey embedding crates").in_group("main");
         worker_config.max_turns = 7;
         worker_config.tools = vec!["web_search".to_string()];
+        worker_config.completion_delivery = ActorCompletionDelivery::PollOnly;
         let worker = registry.spawn(worker_config, Some(&principal), false);
         let finished = registry.spawn(
             ActorConfig::new("done-already", "Old job").in_group("main"),
@@ -273,6 +299,10 @@ mod tests {
         assert_eq!(actor.config.goals, "Survey embedding crates");
         assert_eq!(actor.config.max_turns, 7);
         assert_eq!(actor.config.tools, vec!["web_search".to_string()]);
+        assert_eq!(
+            actor.config.completion_delivery,
+            ActorCompletionDelivery::PollOnly
+        );
         assert_eq!(actor.state, ActorState::Waiting);
 
         // Upsert: persisting again with new state replaces the row.
@@ -285,5 +315,43 @@ mod tests {
         store
             .persist(registry.get(&worker).unwrap())
             .expect("re-persist is an upsert, not a duplicate insert");
+    }
+
+    #[test]
+    fn store_migrates_old_schema_with_parent_message_default() {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("actors.db");
+        let worker_id;
+
+        {
+            let mut registry = ActorRegistry::new();
+            registry.set_store(ActorStore::open(&db_path).unwrap());
+            let principal = registry.spawn(
+                ActorConfig::new("cortex", "Serve the user").in_group("main"),
+                None,
+                true,
+            );
+            worker_id = registry.spawn(
+                ActorConfig::new("legacy-worker", "Finish old work").in_group("main"),
+                Some(&principal),
+                false,
+            );
+        }
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("ALTER TABLE actors DROP COLUMN completion_delivery", [])
+            .unwrap();
+        drop(conn);
+
+        let store = ActorStore::open(&db_path).unwrap();
+        let restored = store.load_unfinished().unwrap();
+        let actor = restored
+            .iter()
+            .find(|entry| entry.actor.id == worker_id)
+            .unwrap();
+        assert_eq!(
+            actor.actor.config.completion_delivery,
+            ActorCompletionDelivery::ParentMessage
+        );
     }
 }

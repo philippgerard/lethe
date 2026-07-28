@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
                 tools: String::new(),
                 model: "aux".to_string(),
                 max_turns: 10,
+                completion_delivery: lethe::actor::ActorCompletionDelivery::ParentMessage,
             })
             .await
             .unwrap();

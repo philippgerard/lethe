@@ -687,6 +687,7 @@ impl Message<ActorToolCommand> for ActorSupervisor {
                             tools: &tools,
                             model: &model,
                             max_turns,
+                            completion_delivery: ActorCompletionDelivery::ParentMessage,
                         },
                     )
                     .map(|report| report.message().to_string())
@@ -767,6 +768,7 @@ pub struct SpawnSubagent {
     pub tools: String,
     pub model: String,
     pub max_turns: usize,
+    pub completion_delivery: ActorCompletionDelivery,
 }
 
 impl Message<SpawnSubagent> for ActorSupervisor {
@@ -786,6 +788,7 @@ impl Message<SpawnSubagent> for ActorSupervisor {
                 tools: &message.tools,
                 model: &message.model,
                 max_turns: message.max_turns,
+                completion_delivery: message.completion_delivery,
             },
         )?;
         self.sync_resident_actors(ctx.actor_ref().clone());
@@ -872,6 +875,9 @@ impl Message<PrincipalTaskUpdateEvents> for ActorSupervisor {
                 if channel != "task_update"
                     || !MessageIntent::from_strings(channel, kind).wakes_cortex()
                 {
+                    return None;
+                }
+                if event.payload.get("parent_wake").and_then(Value::as_bool) == Some(false) {
                     return None;
                 }
                 let actor_name = registry

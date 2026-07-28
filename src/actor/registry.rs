@@ -117,6 +117,13 @@ impl ActorRegistry {
             if self.actors.contains_key(&actor.id) {
                 continue;
             }
+            // Poll-only actors belong to an in-process synchronous
+            // orchestrator. After a restart that poller no longer exists, so
+            // fall back to normal parent delivery rather than orphaning the
+            // eventual result.
+            if actor.config.completion_delivery == ActorCompletionDelivery::PollOnly {
+                actor.config.completion_delivery = ActorCompletionDelivery::ParentMessage;
+            }
             // Re-parent orphans (e.g. children of the previous run's
             // principal) to the live principal so messaging permissions and
             // termination notifications keep working.
@@ -305,6 +312,8 @@ impl ActorRegistry {
         metadata
             .entry("kind".to_string())
             .or_insert_with(|| json!(intent_name(resolved_intent)));
+        let parent_wake = !(sender.config.completion_delivery == ActorCompletionDelivery::PollOnly
+            && recipient_id == sender.spawned_by);
 
         let message = ActorMessage {
             id: short_id(),
@@ -317,7 +326,7 @@ impl ActorRegistry {
             created_at: Utc::now(),
         };
 
-        if let Some(recipient) = self.actors.get_mut(recipient_id) {
+        if parent_wake && let Some(recipient) = self.actors.get_mut(recipient_id) {
             recipient.messages.push(message.clone());
             recipient.inbox.push_back(message.clone());
         }
@@ -334,9 +343,10 @@ impl ActorRegistry {
                 "content_preview": message.content.chars().take(200).collect::<String>(),
                 "intent": intent_name(resolved_intent),
                 "channel": resolved_intent.channel(),
+                "parent_wake": parent_wake,
             }),
         );
-        if resolved_intent.channel() == "user_notify" {
+        if parent_wake && resolved_intent.channel() == "user_notify" {
             self.emit_event(
                 "user_notify",
                 &sender,
@@ -609,6 +619,7 @@ impl ActorRegistry {
             model: updated.config.model.unwrap_or(ModelTier::Aux),
             has_pending_messages,
             requested_tools: updated.config.tools.clone(),
+            completion_delivery: updated.config.completion_delivery,
         };
         self.persist_actor(actor_id);
         Ok(Some(spec))
@@ -840,10 +851,12 @@ impl ActorRegistry {
         // subagents get a separate <rules> block since their header is purely
         // identification.
         if !actor.is_principal {
-            builder.block(
-                "rules",
-                "Report results to your parent before terminating. Use update_task_state for meaningful progress.",
-            );
+            let rules = if actor.config.completion_delivery == ActorCompletionDelivery::PollOnly {
+                "The caller is synchronously polling your actor state and will collect your terminal result. Do not send messages to your parent. Terminate with the final result when done; use update_task_state only for internal state tracking."
+            } else {
+                "Report results to your parent before terminating. Use update_task_state for meaningful progress."
+            };
+            builder.block("rules", rules);
         }
 
         Ok(builder.render())
@@ -1056,6 +1069,7 @@ impl ActorRegistry {
         } else {
             request.max_turns
         };
+        config.completion_delivery = request.completion_delivery;
         let child_id = self.spawn(config, Some(&actor.id), false);
         let active_children = self
             .get_children(&actor.id)
@@ -1149,7 +1163,9 @@ impl ActorRegistry {
             .get(actor_id)
             .ok_or_else(|| ActorError::NotFound(actor_id.to_string()))?
             .clone();
-        if actor.spawned_by.is_empty() {
+        if actor.spawned_by.is_empty()
+            || actor.config.completion_delivery == ActorCompletionDelivery::PollOnly
+        {
             return Ok(());
         }
         let Some(parent) = self.actors.get(&actor.spawned_by).cloned() else {
@@ -1199,6 +1215,7 @@ impl ActorRegistry {
                 "content_preview": message.content.chars().take(200).collect::<String>(),
                 "intent": intent_name(intent),
                 "channel": intent.channel(),
+                "parent_wake": true,
             }),
         );
         Ok(())

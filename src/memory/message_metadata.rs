@@ -167,7 +167,12 @@ fn legacy_visibility(map: &Map<String, Value>, kind: Option<MessageKind>) -> Mes
 
     if metadata_string(map, "source")
         .as_deref()
-        .is_some_and(|source| matches!(source, "heartbeat" | "background_heartbeat" | "system"))
+        .is_some_and(|source| {
+            matches!(
+                source,
+                "heartbeat" | "background_heartbeat" | "system" | "actor_update"
+            )
+        })
     {
         return MessageVisibility::Internal;
     }
@@ -206,6 +211,26 @@ mod tests {
         let value = json!({"source": "heartbeat"});
 
         assert!(MessageMetadata::from_value(Some(&value)).is_internal());
+    }
+
+    #[test]
+    fn legacy_actor_update_metadata_is_internal() {
+        let value = json!({"source": "actor_update"});
+
+        assert!(MessageMetadata::from_value(Some(&value)).is_internal());
+    }
+
+    #[test]
+    fn typed_delivered_actor_update_is_user_visible() {
+        let value = metadata_value(
+            MessageVisibility::UserVisible,
+            MessageKind::Proactive,
+            "actor_update",
+        );
+        let metadata = MessageMetadata::from_value(Some(&value));
+
+        assert!(!metadata.is_internal());
+        assert_eq!(metadata.kind, Some(MessageKind::Proactive));
     }
 
     #[test]

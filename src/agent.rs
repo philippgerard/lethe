@@ -1571,7 +1571,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::actor::{ActorRunSpec, ModelTier};
+    use crate::actor::{ActorCompletionDelivery, ActorRunSpec, ModelTier};
     use crate::config::Settings;
     use crate::llm::LlmRole;
     use crate::memory::message_metadata::{MessageKind, MessageVisibility, metadata_value};
@@ -2449,6 +2449,7 @@ mod tests {
             model: ModelTier::Aux,
             has_pending_messages: true,
             requested_tools: vec![],
+            completion_delivery: ActorCompletionDelivery::ParentMessage,
         };
 
         let first = actor_turn_instruction(&spec);
@@ -2456,14 +2457,23 @@ mod tests {
         assert!(first.contains("pending inbox"));
         assert!(first.contains("turn 1/3"));
 
-        let later = actor_turn_instruction(&ActorRunSpec {
+        let later_spec = ActorRunSpec {
             turn_number: 2,
             has_pending_messages: false,
             ..spec
-        });
+        };
+        let later = actor_turn_instruction(&later_spec);
         assert!(later.contains("Continue your actor task"));
         assert!(later.contains("send_message"));
         assert!(later.contains("turn 2/3"));
+
+        let poll_only = actor_turn_instruction(&ActorRunSpec {
+            completion_delivery: ActorCompletionDelivery::PollOnly,
+            ..later_spec
+        });
+        assert!(poll_only.contains("caller is polling"));
+        assert!(!poll_only.contains("send_message"));
+        assert!(poll_only.contains("Do not send messages to your parent"));
     }
 
     #[test]
