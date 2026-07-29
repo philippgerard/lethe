@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.28.0 - Agent-id installs itself, browser CLI health probe
+
+- **A broken browser CLI no longer swallows the browser** (#53). The
+  `alien_browser_*` tools were gated on the CLI merely existing on PATH,
+  so an install whose dependency tree didn't match its imports (e.g. a
+  mid-release-cycle plugin pack against an older published
+  `@alien-id/agent-id-core`) exposed tools whose every call died in the
+  CLI's module loader. `browser_cli_health()` now probes the CLI once per
+  process (`--help`, which exercises the whole import graph); a CLI that
+  can't start keeps the tools hidden and logs the reinstall hint.
+- **`lethe check` diagnoses agent-id.** New lines report core/vault CLI
+  presence, identity provisioning state, and browser CLI health — each
+  with the command that fixes it. The same paths are available standalone
+  via the hidden `lethe agent-id status` / `lethe agent-id provision`.
+- **`install.sh` installs and provisions agent-id.** When npm is present
+  it installs `@alien-id/agent-id-core` + `-vault` (and
+  `@alien-id/agent-id-browser` when Google Chrome is on the host), then
+  runs `lethe agent-id provision`, so identity + vault exist even when
+  the init wizard is skipped (existing config, `LETHE_SKIP_INIT`, no
+  TTY). `LETHE_SKIP_AGENT_ID=1` opts out entirely.
+- **README: install the browser CLI from npm.** The "marketplace-only —
+  not on npm" claim was stale; `@alien-id/agent-id-browser` is published,
+  and installing from npm keeps core/vault/browser one matching release
+  set. Bleeding-edge from an agent-id checkout goes through `bun install`
+  + `AGENT_ID_BROWSER_BIN=<checkout>/plugins/agent-id-browser/bin/cli.mjs`
+  so the workspace supplies matching siblings.
+
 ## 0.27.0 - Typed background actor markers, client reply keyboards, full tool previews
 
 - **Background/system activity is now typed on the actor event wire**
