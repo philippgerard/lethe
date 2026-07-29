@@ -34,7 +34,7 @@ pub enum ToolCategory {
     /// agent-id-vault CLIs are present and the integration is enabled.
     AgentId,
     /// Alien agent-id vault-sealed browser tools; visible only when the
-    /// (marketplace-only) agent-id-browser CLI is additionally present.
+    /// agent-id-browser CLI is additionally present and able to start.
     AgentIdBrowser,
 }
 

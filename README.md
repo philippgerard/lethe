@@ -374,34 +374,50 @@ display is available). These are provided by the
 [`agent-id`](https://github.com/alien-id/agent-id) CLIs (`agent-id-core`,
 `agent-id-vault`, `agent-id-browser`); Lethe shells out to them.
 
-Enable identity + vault by installing the two published CLIs so they're on `PATH`:
+Enable identity + vault by installing the two published CLIs so they're on `PATH`
+(`install.sh` does this automatically when npm is present; `LETHE_SKIP_AGENT_ID=1`
+opts out):
 
 ```bash
 npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault   # identity + vault
 ```
 
 `lethe init` provisions an L0 identity + vault automatically when the CLIs are
-present; the daemon re-provisions on start. State is isolated per instance under
-`AGENT_ID_STATE_DIR` (default `<LETHE_HOME>/agent-id`).
+present; the daemon re-provisions on start, and `install.sh` runs the same
+provisioning (`lethe agent-id provision`, idempotent) even when the init wizard
+is skipped. State is isolated per instance under `AGENT_ID_STATE_DIR` (default
+`<LETHE_HOME>/agent-id`). `lethe check` reports CLI presence, identity state,
+and browser CLI health.
 
 ### Browser tools (optional)
 
 The vault-sealed browser adds the `alien_browser_*` tools (`_open` starts a
 session, `_act` runs any page verb — snapshot/click/type/navigate/… — and
 `_fill_secret` / `_fill_otp` inject vaulted credentials the model never sees).
-Because it's a superset of the built-in browser, **it replaces it**: whenever the
-vault-sealed browser is active the plain `browser_*` tools are hidden, so the
-agent only ever sees one browser. `agent-id-browser` is **marketplace-only — not
-on npm**; install it from the plugin tarball and point `AGENT_ID_BROWSER_BIN` at
-it (or put it on `PATH`). It drives **real Google Chrome** via `channel:"chrome"`
-(a stealth-tuned patchright launch — not bundled Chromium), so the host needs
-Chrome installed:
+It is Lethe's only browser: when the CLI is absent — or present but unable to
+start; Lethe probes it once per run — the `alien_browser_*` tools are hidden and
+`lethe check` says why. The CLI drives **real Google Chrome** via
+`channel:"chrome"` (a stealth-tuned patchright launch — not bundled Chromium),
+so the host needs Chrome installed:
+
+```bash
+npm i -g @alien-id/agent-id-browser   # pulls matching core/vault + patchright
+# …and install Google Chrome (google-chrome-stable) on the host.
+```
+
+`install.sh` does this automatically when npm and Chrome are both present.
+Install the browser **from npm** so core/vault/browser come from one release
+set. Do not pack the plugin from a repo checkout against npm-installed
+dependencies: mid-release-cycle the checkout's imports can be ahead of the
+published `@alien-id/agent-id-core`, and the CLI dies in its module loader
+before parsing a single argument. To run bleeding-edge browser code from a
+checkout, let the workspace supply its siblings instead:
 
 ```bash
 # From a checkout of github.com/alien-id/agent-id:
-( cd plugins/agent-id-browser && bun pm pack --destination /tmp )   # -> /tmp/alien-id-agent-id-browser-*.tgz
-npm i -g /tmp/alien-id-agent-id-browser-*.tgz    # pulls core/vault + patchright
-# …and install Google Chrome (google-chrome-stable) on the host.
+bun install                          # links workspace core/vault next to the plugin
+# then point Lethe at the checkout's CLI:
+AGENT_ID_BROWSER_BIN=<checkout>/plugins/agent-id-browser/bin/cli.mjs
 ```
 
 Chrome refuses to run as **root** with its sandbox on. In a container that runs as

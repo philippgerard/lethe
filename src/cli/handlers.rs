@@ -33,8 +33,8 @@ use lethe::tools::shell::ShellTools;
 use lethe::tools::web::WebTools;
 
 use crate::{
-    AgentCommand, ArchiveCommand, FsCommand, HeartbeatCommand, MemoryCommand, MessageCommand,
-    NoteCommand, ShCommand, TodoCommand, WebCommand,
+    AgentCommand, AgentIdCommand, ArchiveCommand, FsCommand, HeartbeatCommand, MemoryCommand,
+    MessageCommand, NoteCommand, ShCommand, TodoCommand, WebCommand,
 };
 
 pub(crate) async fn api_command(port: Option<u16>) -> Result<()> {
@@ -237,7 +237,80 @@ pub(crate) async fn check() -> Result<()> {
         }
     }
 
+    // -- Alien agent-id (identity + vault + browser CLIs) ---------------------
+    print_agent_id_checks(&settings).await;
+
     Ok(())
+}
+
+pub(crate) async fn agent_id_command(command: AgentIdCommand) -> Result<()> {
+    let settings = Settings::from_env();
+    match command {
+        AgentIdCommand::Provision => {
+            crate::cli::init::provision_agent_id(&settings).await;
+            Ok(())
+        }
+        AgentIdCommand::Status => {
+            print_agent_id_checks(&settings).await;
+            Ok(())
+        }
+    }
+}
+
+/// The agent-id lines of `lethe check` (also `lethe agent-id status`): CLI
+/// presence, identity state, and browser CLI health — each with the command
+/// that fixes it, so a broken install diagnoses itself.
+async fn print_agent_id_checks(settings: &Settings) {
+    use lethe::agent_id::{self, BrowserCliHealth};
+
+    if !agent_id::is_enabled() {
+        println!("  [SKIP] agent-id — disabled (AGENT_ID_ENABLED=0)");
+        return;
+    }
+    if !agent_id::vault_tools_available() {
+        println!(
+            "  [SKIP] agent-id — core/vault CLIs not on PATH \
+             (npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault)"
+        );
+        return;
+    }
+
+    let sd = agent_id::state_dir(settings);
+    let status = agent_id::cli::run_json(agent_id::cli::Bin::Core, &sd, &["status"]).await;
+    if status.get("initialized").and_then(|v| v.as_bool()) == Some(true) {
+        let assurance = status
+            .get("assurance")
+            .and_then(|v| v.as_str())
+            .unwrap_or("self-asserted");
+        match status.get("jkt").and_then(|v| v.as_str()) {
+            Some(jkt) => println!(
+                "  [OK]   agent-id — identity ready ({assurance}, key {}…)",
+                &jkt[..jkt.len().min(12)]
+            ),
+            None => println!("  [OK]   agent-id — identity ready ({assurance})"),
+        }
+    } else {
+        println!("  [WARN] agent-id — CLIs present but identity not provisioned");
+        println!("         (run `lethe agent-id provision`)");
+    }
+
+    match agent_id::browser_cli_health() {
+        BrowserCliHealth::Missing => println!(
+            "  [SKIP] agent-id browser — CLI not installed \
+             (npm i -g @alien-id/agent-id-browser, plus Google Chrome)"
+        ),
+        BrowserCliHealth::Broken(bin) => {
+            println!(
+                "  [FAIL] agent-id browser — {} is installed but fails to start",
+                bin.display()
+            );
+            println!("         (reinstall: npm i -g @alien-id/agent-id-browser)");
+        }
+        BrowserCliHealth::Ok(bin) => println!(
+            "  [OK]   agent-id browser — vault-sealed browser ready ({})",
+            bin.display()
+        ),
+    }
 }
 
 pub(crate) fn print_prompt(name: &str) -> Result<()> {

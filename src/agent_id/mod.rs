@@ -99,11 +99,68 @@ pub fn vault_tools_available() -> bool {
     })
 }
 
-/// Browser tools additionally require the (marketplace-only) browser CLI.
+/// Health of the vault-sealed browser CLI. `Broken` covers a CLI that is on
+/// PATH but exits nonzero on `--help` — typically an install whose dependency
+/// tree doesn't match its imports (e.g. a mid-release-cycle plugin pack against
+/// an older published `agent-id-core`).
+pub enum BrowserCliHealth {
+    /// No CLI on PATH and no `AGENT_ID_BROWSER_BIN`.
+    Missing,
+    /// Found at this path, but it fails to start.
+    Broken(PathBuf),
+    /// Found at this path and runs.
+    Ok(PathBuf),
+}
+
+/// Probe the browser CLI once per process: resolve it, run `--help`, and cache
+/// the verdict. `--help` needs no vault, state, or network, but does exercise
+/// the CLI's whole import graph, which is where a bad install fails.
+pub fn browser_cli_health() -> &'static BrowserCliHealth {
+    static HEALTH: OnceLock<BrowserCliHealth> = OnceLock::new();
+    HEALTH.get_or_init(|| {
+        let Some(bin) = find_bin("AGENT_ID_BROWSER_BIN", "agent-id-browser") else {
+            return BrowserCliHealth::Missing;
+        };
+        let runs = std::process::Command::new(&bin)
+            .arg("--help")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if runs {
+            BrowserCliHealth::Ok(bin)
+        } else {
+            BrowserCliHealth::Broken(bin)
+        }
+    })
+}
+
+/// Browser tools additionally require the browser CLI — on PATH *and* able to
+/// start. Presence alone is not enough: exposing `alien_browser_*` tools whose
+/// every call dies in the CLI's module loader gives the agent no browser and no
+/// useful signal, so a broken CLI keeps the tools hidden and logs why.
 pub fn browser_tools_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        vault_tools_available() && find_bin("AGENT_ID_BROWSER_BIN", "agent-id-browser").is_some()
+        if !vault_tools_available() {
+            return false;
+        }
+        match browser_cli_health() {
+            BrowserCliHealth::Ok(_) => true,
+            BrowserCliHealth::Missing => false,
+            BrowserCliHealth::Broken(bin) => {
+                tracing::warn!(
+                    bin = %bin.display(),
+                    "agent-id: browser CLI is installed but fails to start; \
+                     browser tools disabled (reinstall with \
+                     `npm i -g @alien-id/agent-id-browser`, or check \
+                     `lethe check`)"
+                );
+                false
+            }
+        }
     })
 }
 
