@@ -631,6 +631,9 @@ fn kill_process_group(pid: u32) {
         };
         let _ = Command::new("kill")
             .arg("-KILL")
+            // GNU kill otherwise parses a negative process-group id as an
+            // option. BSD kill accepts this separator too.
+            .arg("--")
             .arg(target)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
