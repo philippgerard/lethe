@@ -34,8 +34,9 @@ use crate::memory::messages::{MessageHistoryError, MessageRole, StoredMessage};
 use crate::memory::recall::{Hippocampus, HippocampusConfig, HippocampusError};
 use crate::memory::{MemoryStore, MemoryStoreError};
 use crate::scheduler::curator::{CuratorError, CuratorRunStats, MemoryCurator};
+use crate::tools::hosted_plugins::HostedPluginClient;
 use crate::tools::registry::{
-    ActorToolContext, SharedActorRegistry, ToolRuntime, requestable_tools_directory_for,
+    ActorToolContext, SharedActorRegistry, ToolPolicy, ToolRuntime, requestable_tools_directory_for,
 };
 use crate::tools::shell::ShellTools;
 
@@ -148,6 +149,9 @@ pub struct Agent {
     prompts: PromptStore,
     router: Arc<RwLock<LlmRouter>>,
     shell: ShellTools,
+    /// Immutable capability ceiling selected when the agent is constructed.
+    /// Per-turn runtimes may narrow this policy, but must never widen it.
+    tool_policy: ToolPolicy,
     actor_registry: Option<SharedActorRegistry>,
     principal_actor_id: Option<String>,
     notification_gate: Mutex<NotificationGate>,
@@ -166,6 +170,12 @@ pub struct Agent {
     /// batch has been merged into it (the old detached spawn raced exactly
     /// that way and lost context silently).
     pending_summary: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    hosted_plugins: Option<Arc<HostedPluginClient>>,
+    /// Host-installed factory producing a per-turn observer for subagent
+    /// turns (see [`Agent::install_subagent_observer`]). Captured by the
+    /// actor turn executor at build time; `None` leaves subagent turns
+    /// unobserved.
+    subagent_observer: crate::tools::registry::SubagentObserverSlot,
 }
 
 /// How long the next turn waits for the previous turn's summary update before
@@ -200,15 +210,44 @@ async fn await_pending_task(
 impl Agent {
     pub fn from_settings(settings: Settings) -> AgentResult<Self> {
         let memory = Arc::new(MemoryStore::from_settings(&settings)?);
+        Self::from_settings_with_memory(settings, memory)
+    }
+
+    /// Build the real Lethe agent around an injected memory backend. This is
+    /// the hosted/multiplexing seam: prompt assembly, Hippocampus recall, tool
+    /// semantics, history compaction, and curation remain exactly the same as
+    /// the standalone binary.
+    pub fn from_settings_with_memory(
+        settings: Settings,
+        memory: Arc<MemoryStore>,
+    ) -> AgentResult<Self> {
+        Self::from_settings_with_memory_policy(settings, memory, ToolPolicy::Full)
+    }
+
+    /// [`Agent::from_settings_with_memory`] with an explicit capability
+    /// policy. A hosted multiplexer passes [`ToolPolicy::HostedSafe`] so the
+    /// policy applies not only to the turns it constructs itself but also to
+    /// everything the agent runs internally on the host's behalf: subagent
+    /// turns spawned by the actor runtime and the `<available_on_request>`
+    /// directories rendered into actor prompts.
+    pub fn from_settings_with_memory_policy(
+        settings: Settings,
+        memory: Arc<MemoryStore>,
+        tool_policy: ToolPolicy,
+    ) -> AgentResult<Self> {
         let prompts = PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
         let router = Arc::new(RwLock::new(LlmRouter::new(LlmRouterConfig::from_settings(
             &settings,
         ))));
         let shell = ShellTools::new(&settings.paths.workspace_dir);
         let last_prompt_tokens = Arc::new(AtomicU64::new(0));
+        let hosted_plugins = HostedPluginClient::from_config(&settings.hosted_plugins);
+        let subagent_observer: crate::tools::registry::SubagentObserverSlot =
+            Arc::new(std::sync::RwLock::new(None));
         let (actor_registry, principal_actor_id) = if settings.background.actors_enabled {
             let mut registry = ActorRegistry::new();
             registry.set_prompts(prompts.clone());
+            registry.set_tool_policy(tool_policy);
             // Durable actor state: snapshots every mutation into the unified
             // memory DB and rehydrates unfinished subagents after a restart —
             // a deploy or self-restart interrupts work instead of erasing it.
@@ -233,6 +272,9 @@ impl Agent {
                     router.clone(),
                     shell.clone(),
                     last_prompt_tokens.clone(),
+                    hosted_plugins.clone(),
+                    tool_policy,
+                    subagent_observer.clone(),
                 ))
                 .map_err(|error| AgentError::Llm(anyhow!("actor runtime failed: {error}")))?;
             (Some(runtime), Some(principal_id))
@@ -245,6 +287,7 @@ impl Agent {
             prompts,
             router,
             shell,
+            tool_policy,
             actor_registry,
             principal_actor_id,
             notification_gate: Mutex::new(NotificationGate::new(15 * 60)),
@@ -252,6 +295,8 @@ impl Agent {
             last_prompt_tokens,
             conversation_tx: broadcast::channel(CONVERSATION_EVENT_DEPTH).0,
             pending_summary: tokio::sync::Mutex::new(None),
+            hosted_plugins,
+            subagent_observer,
         })
     }
 
@@ -344,6 +389,22 @@ impl Agent {
         // Sync point: the prompt reads the conversation_summary block, so let
         // the previous turn's in-flight summary update land first (bounded).
         await_pending_task(&self.pending_summary, SUMMARY_SYNC_TIMEOUT).await;
+        let hosted_context = if let Some(client) = self.hosted_plugins.as_ref() {
+            if let Err(error) = client.refresh_catalog().await {
+                tracing::warn!(error = %error, "hosted plugin catalog refresh failed during prompt assembly");
+            }
+            match client.context_blocks().await {
+                Ok(context) => context,
+                Err(error) => {
+                    // Plugin context is volatile convenience, never a reason to
+                    // fail the user's chat turn.
+                    tracing::warn!(error = %error, "hosted plugin context unavailable");
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
         let mut request_options = req.options.clone();
         let last_prompt_tokens = match self.last_prompt_tokens.load(Ordering::Relaxed) {
             0 => None,
@@ -376,6 +437,12 @@ impl Agent {
             system.content.push_str(&context);
             system.content.push_str("\n</actor_context>");
         }
+        if !hosted_context.trim().is_empty()
+            && let Some(system) = volatile_system_message_mut(&mut turn.messages)
+        {
+            system.content.push_str("\n\n");
+            system.content.push_str(hosted_context.trim());
+        }
         let directory = self.requestable_tools_directory_async(req).await?;
         if !directory.is_empty()
             && let Some(system) = volatile_system_message_mut(&mut turn.messages)
@@ -388,12 +455,27 @@ impl Agent {
 
     async fn requestable_tools_directory_async(&self, req: &TurnRequest) -> AgentResult<String> {
         if let (Some(registry), Some(actor_id)) = (&self.actor_registry, &self.principal_actor_id) {
-            return registry
-                .build_requestable_directory(actor_id)
+            let mut directory = registry
+                .build_requestable_directory(actor_id, req.runtime.agent_id_state_dir.is_some())
                 .await
                 .map_err(|error| {
                     AgentError::Llm(anyhow!("requestable directory failed: {error}"))
-                });
+                })?;
+            if let Some(client) = self.hosted_plugins.as_ref() {
+                directory = client.filter_requestable_directory(&directory);
+                let hosted = client.requestable_directory();
+                if !hosted.is_empty() {
+                    if !directory.is_empty() {
+                        directory.push_str("\n\n");
+                    }
+                    directory.push_str(
+                        "<available_on_request source=\"hosted_plugins\">\nTools below are NOT loaded. Call request_tool(name=...) to enable one for this turn.\n",
+                    );
+                    directory.push_str(&hosted);
+                    directory.push_str("\n</available_on_request>");
+                }
+            }
+            return Ok(directory);
         }
         let runtime = self.with_actor_runtime(req.runtime.clone());
         let body = requestable_tools_directory_for(&runtime);
@@ -421,11 +503,15 @@ impl Agent {
                 .add(MessageRole::User, &message, metadata)?;
         }
         let runtime = self.with_actor_runtime(runtime);
+        let telegram_guard = runtime
+            .telegram
+            .as_ref()
+            .and_then(|telegram| telegram.guard.clone());
         let dropped_for_summary = turn.dropped_for_summary.clone();
         let response = self
             .complete_turn_with_tools(turn.messages, runtime, !turn.synthetic)
             .await?;
-        if !turn.synthetic {
+        if !turn.synthetic && final_response_should_be_persisted(telegram_guard.as_ref())? {
             let history_content = assistant_history_content(&response);
             // Don't persist whitespace-only final replies — unlike the loop's
             // per-iteration rows (whose tool_calls metadata pairs the tool
@@ -497,6 +583,22 @@ impl Agent {
         self.principal_actor_id.as_deref()
     }
 
+    /// Install a factory that observes subagent turns. The actor turn
+    /// executor calls it with the acting actor's id at the start of each
+    /// subagent turn and threads the returned observer through the tool
+    /// loop, so hosts can surface per-subagent tool/reasoning activity
+    /// (attributed by actor id) on their own event streams. Applies to all
+    /// turns started after installation; without it subagent turns run
+    /// unobserved.
+    pub fn install_subagent_observer(
+        &self,
+        factory: crate::tools::registry::SubagentObserverFactory,
+    ) {
+        if let Ok(mut slot) = self.subagent_observer.write() {
+            *slot = Some(factory);
+        }
+    }
+
     pub async fn run_curator_pass(&self, force: bool) -> AgentResult<CuratorRunStats> {
         let curator = MemoryCurator::new(self.settings.paths.memory_dir.join("curator_state.json"));
         let router = self
@@ -524,10 +626,22 @@ impl Agent {
                 }
             }
         }
-        match self.memory.todos.open_work_digest(20) {
-            Ok(digest) if !digest.trim().is_empty() => lines.push(digest),
-            Ok(_) => {}
-            Err(error) => tracing::warn!(error = %error, "todo open-work digest failed"),
+        if self.settings.hosted_plugins.replace_local_todos {
+            if let Some(client) = self.hosted_plugins.as_ref() {
+                match client.context_blocks().await {
+                    Ok(context) if !context.trim().is_empty() => lines.push(context),
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "hosted open-work context failed")
+                    }
+                }
+            }
+        } else {
+            match self.memory.todos.open_work_digest(20) {
+                Ok(digest) if !digest.trim().is_empty() => lines.push(digest),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(error = %error, "todo open-work digest failed"),
+            }
         }
         lines.join("\n")
     }
@@ -648,6 +762,13 @@ impl Agent {
     }
 
     fn with_actor_runtime(&self, mut runtime: ToolRuntime) -> ToolRuntime {
+        // The constructor policy is the outer trust boundary. A hosted caller
+        // forgetting to repeat `HostedSafe` on an individual TurnRequest must
+        // fail closed, while a Full agent still honors an explicitly narrower
+        // per-turn policy.
+        if self.tool_policy == ToolPolicy::HostedSafe {
+            runtime.policy = ToolPolicy::HostedSafe;
+        }
         if runtime.actor.is_none()
             && let (Some(registry), Some(actor_id)) =
                 (self.actor_registry.clone(), self.principal_actor_id.clone())
@@ -657,6 +778,9 @@ impl Agent {
                 actor_id,
                 is_subagent: false,
             });
+        }
+        if runtime.hosted_plugins.is_none() {
+            runtime.hosted_plugins = self.hosted_plugins.clone();
         }
         runtime
     }
@@ -697,6 +821,7 @@ impl Agent {
                 router: self.router.clone(),
                 shell: self.shell.clone(),
                 last_prompt_tokens: self.last_prompt_tokens.clone(),
+                hosted_plugins: self.hosted_plugins.clone(),
             },
             messages,
             runtime,
@@ -735,7 +860,12 @@ pub fn prepare_turn(
         None
     };
 
-    let parts = build_system_prompt(memory, prompts, recall.as_deref())?;
+    let parts = build_system_prompt(
+        memory,
+        prompts,
+        recall.as_deref(),
+        !settings.hosted_plugins.replace_local_todos,
+    )?;
     let dialect = dialect_for_model(&settings.llm.llm_model);
     let mut messages = parts.into_messages();
     apply_cache_markers(&mut messages, dialect.as_ref());
@@ -816,6 +946,7 @@ fn build_system_prompt(
     memory: &MemoryStore,
     prompts: &PromptStore,
     recall: Option<&str>,
+    include_local_active_tasks: bool,
 ) -> AgentResult<SystemParts> {
     let identity = memory
         .blocks
@@ -842,17 +973,19 @@ fn build_system_prompt(
     // every turn so unfinished work survives context compaction and session
     // restarts without the model having to remember to call todo_list. Text
     // comes from the overridable `active_tasks` template.
-    match memory.todos.open_work_digest(ACTIVE_TASKS_PROMPT_LIMIT) {
-        Ok(digest) if !digest.trim().is_empty() => {
-            let mut variables = std::collections::HashMap::new();
-            variables.insert("digest".to_string(), digest);
-            let body = prompts
-                .render("active_tasks", &variables, "Your open work:\n{digest}")
-                .text;
-            volatile_builder.block("active_tasks", body);
+    if include_local_active_tasks {
+        match memory.todos.open_work_digest(ACTIVE_TASKS_PROMPT_LIMIT) {
+            Ok(digest) if !digest.trim().is_empty() => {
+                let mut variables = std::collections::HashMap::new();
+                variables.insert("digest".to_string(), digest);
+                let body = prompts
+                    .render("active_tasks", &variables, "Your open work:\n{digest}")
+                    .text;
+                volatile_builder.block("active_tasks", body);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(error = %error, "active-tasks digest failed"),
         }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(error = %error, "active-tasks digest failed"),
     }
     volatile_builder.raw(memory_volatile).raw(clock_block);
 
@@ -1108,6 +1241,18 @@ fn extract_historical_tool_calls(metadata: &Value) -> Vec<HistoricalToolCall> {
 
 fn assistant_history_content(response: &str) -> String {
     normalize_message_envelope(response).unwrap_or_else(|| response.to_string())
+}
+
+fn final_response_should_be_persisted(
+    telegram_guard: Option<&crate::interfaces::telegram::SharedTelegramTurnGuard>,
+) -> AgentResult<bool> {
+    let Some(guard) = telegram_guard else {
+        return Ok(true);
+    };
+    let guard = guard
+        .lock()
+        .map_err(|error| AgentError::Llm(anyhow!("telegram turn guard poisoned: {error}")))?;
+    Ok(guard.visible_messages_sent() == 0)
 }
 
 /// Return the last system message (the volatile half of the split prompt) so
@@ -1731,6 +1876,46 @@ mod tests {
     }
 
     #[test]
+    fn hosted_agenda_suppresses_local_active_tasks_prompt() {
+        let tmp = tempdir().unwrap();
+        let mut settings = settings(tmp.path());
+        settings.hosted_plugins.replace_local_todos = true;
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        let prompts = PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
+        let id = memory
+            .todos
+            .create(crate::todos::NewTodo {
+                title: "local split-brain task".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        memory
+            .todos
+            .update(
+                id,
+                crate::todos::TodoUpdate {
+                    status: Some(crate::todos::TodoStatus::InProgress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let turn = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "hello",
+            Vec::new(),
+            None,
+            &AgentOptions::default(),
+        )
+        .unwrap();
+        let system = system_content(&turn.messages);
+        assert!(!system.contains("<active_tasks>"));
+        assert!(!system.contains("local split-brain task"));
+    }
+
+    #[test]
     fn prepare_turn_excludes_tool_loop_chatter_from_history() {
         let tmp = tempdir().unwrap();
         let settings = settings(tmp.path());
@@ -2321,6 +2506,18 @@ mod tests {
     }
 
     #[test]
+    fn telegram_tool_delivery_suppresses_the_undelivered_final_history_row() {
+        let guard = Arc::new(Mutex::new(
+            crate::interfaces::telegram::TelegramTurnGuard::new(),
+        ));
+
+        assert!(final_response_should_be_persisted(Some(&guard)).unwrap());
+        guard.lock().unwrap().record_visible_message();
+        assert!(!final_response_should_be_persisted(Some(&guard)).unwrap());
+        assert!(final_response_should_be_persisted(None).unwrap());
+    }
+
+    #[test]
     fn internal_metadata_turn_skips_recall() {
         let tmp = tempdir().unwrap();
         let settings = settings(tmp.path());
@@ -2390,6 +2587,38 @@ mod tests {
 
         assert!(agent.actor_registry().is_none());
         assert!(!turn.messages[0].content.contains("<actor_context>"));
+    }
+
+    #[test]
+    fn hosted_safe_agent_constrains_default_turn_runtime() {
+        let tmp = tempdir().unwrap();
+        let mut settings = settings(tmp.path());
+        settings.background.actors_enabled = false;
+        let memory = Arc::new(MemoryStore::from_settings(&settings).unwrap());
+        let agent =
+            Agent::from_settings_with_memory_policy(settings, memory, ToolPolicy::HostedSafe)
+                .unwrap();
+
+        let request = TurnRequest::new("stay inside the hosted boundary");
+        assert_eq!(request.runtime.policy, ToolPolicy::Full);
+
+        let runtime = agent.with_actor_runtime(request.runtime);
+        assert_eq!(runtime.policy, ToolPolicy::HostedSafe);
+
+        let registry = crate::tools::registry::ToolRegistry::with_runtime(
+            agent.memory(),
+            agent.settings.paths.workspace_dir.clone(),
+            agent.settings.paths.cache_dir.clone(),
+            &agent.shell,
+            runtime,
+        );
+        let names = registry
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("read_file"));
+        assert!(!names.contains("bash"));
     }
 
     #[test]
@@ -2474,6 +2703,86 @@ mod tests {
         assert!(poll_only.contains("caller is polling"));
         assert!(!poll_only.contains("send_message"));
         assert!(poll_only.contains("Do not send messages to your parent"));
+    }
+
+    fn system_message(content: &str) -> LlmMessage {
+        LlmMessage {
+            role: LlmRole::System,
+            content: content.to_string(),
+            attachments: vec![],
+            tool_calls: vec![],
+            tool_responses: vec![],
+            cache_control: None,
+        }
+    }
+
+    /// The OpenRouter → Claude cache path, end to end: dialect → markers →
+    /// genai request. This crosses the seam that actually broke: the dialect
+    /// silently returned "no marker" while the adapter stood ready to emit one,
+    /// so every turn re-billed the full prompt. Testing either layer alone
+    /// misses that, which is why this test spans both.
+    #[test]
+    fn openrouter_claude_carries_cache_control_into_the_genai_request() {
+        let mut messages = vec![
+            system_message("identity + persona + instructions"),
+            system_message("clock + memory state + recall"),
+            LlmMessage {
+                role: LlmRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                tool_calls: vec![],
+                tool_responses: vec![],
+                cache_control: None,
+            },
+        ];
+
+        let dialect = dialect_for_model("openrouter/anthropic/claude-opus-4.7");
+        apply_cache_markers(&mut messages, dialect.as_ref());
+
+        let request = crate::llm::build_chat_request(messages);
+        let marker = |index: usize| {
+            request.messages[index]
+                .options
+                .as_ref()
+                .and_then(|options| options.cache_control.clone())
+        };
+
+        assert_eq!(
+            marker(0),
+            Some(genai::chat::CacheControl::Ephemeral1h),
+            "the stable prefix must carry the 1h marker OpenRouter forwards to Anthropic"
+        );
+        assert_eq!(
+            marker(1),
+            Some(genai::chat::CacheControl::Ephemeral),
+            "the volatile tail must carry the 5m marker"
+        );
+        assert_eq!(marker(2), None, "user messages carry no cache marker");
+    }
+
+    /// A vendor with automatic prefix caching must stay unmarked all the way
+    /// through, not just at the dialect.
+    #[test]
+    fn openrouter_kimi_carries_no_cache_control_into_the_genai_request() {
+        let mut messages = vec![
+            system_message("identity + persona"),
+            system_message("clock + recall"),
+        ];
+
+        let dialect = dialect_for_model("openrouter/moonshotai/kimi-k2.6");
+        apply_cache_markers(&mut messages, dialect.as_ref());
+
+        let request = crate::llm::build_chat_request(messages);
+        for (index, message) in request.messages.iter().enumerate() {
+            assert!(
+                message
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.cache_control.as_ref())
+                    .is_none(),
+                "message {index} must stay unmarked — Moonshot caches automatically"
+            );
+        }
     }
 
     #[test]

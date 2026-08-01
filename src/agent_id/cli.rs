@@ -183,20 +183,66 @@ pub async fn run_json(bin: Bin, state_dir: &Path, args: &[&str]) -> Value {
     }
 }
 
+/// Serializes every `agent-id-browser open` (agent tool calls AND the
+/// viewer-triggered launch in `interfaces::browser_stream`). The CLI's `open`
+/// is NOT idempotent — it wipes the session work dir and unseals fresh, so a
+/// concurrent second open destroys a live session's profile dir.
+static OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The live half of `browser-sessions/<name>.json`: a session whose daemon
+/// pid is still running. Linux-only pid probe (/proc) — on other platforms we
+/// report None and `open` behaves as before (hosted runtimes are linux).
+pub fn live_session(state_dir: &Path, name: &str) -> Option<Value> {
+    let raw = std::fs::read_to_string(
+        state_dir
+            .join("browser-sessions")
+            .join(format!("{name}.json")),
+    )
+    .ok()?;
+    let info = serde_json::from_str::<Value>(&raw).ok()?;
+    let pid = info.get("pid").and_then(Value::as_u64)?;
+    if !cfg!(target_os = "linux") || !Path::new(&format!("/proc/{pid}")).exists() {
+        return None;
+    }
+    Some(info)
+}
+
 /// Start a long-lived browser session daemon (`agent-id-browser open`), read its
 /// `{ ready: true, ... }` line, then leave it running and drain the rest of its
 /// stdout to a log so it never blocks on a full pipe. Returns the ready line.
+///
+/// Idempotent per session: if `session_name` already has a live daemon, the
+/// existing session is returned (`reused: true`) instead of re-opening over it.
 pub async fn spawn_daemon_ready(
     state_dir: &Path,
+    session_name: &str,
     args: &[&str],
     log_path: PathBuf,
 ) -> Result<Value, String> {
+    let _open_serialized = OPEN_LOCK.lock().await;
+    if let Some(info) = live_session(state_dir, session_name) {
+        return Ok(json!({
+            "ok": true,
+            "ready": true,
+            "reused": true,
+            "session": session_name,
+            "headless": info.get("headless").cloned().unwrap_or(Value::Bool(true)),
+        }));
+    }
     let mut cmd = base_command(Bin::Browser, state_dir)?;
     // The daemon must OUTLIVE this call: do not kill it when the child handle
     // drops.
     cmd.kill_on_drop(false);
     cmd.args(args);
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    wait_daemon_ready(child, log_path, Duration::from_secs(90)).await
+}
+
+async fn wait_daemon_ready(
+    mut child: tokio::process::Child,
+    log_path: PathBuf,
+    ready_timeout: Duration,
+) -> Result<Value, String> {
     let stdout = child
         .stdout
         .take()
@@ -208,31 +254,45 @@ pub async fn spawn_daemon_ready(
     let mut stderr = child.stderr.take();
 
     let mut reader = BufReader::new(stdout).lines();
-    // Terminal outcome from the daemon's first meaningful stdout line: Ok(ready
-    // value), or Err(the daemon's own {ok:false,...} message). None = stdout
-    // closed with no verdict (the daemon died); we then read stderr for why.
-    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+    // Terminal outcome from the daemon's stdout: Ok(ready value), or Err(the
+    // daemon's own {ok:false,...} message). None = stdout closed with no
+    // verdict (the daemon died); we then read stderr for why. The daemon
+    // PRETTY-PRINTS structured errors (multi-line JSON), so a per-line parse
+    // alone would swallow them — accumulate lines from each `{` and retry the
+    // buffer, otherwise "no browser-profile named 'x'" degrades to an opaque
+    // "closed before ready".
+    let mut stdout_tail = String::new();
+    let outcome = tokio::time::timeout(ready_timeout, async {
+        let mut json_buf = String::new();
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                if value.get("ready").and_then(Value::as_bool) == Some(true) {
-                    return Some(Ok(value));
-                }
-                // A structured failure the daemon reports before ready — surface
-                // its own message (e.g. "no browser-profile named 'x' — run
-                // auto-login first") instead of a generic timeout.
-                if value.get("ok").and_then(Value::as_bool) == Some(false) {
-                    let msg = value
-                        .get("message")
-                        .or_else(|| value.get("error"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("browser daemon reported an error")
-                        .to_string();
-                    return Some(Err(msg));
-                }
+            stdout_tail.push_str(trimmed);
+            stdout_tail.push('\n');
+            if trimmed.starts_with('{') {
+                json_buf.clear();
+            }
+            json_buf.push_str(trimmed);
+            json_buf.push('\n');
+            let Ok(value) = serde_json::from_str::<Value>(json_buf.trim()) else {
+                continue;
+            };
+            if value.get("ready").and_then(Value::as_bool) == Some(true) {
+                return Some(Ok(value));
+            }
+            // A structured failure the daemon reports before ready — surface
+            // its own message (e.g. "no browser-profile named 'x' — run
+            // auto-login first") instead of a generic timeout.
+            if value.get("ok").and_then(Value::as_bool) == Some(false) {
+                let msg = value
+                    .get("message")
+                    .or_else(|| value.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("browser daemon reported an error")
+                    .to_string();
+                return Some(Err(msg));
             }
         }
         None
@@ -280,12 +340,72 @@ pub async fn spawn_daemon_ready(
                 let _ = err.read_to_string(&mut buf).await;
             }
             let _ = child.kill().await;
-            let tail = buf.trim();
+            // Prefer stderr; fall back to whatever the daemon printed on
+            // stdout (non-JSON text) so the model never sees a bare "closed
+            // before ready" when there was a reason available.
+            let tail = if buf.trim().is_empty() {
+                stdout_tail.trim().chars().take(400).collect::<String>()
+            } else {
+                buf.trim().chars().take(400).collect::<String>()
+            };
             if tail.is_empty() {
                 Err("browser daemon closed before ready".to_string())
             } else {
                 Err(format!("browser daemon closed before ready: {tail}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_hub(path: PathBuf) -> SecurePromptHub {
+        SecurePromptHub::new(path, Arc::new(|_, _| {}))
+    }
+
+    #[test]
+    fn deauthorize_guard_removes_pid_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(dir.path().join("secure-prompt.sock"));
+        let pid = 42_424;
+        hub.authorize(pid);
+        assert!(hub.is_authorized_for_test(pid));
+
+        {
+            let _guard = DeauthorizeGuard { hub: &hub, pid };
+        }
+
+        assert!(!hub.is_authorized_for_test(pid));
+    }
+
+    #[tokio::test]
+    async fn daemon_ready_timeout_kills_and_reaps_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false);
+        let child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap();
+
+        let error = wait_daemon_ready(
+            child,
+            dir.path().join("daemon.log"),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "browser daemon did not report ready in time");
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(result, -1, "timed-out daemon process is still alive");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }

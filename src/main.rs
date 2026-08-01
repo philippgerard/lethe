@@ -147,6 +147,14 @@ enum Command {
     },
     /// Live health check: confirm the model and embeddings actually respond.
     Check,
+    /// Provision or inspect the Alien agent-id identity + vault. Idempotent;
+    /// `install.sh` runs `provision` so a skipped init wizard still sets up
+    /// agent-id when the CLIs are present.
+    #[command(hide = true, name = "agent-id")]
+    AgentId {
+        #[command(subcommand)]
+        command: AgentIdCommand,
+    },
     /// Print a prompt template after workspace/config/embedded resolution.
     #[command(hide = true)]
     Prompt { name: String },
@@ -426,6 +434,15 @@ pub enum ServiceCommand {
         yes: bool,
     },
     /// Show the detected platform, unit path, and live status.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentIdCommand {
+    /// Ensure the L0 identity + credential vault exist (no-op when already
+    /// provisioned or when the core/vault CLIs are absent).
+    Provision,
+    /// Print CLI presence, identity state, and browser CLI health.
     Status,
 }
 
@@ -905,13 +922,14 @@ async fn main() -> Result<()> {
             ),
         },
         Command::Check => h::check().await,
+        Command::AgentId { command } => h::agent_id_command(command).await,
         Command::Prompt { name } => h::print_prompt(&name),
         Command::Prompts { command } => cli::prompts::run(&settings, command),
         Command::InitMemory => h::init_memory(),
         Command::Memory { command } => h::memory_command(command).await,
         Command::Fs { command } => h::fs_command(command),
         Command::Sh { command } => h::sh_command(command),
-        Command::Web { command } => h::web_command(command),
+        Command::Web { command } => h::web_command(command).await,
         Command::Transcribe {
             file_path,
             mime_type,

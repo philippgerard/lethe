@@ -270,11 +270,48 @@ impl LlmRouterConfig {
         !deep.is_empty() && deep != self.model.trim()
     }
 
-    pub fn chat_options(&self) -> ChatOptions {
-        ChatOptions::default()
-            .with_max_tokens(self.max_output_tokens)
-            .with_temperature(self.temperature_millidegrees as f64 / 1000.0)
+    /// Chat options for a specific model. Takes the model rather than reading
+    /// `self.model` because a turn may run on the aux, tool, or deep model instead.
+    pub fn chat_options(&self, model: &str) -> ChatOptions {
+        let options = ChatOptions::default().with_max_tokens(self.max_output_tokens);
+        if rejects_sampling_params(model) {
+            return options;
+        }
+        options.with_temperature(self.temperature_millidegrees as f64 / 1000.0)
     }
+}
+
+/// The gpt-5 reasoning family: `gpt-5`, `gpt-5.4-mini`, `gpt-5.6-terra`, … The
+/// `gpt-5-chat*` variants are conversational, not reasoning models.
+fn is_gpt5_reasoning(model_name: &str) -> bool {
+    let name = model_name.trim();
+    name.starts_with("gpt-5") && !name.starts_with("gpt-5-chat")
+}
+
+/// The o-series: `o1`, `o3-mini`, `o4-mini`, … but not `olive` or `o200k`.
+fn is_o_series(model_name: &str) -> bool {
+    let bytes = model_name.trim().as_bytes();
+    matches!(bytes, [b'o', digit, ..] if digit.is_ascii_digit())
+        && (bytes.len() == 2 || bytes[2] == b'-' || bytes[2] == b'.')
+}
+
+/// Whether `model` rejects a non-default `temperature`/`top_p`.
+///
+/// OpenAI's reasoning models accept only the default sampling params and 400 on
+/// anything else — on Chat Completions and the Responses API alike. This is why
+/// the option is dropped here rather than inside the genai adapter: silently
+/// swapping a caller's 0.7 for the default is the adapter lying about what it
+/// sent, and only the caller knows the request is headed somewhere that cannot
+/// honour it.
+///
+/// Relayed ids (`openrouter/…`, `opencode-go/…`) are left alone: the relay
+/// normalizes params for the upstream model, and those routes are unaffected.
+fn rejects_sampling_params(model: &str) -> bool {
+    let name = strip_slash_provider(model.trim(), "openai");
+    if name.contains('/') {
+        return false;
+    }
+    is_gpt5_reasoning(name) || is_o_series(name)
 }
 
 #[derive(Clone)]
@@ -345,7 +382,7 @@ impl LlmRouter {
             bail!("LLM_MODEL is not set.");
         }
         let use_aux = model != self.config.model.trim();
-        let options = self.config.chat_options();
+        let options = self.config.chat_options(model);
         if let Some(oauth) = &self.openai_oauth
             && should_use_openai_oauth(model, &self.config)
         {
@@ -458,6 +495,8 @@ impl LlmRouter {
             reasoning_content,
             model_iden: model_iden.clone(),
             provider_model_iden: model_iden,
+            stop_reason: None,
+            response_id: None,
             usage: captured_usage.unwrap_or_default(),
             captured_raw_body: None,
         };
@@ -496,7 +535,7 @@ impl LlmRouter {
         }
         let use_aux = model != self.config.model.trim();
 
-        let options = self.config.chat_options();
+        let options = self.config.chat_options(model);
         if let Some(oauth) = &self.openai_oauth
             && should_use_openai_oauth(model, &self.config)
         {
@@ -736,9 +775,7 @@ impl AnthropicOAuthClient {
             .await
         {
             Ok(response) => Ok(response),
-            Err(
-                AnthropicOAuthError::RateLimited { .. } | AnthropicOAuthError::Transient { .. },
-            ) => {
+            Err(error) if anthropic_stream_error_should_fallback(&error) => {
                 // Pre-stream failure (rate limit / network blip before we
                 // got bytes back) — let the non-streaming path retry and
                 // surface the full text in one delta.
@@ -1135,11 +1172,12 @@ fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<
     }
 
     if let Some(endpoint) = api_base {
+        let model_name = strip_slash_provider(model, provider).to_string();
         return Some(RouterTarget {
             endpoint,
             auth_env: auth_env_for_provider(provider).to_string(),
-            adapter: adapter_for_provider(provider).unwrap_or(AdapterKind::OpenAI),
-            model_name: strip_slash_provider(model, provider).to_string(),
+            adapter: adapter_for(provider, &model_name).unwrap_or(AdapterKind::OpenAI),
+            model_name,
         });
     }
 
@@ -1174,11 +1212,12 @@ fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<
     if let Some(slash_provider) = slash_provider
         && let Some(endpoint) = default_endpoint_for_provider(slash_provider)
     {
+        let model_name = strip_slash_provider(model, slash_provider).to_string();
         return Some(RouterTarget {
             endpoint: endpoint.to_string(),
             auth_env: auth_env_for_provider(slash_provider).to_string(),
-            adapter: adapter_for_provider(slash_provider)?,
-            model_name: strip_slash_provider(model, slash_provider).to_string(),
+            adapter: adapter_for(slash_provider, &model_name)?,
+            model_name,
         });
     }
 
@@ -1226,6 +1265,26 @@ fn strip_slash_provider<'a>(model: &'a str, provider: &str) -> &'a str {
     } else {
         model
     }
+}
+
+/// Adapter for `provider`, refined by the model where the protocol depends on
+/// it.
+///
+/// OpenAI's gpt-5 reasoning family cannot combine function tools with reasoning
+/// on `/v1/chat/completions` — the API rejects the request outright and points
+/// at `/v1/responses`, which supports both. An agent request always carries
+/// tools, so those models go to the Responses adapter; otherwise every gpt-5.x
+/// turn would have to give up reasoning to keep its tools.
+///
+/// Only the direct `openai` provider is upgraded. OpenRouter also speaks the
+/// OpenAI protocol but has no `/v1/responses`, and it has its own branch in
+/// [`router_target_for_model`] that pins `AdapterKind::OpenAI`.
+fn adapter_for(provider: &str, model_name: &str) -> Option<AdapterKind> {
+    let adapter = adapter_for_provider(provider)?;
+    if provider == "openai" && adapter == AdapterKind::OpenAI && is_gpt5_reasoning(model_name) {
+        return Some(AdapterKind::OpenAIResp);
+    }
+    Some(adapter)
 }
 
 fn adapter_for_provider(provider: &str) -> Option<AdapterKind> {
@@ -1497,6 +1556,19 @@ fn anthropic_rate_limit_is_retryable(retry_after: Duration) -> bool {
     retry_after <= MAX_ANTHROPIC_RATE_LIMIT_WAIT
 }
 
+/// Whether a failed streaming attempt may issue a second, non-streaming
+/// request. Subscription-window rate limits must fail fast here too; otherwise
+/// the fallback defeats the bounded retry policy in `exec_chat_request`.
+fn anthropic_stream_error_should_fallback(error: &AnthropicOAuthError) -> bool {
+    match error {
+        AnthropicOAuthError::RateLimited { retry_after, .. } => {
+            anthropic_rate_limit_is_retryable(*retry_after)
+        }
+        AnthropicOAuthError::Transient { .. } => true,
+        AnthropicOAuthError::Other(_) => false,
+    }
+}
+
 fn truncate_error(text: &str) -> String {
     const MAX: usize = 500;
     let text = text.trim();
@@ -1522,7 +1594,10 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
                 // apply_cache_markers in agent.rs survive the OAuth path.
                 // Without this every heartbeat re-pays the full system
                 // prompt as fresh input.
-                let cache = message.options.as_ref().and_then(|o| o.cache_control);
+                let cache = message
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.cache_control.as_ref());
                 let prev_len = system_blocks.len();
                 for text in message.content.texts() {
                     if !text.trim().is_empty() {
@@ -1607,10 +1682,17 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
     })
 }
 
-fn cache_control_value(control: CacheControl) -> Value {
+/// Map genai's cache marker onto Anthropic's wire format for the hand-rolled
+/// OAuth path. Anthropic accepts only the 5-minute default and an explicit 1h
+/// TTL, so longer variants clamp to 1h. Lethe itself only ever produces
+/// `Ephemeral` and `Ephemeral1h` — see [`cache_hint_to_genai`].
+fn cache_control_value(control: &CacheControl) -> Value {
     match control {
-        CacheControl::Ephemeral => json!({"type": "ephemeral"}),
-        CacheControl::Persistent => json!({"type": "ephemeral", "ttl": "1h"}),
+        CacheControl::Ephemeral | CacheControl::Memory => json!({"type": "ephemeral"}),
+        CacheControl::Ephemeral5m => json!({"type": "ephemeral", "ttl": "5m"}),
+        CacheControl::Ephemeral1h | CacheControl::Ephemeral24h => {
+            json!({"type": "ephemeral", "ttl": "1h"})
+        }
     }
 }
 
@@ -1672,7 +1754,9 @@ fn anthropic_user_content(content: MessageContent) -> Vec<Value> {
                 "type": "text",
                 "text": format!("[tool call {} omitted in user content]", call.fn_name),
             })),
-            ContentPart::ThoughtSignature(_) => {}
+            ContentPart::ThoughtSignature(_)
+            | ContentPart::ReasoningContent(_)
+            | ContentPart::Custom(_) => {}
         }
     }
     if blocks.is_empty() {
@@ -1696,8 +1780,10 @@ fn anthropic_assistant_content(content: MessageContent) -> Vec<Value> {
                 "name": map_tool_name_to_claude(&call.fn_name),
                 "input": call.fn_arguments,
             })),
-            ContentPart::ThoughtSignature(_) => {}
-            ContentPart::Binary(_) | ContentPart::ToolResponse(_) => {}
+            // Reasoning is dropped rather than replayed: Anthropic only accepts a
+            // thinking block back with its signature, and we don't carry those.
+            ContentPart::ThoughtSignature(_) | ContentPart::ReasoningContent(_) => {}
+            ContentPart::Binary(_) | ContentPart::ToolResponse(_) | ContentPart::Custom(_) => {}
         }
     }
     blocks
@@ -1719,7 +1805,9 @@ fn anthropic_tool_result_content(content: MessageContent) -> Vec<Value> {
             }
             ContentPart::ToolCall(_)
             | ContentPart::Binary(_)
-            | ContentPart::ThoughtSignature(_) => {}
+            | ContentPart::ThoughtSignature(_)
+            | ContentPart::ReasoningContent(_)
+            | ContentPart::Custom(_) => {}
         }
     }
     blocks
@@ -1727,7 +1815,7 @@ fn anthropic_tool_result_content(content: MessageContent) -> Vec<Value> {
 
 fn anthropic_tool_schema(tool: genai::chat::Tool) -> Value {
     json!({
-        "name": map_tool_name_to_claude(&tool.name),
+        "name": map_tool_name_to_claude(tool.name.as_str()),
         "description": tool.description.unwrap_or_default(),
         "input_schema": tool.schema.unwrap_or_else(|| json!({
             "type": "object",
@@ -1758,9 +1846,12 @@ fn drop_leading_non_user_messages(messages: &mut Vec<Value>) {
     // `tool_use` blocks whose `tool_result`s are the *next* (user-role) message;
     // dropping that assistant orphans those results, and Anthropic 400s on a
     // leading `tool_result` with no preceding `tool_use`. So after draining to
-    // the first user message, drop it too if it still carries a tool_result (its
-    // producing assistant is gone), then re-scan. Each step removes at least one
-    // message, so this terminates. (Without the loop, the second call site —
+    // the first user message, strip any tool_result blocks whose producing
+    // assistant is now gone. Consecutive user-role messages are merged before
+    // this pass, so the same content array may also carry the next real user
+    // question; preserve those non-tool blocks rather than dropping the whole
+    // message. If no content remains, remove the message and re-scan. (Without
+    // the loop, the second call site —
     // after clean_orphaned_tool_pairs has shifted an assistant_tool_use to the
     // front — would re-orphan a tool_result with nothing left to clean it up.)
     loop {
@@ -1776,25 +1867,23 @@ fn drop_leading_non_user_messages(messages: &mut Vec<Value>) {
                 if index > 0 {
                     messages.drain(0..index);
                 }
-                if message_contains_tool_result(&messages[0]) {
-                    messages.remove(0);
-                    continue;
+                if let Some(content) = messages[0].get_mut("content").and_then(Value::as_array_mut)
+                    && content.iter().any(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                {
+                    content.retain(|block| {
+                        block.get("type").and_then(Value::as_str) != Some("tool_result")
+                    });
+                    if content.is_empty() {
+                        messages.remove(0);
+                        continue;
+                    }
                 }
                 return;
             }
         }
     }
-}
-
-fn message_contains_tool_result(message: &Value) -> bool {
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            content
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
 }
 
 fn merge_message_content(previous: &mut Value, next: &Value) {
@@ -2083,6 +2172,7 @@ impl AnthropicStreamState {
         if cache_creation.is_some() || cache_read.is_some() {
             self.usage.prompt_tokens_details = Some(PromptTokensDetails {
                 cache_creation_tokens: cache_creation,
+                cache_creation_details: None,
                 cached_tokens: cache_read,
                 audio_tokens: None,
             });
@@ -2121,6 +2211,8 @@ impl AnthropicStreamState {
             reasoning_content: None,
             model_iden: ModelIden::new(AdapterKind::Anthropic, requested),
             provider_model_iden: ModelIden::new(AdapterKind::Anthropic, provider),
+            stop_reason: None,
+            response_id: None,
             usage: self.usage,
             captured_raw_body: None,
         }
@@ -2194,6 +2286,7 @@ fn anthropic_response_to_chat_response(data: Value, requested_model: &str) -> Re
         if cache_creation.is_some() || cache_read.is_some() {
             usage.prompt_tokens_details = Some(PromptTokensDetails {
                 cache_creation_tokens: cache_creation,
+                cache_creation_details: None,
                 cached_tokens: cache_read,
                 audio_tokens: None,
             });
@@ -2207,6 +2300,8 @@ fn anthropic_response_to_chat_response(data: Value, requested_model: &str) -> Re
         reasoning_content: None,
         model_iden: ModelIden::new(AdapterKind::Anthropic, requested_model),
         provider_model_iden: ModelIden::new(AdapterKind::Anthropic, provider_model),
+        stop_reason: None,
+        response_id: None,
         usage,
         captured_raw_body: None,
     })
@@ -2439,7 +2534,8 @@ fn into_chat_message(message: LlmMessage) -> ChatMessage {
 fn cache_hint_to_genai(hint: CacheHint) -> genai::chat::CacheControl {
     match hint {
         CacheHint::Ephemeral => genai::chat::CacheControl::Ephemeral,
-        CacheHint::Persistent => genai::chat::CacheControl::Persistent,
+        // Upstream's Ephemeral1h is what the fork used to call Persistent.
+        CacheHint::Persistent => genai::chat::CacheControl::Ephemeral1h,
     }
 }
 
@@ -2621,6 +2717,26 @@ mod tests {
         assert!(!anthropic_rate_limit_is_retryable(retry_after));
     }
 
+    #[test]
+    fn anthropic_stream_fallback_respects_the_retry_window() {
+        let short_limit = AnthropicOAuthError::RateLimited {
+            message: "burst limit".to_string(),
+            retry_after: Duration::from_secs(5),
+        };
+        let long_limit = AnthropicOAuthError::RateLimited {
+            message: "subscription window".to_string(),
+            retry_after: Duration::from_secs(60 * 60),
+        };
+        let transient = AnthropicOAuthError::Transient {
+            message: "connection reset".to_string(),
+            retry_after: Duration::from_secs(5),
+        };
+
+        assert!(anthropic_stream_error_should_fallback(&short_limit));
+        assert!(!anthropic_stream_error_should_fallback(&long_limit));
+        assert!(anthropic_stream_error_should_fallback(&transient));
+    }
+
     #[tokio::test]
     async fn anthropic_long_rate_limit_does_not_arm_shared_gate() {
         let client = AnthropicOAuthClient {
@@ -2751,6 +2867,41 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_body_keeps_real_user_text_after_dropping_a_leading_tool_pair() {
+        let request = build_chat_request(vec![
+            LlmMessage::assistant_with_tool_calls(
+                "",
+                vec![HistoricalToolCall {
+                    call_id: "call_1".to_string(),
+                    fn_name: "calculator".to_string(),
+                    fn_arguments: serde_json::json!({"expression": "2+2"}),
+                    thought_signatures: None,
+                }],
+            ),
+            LlmMessage::tool_results(vec![HistoricalToolResponse {
+                call_id: "call_1".to_string(),
+                content: "4".to_string(),
+                source_message_id: None,
+            }]),
+            LlmMessage::user("real user message"),
+        ]);
+
+        let body = anthropic_request_body("claude-opus-4-6", request, &ChatOptions::default());
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "real user message");
+        assert!(
+            messages[0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "tool_result")
+        );
+    }
+
+    #[test]
     fn router_target_maps_openrouter_prefix_to_openai_compatible_endpoint() {
         let config = LlmRouterConfig {
             model: "openrouter/moonshotai/kimi-k2.6".to_string(),
@@ -2769,6 +2920,101 @@ mod tests {
         assert_eq!(target.auth_env, "OPENROUTER_API_KEY");
         assert_eq!(target.adapter, AdapterKind::OpenAI);
         assert_eq!(target.model_name, "moonshotai/kimi-k2.6");
+    }
+
+    fn config_for(model: &str, provider: &str) -> LlmRouterConfig {
+        LlmRouterConfig {
+            model: model.to_string(),
+            aux_model: String::new(),
+            tool_model: String::new(),
+            deep_model: String::new(),
+            provider: provider.to_string(),
+            api_base: String::new(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 700,
+        }
+    }
+
+    #[test]
+    fn direct_openai_gpt5_routes_to_the_responses_adapter() {
+        // gpt-5 reasoning models reject function tools on /v1/chat/completions
+        // and must go to /v1/responses, which supports tools + reasoning.
+        for model in [
+            "openai/gpt-5.6-terra",
+            "openai/gpt-5.5",
+            "openai/gpt-5.4-mini",
+        ] {
+            let config = config_for(model, "");
+            let target = router_target_for_model(model, &config).unwrap();
+            assert_eq!(
+                target.adapter,
+                AdapterKind::OpenAIResp,
+                "{model} must use the Responses API"
+            );
+            assert_eq!(target.endpoint, OPENAI_ENDPOINT);
+        }
+    }
+
+    #[test]
+    fn direct_openai_non_reasoning_models_stay_on_chat_completions() {
+        // gpt-5-chat* is conversational, not a reasoning model.
+        for model in ["openai/gpt-5-chat-latest", "openai/gpt-4o"] {
+            let config = config_for(model, "");
+            let target = router_target_for_model(model, &config).unwrap();
+            assert_eq!(
+                target.adapter,
+                AdapterKind::OpenAI,
+                "{model} must stay on chat completions"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_gpt5_stays_on_chat_completions() {
+        // OpenRouter speaks the OpenAI protocol but exposes no /v1/responses.
+        let config = config_for("openrouter/openai/gpt-5.4", "");
+        let target = router_target_for_model(&config.model, &config).unwrap();
+        assert_eq!(target.adapter, AdapterKind::OpenAI);
+        assert_eq!(target.endpoint, OPENROUTER_ENDPOINT);
+    }
+
+    #[test]
+    fn openai_reasoning_models_drop_temperature() {
+        let config = config_for("gpt-5.6-terra", "openai");
+        for model in [
+            "gpt-5.6-terra",
+            "openai/gpt-5.6-terra",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "gpt-5",
+            "o3-mini",
+            "o1",
+        ] {
+            assert!(
+                config.chat_options(model).temperature.is_none(),
+                "{model} rejects a non-default temperature"
+            );
+            assert_eq!(config.chat_options(model).max_tokens, Some(100));
+        }
+    }
+
+    #[test]
+    fn everything_else_keeps_its_temperature() {
+        let config = config_for("claude-opus-4-8", "anthropic");
+        for model in [
+            "claude-opus-4-8",
+            "gpt-5-chat-latest",
+            "gpt-4o",
+            // Relayed ids are normalized by the relay, so they are left alone.
+            "openrouter/openai/gpt-5.4",
+            "openrouter/anthropic/claude-opus-4.7",
+        ] {
+            assert_eq!(
+                config.chat_options(model).temperature,
+                Some(0.7),
+                "{model} must keep its configured temperature"
+            );
+        }
     }
 
     #[test]

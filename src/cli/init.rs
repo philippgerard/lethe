@@ -798,8 +798,10 @@ fn info(message: &str) {
 
 /// Provision the agent's Alien identity + vault at init time and report it, or
 /// point the user at the CLIs to install when they're absent. Best-effort — a
-/// failure here never blocks setup (the daemon re-provisions on start).
-async fn provision_agent_id(settings: &Settings) {
+/// failure here never blocks setup (the daemon re-provisions on start). Also
+/// run by `lethe agent-id provision`, which install.sh calls so a skipped
+/// wizard still provisions.
+pub(crate) async fn provision_agent_id(settings: &Settings) {
     if !lethe::agent_id::is_enabled() {
         return;
     }
@@ -825,6 +827,13 @@ async fn provision_agent_id(settings: &Settings) {
             &jkt[..jkt.len().min(12)]
         )),
         None => info("Alien identity ready. Bind it to you later with the agent_id_bind tool."),
+    }
+    if let lethe::agent_id::BrowserCliHealth::Broken(bin) = lethe::agent_id::browser_cli_health() {
+        warn(&format!(
+            "Vault-sealed browser CLI at {} fails to start — browser tools stay \
+             disabled. Reinstall: npm i -g @alien-id/agent-id-browser",
+            bin.display()
+        ));
     }
 }
 

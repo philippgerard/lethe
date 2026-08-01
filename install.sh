@@ -14,6 +14,8 @@
 #   LETHE_INSTALL_FROM_SOURCE Force a `cargo build --release` even if
 #                             a binary release is available.
 #   LETHE_SKIP_INIT           Skip the post-install `lethe init` wizard.
+#   LETHE_SKIP_AGENT_ID       Skip installing the Alien agent-id CLIs
+#                             (identity + vault + vault-sealed browser).
 #   LETHE_REPO_URL            Override clone URL for the source path.
 #   LETHE_RELEASE_BASE_URL    Override binary release base URL.
 
@@ -25,8 +27,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-REPO_URL="${LETHE_REPO_URL:-https://github.com/atemerev/lethe.git}"
-REPO_OWNER="${LETHE_REPO_OWNER:-atemerev}"
+REPO_URL="${LETHE_REPO_URL:-https://github.com/alien-id/lethe.git}"
+REPO_OWNER="${LETHE_REPO_OWNER:-alien-id}"
 REPO_NAME="${LETHE_REPO_NAME:-lethe}"
 RELEASE_BASE_URL="${LETHE_RELEASE_BASE_URL:-https://github.com/$REPO_OWNER/$REPO_NAME/releases/latest/download}"
 LETHE_HOME="${LETHE_HOME:-$HOME/.lethe}"
@@ -193,6 +195,58 @@ build_from_source() {
     fi
 }
 
+# Alien agent-id CLIs: identity + credential vault, and (when Chrome is
+# present) the vault-sealed browser. All three come from npm as a matching
+# release set — never mix npm packages with tarballs packed from a checkout,
+# or the browser can end up importing core files its published dependency
+# doesn't have. Best-effort: Lethe works without them.
+install_agent_id() {
+    if [ "${LETHE_SKIP_AGENT_ID:-0}" = "1" ]; then
+        info "LETHE_SKIP_AGENT_ID=1 — skipping Alien agent-id CLIs."
+        return
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        warn "npm not found — skipping Alien agent-id (identity + vault, optional)."
+        warn "Install Node.js, then: npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault"
+        return
+    fi
+
+    if command -v agent-id-core >/dev/null 2>&1 && command -v agent-id-vault >/dev/null 2>&1; then
+        info "Alien agent-id CLIs already on PATH."
+    elif npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault; then
+        success "Alien agent-id CLIs installed (identity + vault)."
+    else
+        warn "Could not install the agent-id CLIs — Lethe works without them."
+        return
+    fi
+
+    # The vault-sealed browser drives real Google Chrome; without Chrome the
+    # CLI is dead weight, so only install it when Chrome is on the host.
+    if command -v google-chrome-stable >/dev/null 2>&1 || command -v google-chrome >/dev/null 2>&1; then
+        if command -v agent-id-browser >/dev/null 2>&1; then
+            info "Vault-sealed browser CLI already on PATH."
+        elif npm i -g @alien-id/agent-id-browser; then
+            success "Vault-sealed browser CLI installed."
+        else
+            warn "Could not install @alien-id/agent-id-browser — browser tools stay off."
+        fi
+    else
+        info "Google Chrome not found — skipping the vault-sealed browser CLI."
+        info "Install Chrome, then: npm i -g @alien-id/agent-id-browser"
+    fi
+}
+
+# Idempotent: creates the L0 identity + vault when the CLIs are present.
+# Covers every path where the init wizard doesn't run (existing config,
+# LETHE_SKIP_INIT, no TTY) — `lethe init` provisions on its own.
+provision_agent_id() {
+    if [ "${LETHE_SKIP_AGENT_ID:-0}" = "1" ]; then
+        return
+    fi
+    LETHE_HOME="$LETHE_HOME" "$BIN_DIR/lethe" agent-id provision || \
+        warn "agent-id provisioning failed — rerun with: $BIN_DIR/lethe agent-id provision"
+}
+
 run_init_wizard() {
     if [ "${LETHE_SKIP_INIT:-0}" = "1" ]; then
         info "LETHE_SKIP_INIT=1 — skipping setup wizard."
@@ -229,7 +283,11 @@ main() {
         build_from_source
     fi
 
+    install_agent_id
+
     run_init_wizard
+
+    provision_agent_id
 
     echo ""
     success "Lethe installed."

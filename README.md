@@ -1,6 +1,6 @@
 # Lethe
 
-[![Release](https://img.shields.io/github/v/release/atemerev/lethe?style=flat-square&color=blue)](https://github.com/atemerev/lethe/releases/latest)
+[![Release](https://img.shields.io/github/v/release/alien-id/lethe?style=flat-square&color=blue)](https://github.com/alien-id/lethe/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88+-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 ![Swiss Made Software](https://img.shields.io/badge/swiss%20made-software-red?style=flat-square&labelColor=FF0000&logoColor=white)
@@ -23,7 +23,7 @@ Prefer to build from source?
 > Linux linker note: check `.cargo/config.toml` first. If it points at `mold`, install it before building (`sudo dnf install mold` or `sudo apt-get install mold`) or adjust the linker setting for your system.
 
 ```bash
-git clone https://github.com/atemerev/lethe.git
+git clone https://github.com/alien-id/lethe.git
 cd lethe
 cargo build --release
 install -m 755 target/release/lethe ~/.local/bin/lethe
@@ -86,7 +86,7 @@ Core runtime pieces:
 | Area | Rust modules | Responsibility |
 |------|--------------|----------------|
 | Agent/cortex | `src/agent.rs` | Prompt assembly, LLM calls, tool loop, and actor turn execution. |
-| LLM routing | `src/llm/` | `genai` client, OAuth (ChatGPT Plus/Pro, Claude Pro/Max) and API-key auth, OpenRouter prompt-cache forwarding via vendored genai patch, model metadata. |
+| LLM routing | `src/llm/` | `genai` client, OAuth (ChatGPT Plus/Pro, Claude Pro/Max) and API-key auth, per-model prompt-cache dialects, OpenRouter prompt-cache forwarding via vendored genai patch, model metadata. |
 | Memory | `src/memory/` | Markdown memory blocks, SQLite-vec recall tables (`memory`, `message_history`, plus their `*_vec` virtual siblings), SQLite todos. |
 | Recall | `src/hippocampus.rs` | Hybrid lexical/vector recall over notes, archival memories, and conversation history. |
 | Actors | `src/actor.rs`, `src/actor/` | Resident Kameo actors, supervisor-owned state, mailbox/event routing, autonomous subagent wakeups, persistent DMN, SQLite-backed actor snapshots that survive restarts. |
@@ -97,7 +97,7 @@ Core runtime pieces:
 ## Build
 
 ```bash
-git clone https://github.com/atemerev/lethe.git
+git clone https://github.com/alien-id/lethe.git
 cd lethe
 cp .env.example .env
 cargo build --release
@@ -120,11 +120,9 @@ cargo test
 cargo build --release
 ```
 
-The built-in `browser_*` tools shell out to the external
-[`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI
-(`npm install -g agent-browser`). When the agent-id integration's vault-sealed
-browser is active it takes over instead (and the built-in `browser_*` tools are
-hidden, so there's only ever one browser) — see [Alien agent-id](#alien-agent-id).
+Browser automation uses the vault-sealed Alien Browser exclusively; the former
+standalone `agent-browser`/`browser_*` integration has been removed. See
+[Alien agent-id](#alien-agent-id).
 
 ## Running
 
@@ -209,12 +207,14 @@ Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX
 
 ### Prompt caching
 
-Lethe stamps cache breakpoints on the system prompt (1h-TTL persistent prefix + 5min-TTL ephemeral tail) and forwards them through to:
+Lethe stamps cache breakpoints on the system prompt — a 1h-TTL prefix (identity, persona, instructions) plus a 5min-TTL tail (clock, memory state, recall) — but only for models that need an explicit breakpoint. Which marker a model gets is decided by its dialect in [`src/llm/dialect.rs`](src/llm/dialect.rs):
 
-- **Anthropic direct** and **Anthropic OAuth** — cache_control is emitted on system blocks.
-- **OpenRouter** — cache_control is emitted on system content parts, which OpenRouter forwards to upstream providers that support explicit caching (Anthropic, Qwen, Gemini explicit). Providers with automatic prefix caching (OpenAI, Grok, Moonshot/Kimi, Groq, DeepSeek, Gemini implicit) ignore the field but benefit from the stable structured shape.
+- **Anthropic direct** and **Anthropic OAuth** — emitted on system blocks, 1h + 5min.
+- **OpenRouter → Anthropic** — emitted on system content parts. OpenRouter relays `cache_control` to the upstream vendor (converting between the Anthropic and OpenAI marker formats), and Anthropic is the only vendor accepting the extended `ttl: "1h"`.
+- **OpenRouter → Gemini / Qwen** — explicit breakpoints too, but 5min only: the 1h TTL is Anthropic-only.
+- **Everything else** — no marker. OpenAI, Grok, Moonshot/Kimi, Groq, DeepSeek and Z.AI/GLM cache automatically, so a breakpoint buys nothing.
 
-Both `genai`'s native OpenAI adapter and our vendored fork now carry the patch — see [`vendor/genai/LETHE_FORK.md`](vendor/genai/LETHE_FORK.md) for the patch surface.
+See [OpenRouter's prompt-caching docs](https://openrouter.ai/docs/features/prompt-caching) for the per-vendor rules. Upstream `genai` only supports request-level `cache_control` (OpenAI's native `prompt_cache_retention`), which does not cover the OpenRouter route — forwarding it per-message is the one patch our vendored fork carries. See [`vendor/genai/LETHE_FORK.md`](vendor/genai/LETHE_FORK.md).
 
 ## Configuration
 
@@ -377,34 +377,50 @@ display is available). These are provided by the
 [`agent-id`](https://github.com/alien-id/agent-id) CLIs (`agent-id-core`,
 `agent-id-vault`, `agent-id-browser`); Lethe shells out to them.
 
-Enable identity + vault by installing the two published CLIs so they're on `PATH`:
+Enable identity + vault by installing the two published CLIs so they're on `PATH`
+(`install.sh` does this automatically when npm is present; `LETHE_SKIP_AGENT_ID=1`
+opts out):
 
 ```bash
 npm i -g @alien-id/agent-id-core @alien-id/agent-id-vault   # identity + vault
 ```
 
 `lethe init` provisions an L0 identity + vault automatically when the CLIs are
-present; the daemon re-provisions on start. State is isolated per instance under
-`AGENT_ID_STATE_DIR` (default `<LETHE_HOME>/agent-id`).
+present; the daemon re-provisions on start, and `install.sh` runs the same
+provisioning (`lethe agent-id provision`, idempotent) even when the init wizard
+is skipped. State is isolated per instance under `AGENT_ID_STATE_DIR` (default
+`<LETHE_HOME>/agent-id`). `lethe check` reports CLI presence, identity state,
+and browser CLI health.
 
 ### Browser tools (optional)
 
 The vault-sealed browser adds the `alien_browser_*` tools (`_open` starts a
 session, `_act` runs any page verb — snapshot/click/type/navigate/… — and
 `_fill_secret` / `_fill_otp` inject vaulted credentials the model never sees).
-Because it's a superset of the built-in browser, **it replaces it**: whenever the
-vault-sealed browser is active the plain `browser_*` tools are hidden, so the
-agent only ever sees one browser. `agent-id-browser` is **marketplace-only — not
-on npm**; install it from the plugin tarball and point `AGENT_ID_BROWSER_BIN` at
-it (or put it on `PATH`). It drives **real Google Chrome** via `channel:"chrome"`
-(a stealth-tuned patchright launch — not bundled Chromium), so the host needs
-Chrome installed:
+It is Lethe's only browser: when the CLI is absent — or present but unable to
+start; Lethe probes it once per run — the `alien_browser_*` tools are hidden and
+`lethe check` says why. The CLI drives **real Google Chrome** via
+`channel:"chrome"` (a stealth-tuned patchright launch — not bundled Chromium),
+so the host needs Chrome installed:
+
+```bash
+npm i -g @alien-id/agent-id-browser   # pulls matching core/vault + patchright
+# …and install Google Chrome (google-chrome-stable) on the host.
+```
+
+`install.sh` does this automatically when npm and Chrome are both present.
+Install the browser **from npm** so core/vault/browser come from one release
+set. Do not pack the plugin from a repo checkout against npm-installed
+dependencies: mid-release-cycle the checkout's imports can be ahead of the
+published `@alien-id/agent-id-core`, and the CLI dies in its module loader
+before parsing a single argument. To run bleeding-edge browser code from a
+checkout, let the workspace supply its siblings instead:
 
 ```bash
 # From a checkout of github.com/alien-id/agent-id:
-( cd plugins/agent-id-browser && bun pm pack --destination /tmp )   # -> /tmp/alien-id-agent-id-browser-*.tgz
-npm i -g /tmp/alien-id-agent-id-browser-*.tgz    # pulls core/vault + patchright
-# …and install Google Chrome (google-chrome-stable) on the host.
+bun install                          # links workspace core/vault next to the plugin
+# then point Lethe at the checkout's CLI:
+AGENT_ID_BROWSER_BIN=<checkout>/plugins/agent-id-browser/bin/cli.mjs
 ```
 
 Chrome refuses to run as **root** with its sandbox on. In a container that runs as
@@ -413,12 +429,14 @@ root (the container is the isolation boundary), set
 stays on. Headed login (`alien_browser_login`) needs a display and is therefore
 unavailable on a headless server — there, use the headless flow below.
 
-**Headless login flow:** add a `login` credential *with a `login_url`* (via
-`vault_add`), then `alien_browser_auto_login` to sign in and seal a reusable
-browser-profile, then `alien_browser_open` / `_act` to drive it. `open` before a
-profile exists reports "no browser-profile" — that means run `auto_login` first.
-(A site with an aggressive anti-automation wall may block headless login; that
-needs a one-time headed sign-in on a machine with a display.)
+**Headless flow:** `alien_browser_open` automatically creates the shared `main`
+profile as an anonymous L0 cookie jar, so public pages work immediately. For a
+site that needs an account, add a `login` credential *with a `login_url`* (via
+`vault_add`), then use `alien_browser_auto_login` to sign in and reseal that
+profile. Inspect forms with `alien_browser_inspect_form` and fill ordinary fields,
+selections, checks, and workspace file uploads in one verified
+`alien_browser_fill_form` call. (A site with an aggressive anti-automation wall
+may still need a one-time headed sign-in on a machine with a display.)
 
 | env var | default | meaning |
 |---|---|---|
@@ -498,7 +516,14 @@ scripts/package-release
 ls dist/
 ```
 
-Tagged pushes (`v*`) build GitHub release assets on a three-runner matrix — `linux-x86_64`, `linux-aarch64`, `macos-aarch64` — each producing one `lethe-<target>.tar.gz`, with `lethe-migrate-<target>.tar.gz` built by the separate `release-migrator.yml` workflow (`install.sh` and `update.sh` consume the `lethe-*` assets from the latest release). Linux gnu binaries are built on `ubuntu-24.04(-arm)` for a glibc 2.39 floor (required by the prebuilt onnxruntime binaries fastembed pulls in — end-user floor: Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL/Rocky 10+); macOS binaries link only against system frameworks.
+Tagged pushes (`v*`) build GitHub release assets on a three-runner matrix —
+`linux-x86_64`, `linux-aarch64`, and `macos-aarch64` — each producing one
+`lethe-<target>.tar.gz` plus its `.sha256` checksum (`install.sh` and
+`update.sh` consume these assets from the latest release). The separate
+`release-migrator.yml` workflow produces the optional legacy
+`lethe-migrate-<target>.tar.gz` assets and checksums. Linux GNU binaries are
+built on Ubuntu 24.04 for a glibc 2.39 floor; macOS binaries link only against
+system frameworks.
 
 Useful smoke checks:
 

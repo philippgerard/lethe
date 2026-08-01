@@ -1,13 +1,18 @@
 name: Release
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 # Incremental compilation only helps repeated local builds; in CI it just
 # bloats the cache. Turning it off keeps the rust-cache small enough to avoid
@@ -18,8 +23,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify source
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install mold
+        run: curl -fsSL https://github.com/rui314/mold/releases/download/v2.41.0/mold-2.41.0-x86_64-linux.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-on-failure: "true"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check release scripts
+        run: bash -n install.sh update.sh scripts/package-release
+
+      - name: Test Lethe
+        env:
+          LETHE_HOME: ${{ runner.temp }}/lethe-home
+        run: cargo test --locked --no-default-features
+
+      - name: Test vendored genai library
+        run: cargo test --locked --manifest-path vendor/genai/Cargo.toml --lib
+
   build:
     name: Build ${{ matrix.name }}
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -30,18 +69,25 @@ jobs:
           # `__isoc23_strtol*` symbols introduced in glibc 2.39. End-user
           # floor: Ubuntu 24.04+, Debian 13+, Fedora 40+, RHEL/Rocky 10+.
           # macOS binaries link only system libs and stay portable per arch.
+          # The only native build dependency is the mold linker (required by
+          # .cargo/config.toml on Linux). It is fetched as a static binary
+          # from its GitHub releases instead of apt: the arm64 runners pull
+          # from ports.ubuntu.com, whose outages have broken this workflow,
+          # while GitHub-to-GitHub downloads share the runner's own
+          # infrastructure. protobuf was a leftover — nothing in Cargo.lock
+          # uses protoc since the LanceDB migrator moved to its own workflow.
           - name: linux-x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config mold
+            deps: curl -fsSL https://github.com/rui314/mold/releases/download/v2.41.0/mold-2.41.0-x86_64-linux.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local
           - name: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            deps: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev pkg-config mold
+            deps: curl -fsSL https://github.com/rui314/mold/releases/download/v2.41.0/mold-2.41.0-aarch64-linux.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local
           - name: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
-            deps: brew install protobuf
+            deps: "true"
 
     steps:
       - uses: actions/checkout@v6
@@ -55,9 +101,18 @@ jobs:
         with:
           workspaces: .
           cache-on-failure: "true"
+          cache-directories: |
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/ort.pyke.io
 
       - name: Install native dependencies
         run: ${{ matrix.deps }}
+
+      # ort-sys stores its downloaded static library outside target/. A restored
+      # Cargo build-script result can otherwise keep a stale -L path after that
+      # external cache was evicted.
+      - name: Refresh ONNX Runtime link metadata
+        run: cargo clean -p ort-sys
 
       - name: Build lethe
         run: cargo build --release --locked --bin lethe
@@ -79,6 +134,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/download-artifact@v8

@@ -40,6 +40,9 @@ const MAX_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// Window to absorb the spawn→authorize race: a freshly spawned CLI child may
 /// connect before the bridge has registered its PID.
 const AUTHORIZE_WAIT: Duration = Duration::from_secs(1);
+/// Maximum accepted HTTP request body. Secure-prompt field specs and sealed
+/// responses are normally only a few KiB, so larger declarations are invalid.
+const MAX_BODY: usize = 256 * 1024;
 
 pub type Emit = Arc<dyn Fn(&str, Value) + Send + Sync>;
 
@@ -104,6 +107,11 @@ impl SecurePromptHub {
 
     fn is_authorized(&self, pid: u32) -> bool {
         self.inner.authorized_pids.lock().unwrap().contains(&pid)
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_authorized_for_test(&self, pid: u32) -> bool {
+        self.is_authorized(pid)
     }
 
     async fn wait_authorized(&self, pid: u32) -> bool {
@@ -275,6 +283,33 @@ async fn handle_conn(hub: SecurePromptHub, stream: UnixStream) -> std::io::Resul
             return Ok(());
         }
     };
+
+    // A notice raises a card and returns immediately — no key exchange, nothing
+    // to collect. It exists for challenges the owner answers somewhere else
+    // entirely: a Google "tap Yes on your phone" prompt is approved in Google's
+    // own app, so the browser child needs to tell the owner and keep waiting,
+    // not ask them to type anything here.
+    if spec.get("kind").and_then(Value::as_str) == Some("notice") {
+        let event = spec
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // Scope what a child may raise to its own namespace, so a compromised
+        // CLI cannot forge identity or secure-input lifecycle events.
+        if !event.starts_with("browser.") {
+            write_http(
+                &mut write_half,
+                400,
+                &json!({ "error": "notice event must be under `browser.`" }),
+            )
+            .await?;
+            return Ok(());
+        }
+        let data = spec.get("data").cloned().unwrap_or_else(|| json!({}));
+        hub.emit(event, data);
+        write_http(&mut write_half, 200, &json!({ "ok": true })).await?;
+        return Ok(());
+    }
 
     let request_id = uuid::Uuid::new_v4().to_string();
     let server = ServerEphemeral::generate();
@@ -489,7 +524,6 @@ async fn read_http_request(
     // Bound the body: field specs and sealed envelopes are a few KB at most, so a
     // peer (or a PID-reuse impostor) declaring a huge Content-Length must not be
     // able to make this daemon — which holds the vault key — buffer to OOM.
-    const MAX_BODY: usize = 256 * 1024;
     if content_length > MAX_BODY {
         return Err("request body too large".into());
     }
@@ -612,6 +646,21 @@ mod tests {
         assert_eq!(find_subslice(b"abcd", b"\r\n\r\n"), None);
     }
 
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected_before_it_is_buffered() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (mut read_half, _write_half) = server.into_split();
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let error = read_http_request(&mut read_half).await.unwrap_err();
+
+        assert_eq!(error, "request body too large");
+    }
+
     type Events = Arc<StdMutex<Vec<(String, Value)>>>;
 
     fn test_hub(socket: PathBuf) -> (SecurePromptHub, Events) {
@@ -658,6 +707,59 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("no secure_input.request emitted");
+    }
+
+    /// A notice raises a card and returns at once, for challenges the owner
+    /// answers elsewhere — a Google push prompt is approved in Google's own app,
+    /// so the browser child must tell the owner and keep polling the page rather
+    /// than block on a value nobody will type here.
+    #[tokio::test]
+    async fn notice_emits_an_event_and_returns_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sp.sock");
+        let (hub, events) = test_hub(socket.clone());
+        let listener = hub.bind().unwrap();
+        tokio::spawn(serve(hub.clone(), listener));
+        hub.authorize(std::process::id());
+
+        let notice = json!({
+            "kind": "notice",
+            "event": "browser.confirmation_required",
+            "data": { "profile": "google", "prompt": "Tap 42 on your phone" },
+        });
+        let (status, body) = cli_post(&socket, &notice.to_string()).await;
+        assert_eq!(status, 200, "body: {body}");
+
+        let captured = events.lock().unwrap().clone();
+        let (name, data) = captured.first().expect("an event was emitted").clone();
+        assert_eq!(name, "browser.confirmation_required");
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));
+        assert_eq!(
+            data.get("prompt").and_then(Value::as_str),
+            Some("Tap 42 on your phone")
+        );
+        // Nothing is pending: a notice asks for no value, so it must not leave a
+        // card the client would try to fill.
+        assert!(hub.list_pending().is_empty());
+    }
+
+    /// A child may only raise events in its own namespace, so a compromised CLI
+    /// cannot forge identity or secure-input lifecycle events.
+    #[tokio::test]
+    async fn notice_refuses_events_outside_the_browser_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("sp.sock");
+        let (hub, events) = test_hub(socket.clone());
+        let listener = hub.bind().unwrap();
+        tokio::spawn(serve(hub.clone(), listener));
+        hub.authorize(std::process::id());
+
+        for forged in ["secure_input.resolved", "agent_id.bound", ""] {
+            let notice = json!({ "kind": "notice", "event": forged, "data": {} });
+            let (status, _) = cli_post(&socket, &notice.to_string()).await;
+            assert_eq!(status, 400, "event '{forged}' should be refused");
+        }
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

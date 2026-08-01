@@ -330,6 +330,10 @@ pub struct ActorConfig {
     pub persistent: bool,
     #[serde(default)]
     pub completion_delivery: ActorCompletionDelivery,
+    /// System-driven background actor (DMN reflector, future proactivity):
+    /// consumers route its activity out of user-facing surfaces.
+    #[serde(default)]
+    pub background: bool,
 }
 
 impl ActorConfig {
@@ -344,6 +348,7 @@ impl ActorConfig {
             max_messages: 50,
             persistent: false,
             completion_delivery: ActorCompletionDelivery::default(),
+            background: false,
         }
     }
 

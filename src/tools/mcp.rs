@@ -231,8 +231,30 @@ async fn ensure_session(url: &str, token: &str) -> Result<McpSession, String> {
     Ok(session)
 }
 
-fn session_expired(error: &str) -> bool {
-    error.contains("HTTP 404") || error.to_lowercase().contains("session")
+#[derive(Debug)]
+enum RpcCallError {
+    /// Streamable HTTP defines HTTP 404 for an expired or otherwise invalid
+    /// `Mcp-Session-Id`. Keep this classification structural: a JSON-RPC
+    /// application error is not a transport-session signal merely because its
+    /// message happens to contain the word "session".
+    SessionExpired(String),
+    Other(String),
+}
+
+impl RpcCallError {
+    fn into_message(self) -> String {
+        match self {
+            Self::SessionExpired(message) | Self::Other(message) => message,
+        }
+    }
+}
+
+/// Only side-effect-free protocol reads may be replayed automatically after a
+/// session handshake is renewed. A `tools/call` can have completed remotely
+/// even when its response says the session is gone, so replaying it could
+/// duplicate an external effect.
+fn retry_after_session_expiry_is_safe(method: &str) -> bool {
+    matches!(method, "tools/list")
 }
 
 async fn do_rpc(
@@ -242,32 +264,62 @@ async fn do_rpc(
     method: &str,
     params: Value,
     timeout: Duration,
-) -> Result<Value, String> {
+) -> Result<Value, RpcCallError> {
     let id = next_id();
     let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-    let (status, content_type, _sid, text) = post_rpc(url, token, session, &body, timeout).await?;
+    let (status, content_type, _sid, text) = post_rpc(url, token, session, &body, timeout)
+        .await
+        .map_err(RpcCallError::Other)?;
     if !status.is_success() {
         let head: String = text.chars().take(200).collect();
-        return Err(format!("Error: MCP {method} failed: HTTP {status}: {head}"));
+        let message = format!("Error: MCP {method} failed: HTTP {status}: {head}");
+        if status == reqwest::StatusCode::NOT_FOUND && session.id.is_some() {
+            return Err(RpcCallError::SessionExpired(message));
+        }
+        return Err(RpcCallError::Other(message));
     }
-    extract_rpc_result(&content_type, &text, id)
+    extract_rpc_result(&content_type, &text, id).map_err(RpcCallError::Other)
 }
 
 /// One JSON-RPC request against the configured server, with the handshake
-/// performed on demand and a single retry on a lost/expired session.
+/// performed on demand. A lost/expired session is retried once only for
+/// side-effect-free protocol reads; effect-bearing calls fail closed.
 async fn rpc_call(method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
     let Some((url, token)) = mcp_config() else {
         return Err(NOT_CONFIGURED.to_string());
     };
 
-    let session = ensure_session(&url, &token).await?;
-    match do_rpc(&url, &token, &session, method, params.clone(), timeout).await {
-        Err(error) if session_expired(&error) => {
+    rpc_call_with_config(&url, &token, method, params, timeout).await
+}
+
+async fn rpc_call_with_config(
+    url: &str,
+    token: &str,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let session = ensure_session(url, token).await?;
+    match do_rpc(url, token, &session, method, params.clone(), timeout).await {
+        Ok(result) => Ok(result),
+        Err(RpcCallError::Other(message)) => Err(message),
+        Err(RpcCallError::SessionExpired(message)) => {
             store_session(None);
-            let session = ensure_session(&url, &token).await?;
-            do_rpc(&url, &token, &session, method, params, timeout).await
+            if !retry_after_session_expiry_is_safe(method) {
+                return Err(format!(
+                    "{message}; cleared the expired MCP session but did not retry {method} automatically because the remote operation may already have executed"
+                ));
+            }
+            let session = ensure_session(url, token).await?;
+            match do_rpc(url, token, &session, method, params, timeout).await {
+                Ok(result) => Ok(result),
+                Err(RpcCallError::SessionExpired(message)) => {
+                    store_session(None);
+                    Err(message)
+                }
+                Err(error) => Err(error.into_message()),
+            }
         }
-        other => other,
     }
 }
 
@@ -509,6 +561,8 @@ mod tests {
     use axum::Router;
     use axum::response::IntoResponse;
     use axum::routing::post;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -554,6 +608,23 @@ mod tests {
         assert_eq!(first_sentence("No trailing period"), "No trailing period");
     }
 
+    #[test]
+    fn mcp_tool_contract_stays_static_and_deployment_agnostic() {
+        assert_eq!(
+            TOOL_DEFS.iter().map(|def| def.name).collect::<Vec<_>>(),
+            ["mcp_list_tools", "mcp_describe_tool", "mcp_call"]
+        );
+        assert!(
+            TOOL_DEFS
+                .iter()
+                .all(|def| def.category == ToolCategory::Mcp)
+        );
+        for def in TOOL_DEFS {
+            assert!(!def.description.contains("Umbrella"));
+            assert!(!def.description.contains("Philipp"));
+        }
+    }
+
     #[tokio::test]
     async fn unconfigured_returns_structured_errors() {
         let _guard = env_lock().lock().unwrap();
@@ -588,10 +659,20 @@ mod tests {
         let method = msg["method"].as_str().unwrap_or("");
         let id = msg["id"].clone();
 
+        if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer test-token") {
+            return axum::http::StatusCode::UNAUTHORIZED.into_response();
+        }
+
         if method != "initialize" {
             let sid = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
             if sid != Some("sess-1") {
                 return (axum::http::StatusCode::NOT_FOUND, "no session").into_response();
+            }
+            let version = headers
+                .get("mcp-protocol-version")
+                .and_then(|v| v.to_str().ok());
+            if version != Some(PROTOCOL_VERSION) {
+                return axum::http::StatusCode::BAD_REQUEST.into_response();
             }
         }
 
@@ -632,6 +713,181 @@ mod tests {
             )
             .into_response(),
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RetryProbeMode {
+        ApplicationSessionError,
+        ExpiredToolCall,
+        ExpiredToolListOnce,
+    }
+
+    struct RetryProbe {
+        mode: RetryProbeMode,
+        initialize_requests: AtomicUsize,
+        method_requests: AtomicUsize,
+    }
+
+    async fn retry_probe(
+        axum::extract::State(probe): axum::extract::State<Arc<RetryProbe>>,
+        body: String,
+    ) -> axum::response::Response {
+        let message: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+        let method = message["method"].as_str().unwrap_or("");
+        let id = message["id"].clone();
+
+        match method {
+            "initialize" => {
+                let attempt = probe.initialize_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut response = axum::Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "retry-probe", "version": "0"}
+                    }
+                }))
+                .into_response();
+                response.headers_mut().insert(
+                    "mcp-session-id",
+                    format!("probe-session-{attempt}").parse().unwrap(),
+                );
+                response
+            }
+            "notifications/initialized" => axum::http::StatusCode::ACCEPTED.into_response(),
+            "tools/call" => {
+                probe.method_requests.fetch_add(1, Ordering::SeqCst);
+                match probe.mode {
+                    RetryProbeMode::ApplicationSessionError => axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32042,
+                            "message": "application session conflict"
+                        }
+                    }))
+                    .into_response(),
+                    RetryProbeMode::ExpiredToolCall => {
+                        (axum::http::StatusCode::NOT_FOUND, "expired Mcp-Session-Id")
+                            .into_response()
+                    }
+                    RetryProbeMode::ExpiredToolListOnce => {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            }
+            "tools/list" => {
+                let attempt = probe.method_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                match probe.mode {
+                    RetryProbeMode::ExpiredToolListOnce if attempt == 1 => {
+                        (axum::http::StatusCode::NOT_FOUND, "expired Mcp-Session-Id")
+                            .into_response()
+                    }
+                    RetryProbeMode::ExpiredToolListOnce => axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"tools": []}
+                    }))
+                    .into_response(),
+                    _ => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
+            _ => axum::http::StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+
+    async fn start_retry_probe(mode: RetryProbeMode) -> (String, Arc<RetryProbe>) {
+        let probe = Arc::new(RetryProbe {
+            mode,
+            initialize_requests: AtomicUsize::new(0),
+            method_requests: AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route("/mcp", post(retry_probe))
+            .with_state(probe.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/mcp"), probe)
+    }
+
+    #[tokio::test]
+    async fn application_error_mentioning_session_is_not_retried_or_reclassified() {
+        let _guard = env_lock().lock().unwrap();
+        reset_state();
+        let (url, probe) = start_retry_probe(RetryProbeMode::ApplicationSessionError).await;
+
+        let error = rpc_call_with_config(
+            &url,
+            "test-token",
+            "tools/call",
+            json!({"name": "calendar_create", "arguments": {}}),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("application session conflict"));
+        assert!(!error.contains("did not retry"));
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.method_requests.load(Ordering::SeqCst), 1);
+        assert!(
+            cached_session().is_some(),
+            "application errors keep the session"
+        );
+        reset_state();
+    }
+
+    #[tokio::test]
+    async fn expired_session_never_automatically_replays_a_tool_call() {
+        let _guard = env_lock().lock().unwrap();
+        reset_state();
+        let (url, probe) = start_retry_probe(RetryProbeMode::ExpiredToolCall).await;
+
+        let error = rpc_call_with_config(
+            &url,
+            "test-token",
+            "tools/call",
+            json!({"name": "calendar_create", "arguments": {"title": "Meeting"}}),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("did not retry tools/call automatically"));
+        assert!(error.contains("may already have executed"));
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.method_requests.load(Ordering::SeqCst), 1);
+        assert!(
+            cached_session().is_none(),
+            "expired session cache is cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_session_retries_a_side_effect_free_tool_list_once() {
+        let _guard = env_lock().lock().unwrap();
+        reset_state();
+        let (url, probe) = start_retry_probe(RetryProbeMode::ExpiredToolListOnce).await;
+
+        let result = rpc_call_with_config(
+            &url,
+            "test-token",
+            "tools/list",
+            json!({}),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["tools"], json!([]));
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.method_requests.load(Ordering::SeqCst), 2);
+        assert!(cached_session().is_some());
+        reset_state();
     }
 
     #[tokio::test]
