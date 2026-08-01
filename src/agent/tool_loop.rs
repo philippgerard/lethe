@@ -6,7 +6,7 @@
 //! can be shared between the user-facing chat path and the actor turn
 //! executor without dragging Agent itself across the kameo boundary.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -128,13 +128,33 @@ fn is_error_result(result: &str) -> bool {
 /// long chain of assistant/tool-result pairs appended after assembly. Prefer
 /// dropping the oldest completed tool exchanges; if needed, then drop oldest
 /// pre-turn history while preserving system messages and the current user ask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContextOverflow {
+    message_chars: usize,
+    message_budget: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ContextClampResult {
+    dropped: usize,
+    overflow: Option<ContextOverflow>,
+}
+
+fn context_overflow_error(model_id: &str, overflow: ContextOverflow) -> AgentError {
+    AgentError::Llm(anyhow!(
+        "tool_context_overflow for model {model_id}: {} message chars exceed {} budget chars while preserving required current-turn tool results",
+        overflow.message_chars,
+        overflow.message_budget
+    ))
+}
+
 fn clamp_chat_request_to_budget(
     request: &mut genai::chat::ChatRequest,
     current_user_index: &mut usize,
     max_total_chars: usize,
-) -> usize {
+) -> ContextClampResult {
     if max_total_chars == 0 {
-        return 0;
+        return ContextClampResult::default();
     }
     let tool_chars = request
         .tools
@@ -145,21 +165,27 @@ fn clamp_chat_request_to_budget(
     let total = |messages: &[ChatMessage]| messages.iter().map(ChatMessage::size).sum::<usize>();
     let mut dropped = 0;
 
-    // Completed exchanges appended after the current user request are the most
-    // disposable and are usually the source of runaway form/research turns.
-    // Remove each exchange as one slice, ending immediately before the next
-    // assistant message. In particular, never keep the final tool response of
-    // a parallel tool-call batch after removing the assistant that issued it.
-    while total(&request.messages) > message_budget
-        && *current_user_index + 1 < request.messages.len()
-    {
-        let exchange_start = *current_user_index + 1;
-        let exchange_end = request.messages[exchange_start + 1..]
+    // Drop completed current-turn rounds oldest-first, but always retain the
+    // newest assistant + all of its tool responses. Those results are the only
+    // state from which the next model call can make progress; deleting them and
+    // asking again just recreates the same calls. A round ends immediately
+    // before the next assistant message, so parallel tool results stay paired
+    // with the assistant call that issued them.
+    while total(&request.messages) > message_budget {
+        let assistant_starts = request.messages[*current_user_index + 1..]
             .iter()
-            .position(|message| message.role == ChatRole::Assistant)
-            .map_or(request.messages.len(), |offset| exchange_start + 1 + offset);
-        dropped += exchange_end - exchange_start;
-        request.messages.drain(exchange_start..exchange_end);
+            .enumerate()
+            .filter_map(|(offset, message)| {
+                (message.role == ChatRole::Assistant).then_some(*current_user_index + 1 + offset)
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        let Some(next_round_start) = assistant_starts.get(1).copied() else {
+            break;
+        };
+        let exchange_start = *current_user_index + 1;
+        dropped += next_round_start - exchange_start;
+        request.messages.drain(exchange_start..next_round_start);
     }
 
     // If schemas themselves grew enough to squeeze the initial prompt, prune
@@ -181,7 +207,14 @@ fn clamp_chat_request_to_budget(
             dropped += 1;
         }
     }
-    dropped
+    let message_chars = total(&request.messages);
+    ContextClampResult {
+        dropped,
+        overflow: (message_chars > message_budget).then_some(ContextOverflow {
+            message_chars,
+            message_budget,
+        }),
+    }
 }
 
 /// Transient failures — the kind that often succeed on a later attempt
@@ -218,13 +251,16 @@ fn is_transient_error(result: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
-/// Detects true call degeneration: the same tool invoked with the same
-/// arguments returning the same result. Legitimate polling — identical calls
-/// whose results change as the world moves — never accumulates a streak, so
-/// it no longer trips the repeated-call circuit breaker.
+/// Tracks call-level degeneration: the same tool and arguments returning the
+/// same result. It annotates repeated results and classifies fresh successful
+/// information; the breaker itself uses complete-round fingerprints below.
 #[derive(Debug, Default)]
 struct RepeatTracker {
-    last_signature: String,
+    by_signature: HashMap<String, RepeatObservation>,
+}
+
+#[derive(Debug)]
+struct RepeatObservation {
     last_fingerprint: u64,
     streak: usize,
 }
@@ -234,22 +270,94 @@ impl RepeatTracker {
     /// (1 = fresh, >=2 = exact repeat with identical output).
     fn observe(&mut self, signature: &str, result: &str) -> usize {
         let fingerprint = fingerprint_str(result);
-        if signature == self.last_signature && fingerprint == self.last_fingerprint {
-            self.streak += 1;
+        let observation =
+            self.by_signature
+                .entry(signature.to_string())
+                .or_insert(RepeatObservation {
+                    last_fingerprint: fingerprint,
+                    streak: 0,
+                });
+        if fingerprint == observation.last_fingerprint {
+            observation.streak += 1;
         } else {
-            self.streak = 1;
+            observation.last_fingerprint = fingerprint;
+            observation.streak = 1;
         }
-        self.last_signature = signature.to_string();
-        self.last_fingerprint = fingerprint;
-        self.streak
+        observation.streak
     }
 }
 
-fn fingerprint_str(value: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
+/// Progress accumulated across one complete model-issued tool batch. The
+/// ordered observations form a round fingerprint that deliberately excludes
+/// provider-generated call IDs while including every call signature and raw
+/// result. A static companion read therefore cannot inherit its old streak
+/// into the first stagnant interval of an otherwise changing poll.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ToolRoundProgress {
+    had_fresh_success: bool,
+    observations: Vec<(String, u64, bool)>,
+}
+
+#[derive(Debug, Default)]
+struct ToolRoundRepeatTracker {
+    last_fingerprint: Option<u64>,
+    streak: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolRoundDecision {
+    Continue,
+    BreakRepeated { identical_rounds: usize },
+}
+
+impl ToolRoundProgress {
+    fn observe(
+        &mut self,
+        signature: &str,
+        raw_result_fingerprint: u64,
+        is_error: bool,
+        call_repeat_streak: usize,
+    ) {
+        self.observations
+            .push((signature.to_string(), raw_result_fingerprint, is_error));
+        if !is_error && call_repeat_streak == 1 {
+            self.had_fresh_success = true;
+        }
+    }
+
+    fn fingerprint(&self) -> u64 {
+        fingerprint_value(&self.observations)
+    }
+}
+
+impl ToolRoundRepeatTracker {
+    fn decide(&mut self, round: &ToolRoundProgress) -> ToolRoundDecision {
+        let fingerprint = round.fingerprint();
+        if self.last_fingerprint == Some(fingerprint) {
+            self.streak += 1;
+        } else {
+            self.last_fingerprint = Some(fingerprint);
+            self.streak = 1;
+        }
+        if self.streak >= MAX_REPEATED_TOOL_CALLS {
+            ToolRoundDecision::BreakRepeated {
+                identical_rounds: self.streak,
+            }
+        } else {
+            ToolRoundDecision::Continue
+        }
+    }
+}
+
+fn fingerprint_value<T: std::hash::Hash + ?Sized>(value: &T) -> u64 {
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn fingerprint_str(value: &str) -> u64 {
+    fingerprint_value(value)
 }
 
 /// Per-turn record of one tool execution. Currently used by circuit
@@ -610,6 +718,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     let mut total_tool_errors: usize = 0;
     let mut tool_error_pressure: usize = 0;
     let mut repeat_tracker = RepeatTracker::default();
+    let mut round_repeat_tracker = ToolRoundRepeatTracker::default();
     let mut no_progress_turns: usize = 0;
     let mut empty_count: usize = 0;
     let mut tool_log: Vec<ToolLogEntry> = Vec::new();
@@ -671,10 +780,20 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             .context_limit_for(&model_id)
             .saturating_sub(context.settings.llm.llm_max_output as u64)
             .saturating_mul(4) as usize;
-        let dropped =
+        let clamp =
             clamp_chat_request_to_budget(&mut request, &mut current_user_index, max_total_chars);
-        if dropped > 0 {
-            tracing::warn!(iteration, dropped, model = %model_id, "trimmed tool-loop context to budget");
+        if clamp.dropped > 0 {
+            tracing::warn!(iteration, dropped = clamp.dropped, model = %model_id, "trimmed tool-loop context to budget");
+        }
+        if let Some(overflow) = clamp.overflow {
+            tracing::warn!(
+                iteration,
+                model = %model_id,
+                message_chars = overflow.message_chars,
+                message_budget = overflow.message_budget,
+                "tool-loop context cannot fit without dropping required current-turn context"
+            );
+            return Err(context_overflow_error(&model_id, overflow));
         }
         let observer_for_stream = registry.turn_observer().cloned();
         let response = match observer_for_stream {
@@ -813,7 +932,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             .push(assistant_tool_message(text, tool_calls.clone()));
 
         let mut image_views = Vec::new();
-        let mut turn_had_successful_tool = false;
+        let mut round_progress = ToolRoundProgress::default();
         for call in tool_calls {
             let call_id = call.call_id.clone();
             let tool_name = call.fn_name.clone();
@@ -890,7 +1009,13 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             } else {
                 format!("Unknown tool: {}", call.fn_name)
             };
+            let raw_result_fingerprint = fingerprint_str(&raw_result);
             let (result, views) = extract_image_views(raw_result);
+            // Classify the raw tool payload before adding the model-facing
+            // repeat warning below. Appending prose makes JSON error payloads
+            // invalid JSON and must not turn a repeated failure into a success.
+            let is_error = is_error_result(&result);
+            let is_transient = is_error && is_transient_error(&result);
             // Identical-call degeneration: small models re-issue the same call
             // (observed: 5x the same web_search) until the circuit breaker cuts
             // the whole turn. The streak only grows when call AND result are
@@ -898,6 +1023,12 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             // degeneration. Tell the model in the result itself, where it
             // actually looks, before the breaker has to fire.
             let repeated_tool_call_streak = repeat_tracker.observe(&signature, &result);
+            round_progress.observe(
+                &signature,
+                raw_result_fingerprint,
+                is_error,
+                repeated_tool_call_streak,
+            );
             let result = if repeated_tool_call_streak >= 2 {
                 format!(
                     "{result}\n\n[You have made this exact call {repeated_tool_call_streak} times — \
@@ -916,7 +1047,6 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             );
             image_views.extend(views);
 
-            let is_error = is_error_result(&result);
             if let Some(observer) = observer_for_tool.as_ref() {
                 observer.on_tool_end(
                     &tool_name,
@@ -928,9 +1058,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             }
             if is_error {
                 total_tool_errors += 1;
-                tool_error_pressure += if is_transient_error(&result) { 1 } else { 2 };
-            } else {
-                turn_had_successful_tool = true;
+                tool_error_pressure += if is_transient { 1 } else { 2 };
             }
             if !skip_tool_log(&tool_name) {
                 tool_log.push(ToolLogEntry {
@@ -959,21 +1087,30 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 return Ok(TurnOutput::complete(stop_result));
             }
 
+            // Latch breakers but finish this model-issued batch. A follow-up LLM
+            // request is provider-invalid unless every tool_call in the assistant
+            // message has a matching ToolResponse; the outer loop stops once the
+            // complete round has been recorded.
             if tool_error_pressure >= MAX_TOOL_ERROR_PRESSURE {
-                circuit_breaker_reason = Some(format!(
-                    "tool_error_cap hit ({total_tool_errors} errors, weighted pressure {tool_error_pressure} >= {MAX_TOOL_ERROR_PRESSURE})"
-                ));
-                break;
-            }
-            if repeated_tool_call_streak >= MAX_REPEATED_TOOL_CALLS {
-                circuit_breaker_reason = Some(format!(
-                    "repeated_tool_call_cap hit ({repeated_tool_call_streak} >= {MAX_REPEATED_TOOL_CALLS})"
-                ));
-                break;
+                circuit_breaker_reason.get_or_insert_with(|| {
+                    format!(
+                        "tool_error_cap hit ({total_tool_errors} errors, weighted pressure {tool_error_pressure} >= {MAX_TOOL_ERROR_PRESSURE})"
+                    )
+                });
             }
         }
 
-        if turn_had_successful_tool {
+        if let ToolRoundDecision::BreakRepeated { identical_rounds } =
+            round_repeat_tracker.decide(&round_progress)
+        {
+            circuit_breaker_reason.get_or_insert_with(|| {
+                format!(
+                    "repeated_tool_call_cap hit ({identical_rounds} identical complete rounds >= {MAX_REPEATED_TOOL_CALLS})"
+                )
+            });
+        }
+
+        if round_progress.had_fresh_success {
             no_progress_turns = 0;
         } else {
             no_progress_turns += 1;
@@ -1343,6 +1480,34 @@ pub(super) fn image_view_message(image: ImageView) -> ChatMessage {
 mod tests {
     use super::*;
 
+    fn assistant_calls(text: &str, calls: &[(&str, &str)]) -> ChatMessage {
+        assistant_tool_message(
+            text.to_string(),
+            calls
+                .iter()
+                .map(|(call_id, fn_name)| ToolCall {
+                    call_id: (*call_id).to_string(),
+                    fn_name: (*fn_name).to_string(),
+                    fn_arguments: json!({}),
+                    thought_signatures: None,
+                })
+                .collect(),
+        )
+    }
+
+    fn observe_successful_round(
+        call_tracker: &mut RepeatTracker,
+        round_tracker: &mut ToolRoundRepeatTracker,
+        results: &[(&str, &str)],
+    ) -> ToolRoundDecision {
+        let mut progress = ToolRoundProgress::default();
+        for (signature, result) in results {
+            let streak = call_tracker.observe(signature, result);
+            progress.observe(signature, fingerprint_str(result), false, streak);
+        }
+        round_tracker.decide(&progress)
+    }
+
     fn model_routing_config() -> LlmRouterConfig {
         LlmRouterConfig {
             model: "main-model".to_string(),
@@ -1557,30 +1722,55 @@ mod tests {
         let mut request = genai::chat::ChatRequest::new(vec![
             ChatMessage::system("system"),
             ChatMessage::user("current request"),
-            ChatMessage::assistant("old assistant output that is intentionally long"),
+            assistant_calls(
+                "old assistant output that is intentionally long",
+                &[("call-1", "old_read")],
+            ),
             ChatMessage::from(ToolResponse::new(
                 "call-1",
                 "old tool result that is intentionally long",
             )),
-            ChatMessage::assistant("latest answer"),
+            assistant_calls("latest answer", &[("call-2", "latest_read")]),
+            ChatMessage::from(ToolResponse::new("call-2", "latest result")),
         ]);
         request.tools = Some(vec![
             genai::chat::Tool::new("large_tool").with_description("x".repeat(80)),
         ]);
+        let max_total_chars = request.messages[0].size()
+            + request.messages[1].size()
+            + request.messages[4].size()
+            + request.messages[5].size()
+            + request
+                .tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(genai::chat::Tool::size)
+                .sum::<usize>();
         let mut current_user_index = 1;
-        let dropped = clamp_chat_request_to_budget(&mut request, &mut current_user_index, 125);
-        assert!(dropped >= 2, "old assistant/tool pair should be removed");
+        let clamp =
+            clamp_chat_request_to_budget(&mut request, &mut current_user_index, max_total_chars);
+        assert_eq!(clamp.dropped, 2, "old assistant/tool pair removed");
+        assert_eq!(clamp.overflow, None);
         assert_eq!(request.messages[0].role, ChatRole::System);
         assert_eq!(request.messages[current_user_index].role, ChatRole::User);
-        assert_eq!(request.messages.last().unwrap().role, ChatRole::Assistant);
+        assert_eq!(request.messages[2].role, ChatRole::Assistant);
+        assert_eq!(request.messages[3].role, ChatRole::Tool);
     }
 
     #[test]
-    fn tool_loop_budget_drops_all_parallel_results_with_their_assistant() {
+    fn tool_loop_budget_preserves_latest_parallel_round_and_reports_overflow() {
         let mut request = genai::chat::ChatRequest::new(vec![
             ChatMessage::system("system"),
             ChatMessage::user("current request"),
-            ChatMessage::assistant("parallel tool calls that are intentionally long"),
+            assistant_calls(
+                "parallel tool calls that are intentionally long",
+                &[
+                    ("call-1", "first_read"),
+                    ("call-2", "second_read"),
+                    ("call-3", "third_read"),
+                ],
+            ),
             ChatMessage::from(ToolResponse::new(
                 "call-1",
                 "first tool result that is intentionally long",
@@ -1596,19 +1786,57 @@ mod tests {
         ]);
         let mut current_user_index = 1;
 
-        let dropped = clamp_chat_request_to_budget(&mut request, &mut current_user_index, 40);
+        let clamp = clamp_chat_request_to_budget(&mut request, &mut current_user_index, 40);
 
-        assert_eq!(dropped, 4, "the complete parallel exchange must be removed");
-        assert_eq!(request.messages.len(), 2);
+        assert_eq!(clamp.dropped, 0, "newest round must never be removed");
+        assert!(clamp.overflow.is_some());
+        assert_eq!(request.messages.len(), 6);
         assert_eq!(request.messages[0].role, ChatRole::System);
         assert_eq!(request.messages[current_user_index].role, ChatRole::User);
+        assert_eq!(request.messages[2].role, ChatRole::Assistant);
         assert!(
-            request
-                .messages
+            request.messages[3..]
                 .iter()
-                .all(|message| message.role != ChatRole::Tool),
-            "a tool response without its assistant call would be provider-invalid"
+                .all(|message| { message.role == ChatRole::Tool })
         );
+
+        let error = context_overflow_error("test-model", clamp.overflow.unwrap());
+        assert!(matches!(error, AgentError::Llm(_)));
+        let message = error.to_string();
+        assert!(message.contains("tool_context_overflow for model test-model"));
+        assert!(message.contains("required current-turn tool results"));
+    }
+
+    #[test]
+    fn tool_loop_budget_drops_large_pre_turn_history_before_latest_round() {
+        let mut request = genai::chat::ChatRequest::new(vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old user request that is intentionally very long"),
+            ChatMessage::assistant("old answer that is intentionally very long"),
+            ChatMessage::user("current request"),
+            assistant_calls(
+                "latest assistant tool call",
+                &[("latest-call", "latest_read")],
+            ),
+            ChatMessage::from(ToolResponse::new("latest-call", "latest tool result")),
+        ]);
+        let preserved_chars = request.messages[0].size()
+            + request.messages[3].size()
+            + request.messages[4].size()
+            + request.messages[5].size();
+        let mut current_user_index = 3;
+
+        let clamp =
+            clamp_chat_request_to_budget(&mut request, &mut current_user_index, preserved_chars);
+
+        assert_eq!(clamp.dropped, 2, "old history should be removed first");
+        assert_eq!(clamp.overflow, None);
+        assert_eq!(current_user_index, 1);
+        assert_eq!(request.messages.len(), 4);
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[1].role, ChatRole::User);
+        assert_eq!(request.messages[2].role, ChatRole::Assistant);
+        assert_eq!(request.messages[3].role, ChatRole::Tool);
     }
 
     #[test]
@@ -1636,40 +1864,84 @@ mod tests {
     }
 
     #[test]
-    fn repeat_tracker_counts_only_identical_call_and_result() {
-        let mut tracker = RepeatTracker::default();
+    fn identical_parallel_round_breaks_only_when_whole_batch_reaches_threshold() {
+        let mut call_tracker = RepeatTracker::default();
+        let mut round_tracker = ToolRoundRepeatTracker::default();
+        let calls = [
+            ("food_get_entry:{\"id\":741}", "entry"),
+            ("food_get_day_summary:{\"date\":\"2026-08-01\"}", "summary"),
+            ("food_analyze_caffeine:{\"bedtime\":\"00:00\"}", "none"),
+        ];
 
-        // True degeneration: same call, same output → the streak grows one
-        // per observation and reaches the breaker threshold.
-        let mut streak = 0;
-        for expected in 1..=MAX_REPEATED_TOOL_CALLS {
-            streak = tracker.observe("web_search:{\"q\":\"rust\"}", "10 results");
-            assert_eq!(streak, expected);
+        for round in 1..MAX_REPEATED_TOOL_CALLS {
+            assert_eq!(
+                observe_successful_round(&mut call_tracker, &mut round_tracker, &calls),
+                ToolRoundDecision::Continue,
+                "round {round} must remain below the threshold"
+            );
         }
-        assert!(
-            streak >= MAX_REPEATED_TOOL_CALLS,
-            "degenerate repeats must trip the breaker"
+        assert_eq!(
+            observe_successful_round(&mut call_tracker, &mut round_tracker, &calls),
+            ToolRoundDecision::BreakRepeated {
+                identical_rounds: MAX_REPEATED_TOOL_CALLS,
+            },
+            "the breaker is decided only after the complete A/B/C batch"
         );
+    }
 
-        // Legitimate polling: same call, changing output → streak never grows,
-        // so the breaker doesn't kill a poll loop that is observing progress.
-        let mut poller = RepeatTracker::default();
-        assert_eq!(
-            poller.observe("bash:{\"cmd\":\"job-status\"}", "running 10%"),
-            1
-        );
-        assert_eq!(
-            poller.observe("bash:{\"cmd\":\"job-status\"}", "running 40%"),
-            1
-        );
-        assert_eq!(
-            poller.observe("bash:{\"cmd\":\"job-status\"}", "running 90%"),
-            1
-        );
-        assert_eq!(poller.observe("bash:{\"cmd\":\"job-status\"}", "done"), 1);
+    #[test]
+    fn unchanged_companion_does_not_break_while_other_poll_result_changes() {
+        let mut call_tracker = RepeatTracker::default();
+        let mut round_tracker = ToolRoundRepeatTracker::default();
+        let unchanged_signature = "read_file:{\"p\":\"a\"}";
+        let polling_signature = "bash:{\"cmd\":\"job-status\"}";
+        let mut latest_poll_result = String::new();
 
-        // A different call resets the streak.
-        assert_eq!(tracker.observe("read_file:{\"p\":\"a\"}", "contents"), 1);
+        for round in 1..=MAX_REPEATED_TOOL_CALLS + 1 {
+            latest_poll_result = format!("running {round}");
+            assert_eq!(
+                observe_successful_round(
+                    &mut call_tracker,
+                    &mut round_tracker,
+                    &[
+                        (unchanged_signature, "contents"),
+                        (polling_signature, latest_poll_result.as_str()),
+                    ],
+                ),
+                ToolRoundDecision::Continue,
+                "fresh B output must outweigh A's repeat streak in round {round}"
+            );
+        }
+
+        for identical_round in 2..MAX_REPEATED_TOOL_CALLS {
+            assert_eq!(
+                observe_successful_round(
+                    &mut call_tracker,
+                    &mut round_tracker,
+                    &[
+                        (unchanged_signature, "contents"),
+                        (polling_signature, latest_poll_result.as_str()),
+                    ],
+                ),
+                ToolRoundDecision::Continue,
+                "one old companion streak must not shorten batch streak {identical_round}"
+            );
+        }
+
+        assert_eq!(
+            observe_successful_round(
+                &mut call_tracker,
+                &mut round_tracker,
+                &[
+                    (unchanged_signature, "contents"),
+                    (polling_signature, latest_poll_result.as_str()),
+                ],
+            ),
+            ToolRoundDecision::BreakRepeated {
+                identical_rounds: MAX_REPEATED_TOOL_CALLS,
+            },
+            "only four identical complete rounds may trigger the breaker"
+        );
     }
 
     #[test]
