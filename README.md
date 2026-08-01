@@ -1,38 +1,130 @@
 # Lethe
 
-[![Release](https://img.shields.io/github/v/release/alien-id/lethe?style=flat-square&color=blue)](https://github.com/alien-id/lethe/releases/latest)
-[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88+-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
-![Swiss Made Software](https://img.shields.io/badge/swiss%20made-software-red?style=flat-square&labelColor=FF0000&logoColor=white)
+[![Fork release](https://img.shields.io/github/v/release/philippgerard/lethe?style=flat-square&color=blue)](https://github.com/philippgerard/lethe/releases/latest)
+[![Release workflow](https://github.com/philippgerard/lethe/actions/workflows/release.yml/badge.svg)](https://github.com/philippgerard/lethe/actions/workflows/release.yml)
+![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+[![Rust](https://img.shields.io/badge/rust-stable-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 
-Lethe is a long-running personal AI assistant with a brain-inspired cognitive architecture: cortex, hippocampus, brainstem, and a default-mode network running as cooperating actors. She has continuous memory across sessions, notices things on her own, delegates to focused subagents, and can read her own source — propose changes to it, restart herself with new logic. Lives on your machine as an isolated, rootless container (or, with `--yolo`, natively as a systemd/launchd service). Persists across reboots, models, hardware upgrades.
+**An independently operated, production-oriented fork of
+[`alien-id/lethe`](https://github.com/alien-id/lethe).**
 
-Written in Rust as a single ~50 MB static binary. Routes LLM traffic through `genai`. Intentionally has no web console.
+This repository began as a downstream patch set. It now has its own release
+line, operating assumptions, integrations, and roadmap. Upstream remains the
+origin of the core architecture and is still integrated selectively, but this
+repository is no longer a mirror and does not promise drop-in behavioral or
+configuration compatibility with upstream.
+
+Lethe is a long-running personal AI runtime built around a cortex,
+hippocampus, brainstem, default-mode network, and cooperating actors. It keeps
+memory across sessions, delegates work to durable subagents, performs bounded
+background work, and reaches the user through Telegram or an authenticated
+HTTP/SSE API. Identity and persona are configuration, not a hard-coded
+character. The runtime ships as one Rust binary and deliberately has no
+bundled web console.
+
+## Why this fork exists
+
+The primary target is a private, always-on assistant that remains useful after
+restarts and can safely connect to the rest of Philipp's infrastructure. The
+current product surface emphasizes:
+
+- **Durable autonomous work.** Actor state, goals, checkpoints, todos,
+  proactive messages, and conversation history survive restarts instead of
+  living only in one model context.
+- **Controlled integration.** A scoped remote MCP client and an optional
+  hosted-plugin bridge extend the tool catalog without compiling every
+  external system into Lethe.
+- **Reliable delivery.** Telegram, HTTP/SSE, and the scheduler-oriented
+  `POST /wake` path share one agent and one Brainstem, with safeguards against
+  duplicate or silently discarded replies.
+- **Voice as first-class input.** Telegram voice notes and the transcription
+  command share OpenAI, OpenRouter, multilingual Mistral Voxtral, and local
+  Whisper backends.
+- **Tiered model use.** Main, auxiliary, tool-chain, and deep-thinking model
+  slots let inexpensive work stay inexpensive while difficult turns and
+  subagents can escalate deliberately.
+- **Secrets outside model context.** Alien agent-id, its encrypted vault, and
+  the vault-sealed browser inject credentials without returning their values
+  through ordinary tool results.
+- **Operational hardening.** Process-group cleanup, provider-limit handling,
+  history repair, bounded tool loops, release checksums, and fork-invariant
+  tests are treated as product behavior rather than incidental patches.
+
+The production profile runs as Docker Compose on Dokploy behind Tailscale.
+State remains on the persistent `lethe-home` volume and uses SQLite; deployments
+are built from checksum-pinned fork releases. The separate `lethe-stack`
+repository owns that deployment shape. The Podman/Apple Container workflow in
+this repository remains useful for local installations, but it is not the
+production control plane.
+
+### Storage: SQLite first
+
+Standalone Lethe uses SQLite and SQLite-vec. That is the default, the normal
+self-hosted choice, and the backend used in production. It requires no database
+server.
+
+The Cargo feature `postgres-memory` is a different integration boundary: it
+exposes a tenant-scoped PostgreSQL implementation for applications embedding
+Lethe as a library. Enabling the feature does not migrate a standalone install,
+and there is no runtime switch that turns the CLI deployment into PostgreSQL.
+
+### Relationship to upstream
+
+- Fork releases and issues live in `philippgerard/lethe`; tags use a `-pgN`
+  suffix when they carry downstream changes.
+- `alien-id/lethe` is tracked as `upstream`. Changes are reviewed and merged
+  deliberately rather than followed automatically.
+- Local safety, delivery, storage, model-routing, MCP, transcription, and
+  production invariants take precedence when an upstream change conflicts
+  with them.
+- The Git history and MIT attribution are retained. “Independent” describes
+  maintenance and product direction, not a claim that the project started
+  here.
 
 ## Quickstart
 
-```bash
-# Download the latest release and run the setup wizard
-curl -fsSL https://lethe.gg/install | bash
-```
+Building from source is the least ambiguous way to install this fork:
 
-The installer drops a prebuilt binary at `~/.lethe/bin/lethe` and hands off to `lethe init`, which walks you through provider, model, API key, and identity — then deploys Lethe as an **isolated, rootless container** (the default: Podman on Linux, Apple Container on macOS, installed for you if missing). Pass `--yolo` to skip the container and run natively on the host instead.
-
-Prefer to build from source?
-
-> Linux linker note: check `.cargo/config.toml` first. If it points at `mold`, install it before building (`sudo dnf install mold` or `sudo apt-get install mold`) or adjust the linker setting for your system.
+> Linux linker note: `.cargo/config.toml` uses `mold`. Install it first
+> (`sudo dnf install mold` or `sudo apt-get install mold`) or adjust the local
+> linker configuration.
 
 ```bash
-git clone https://github.com/alien-id/lethe.git
+git clone https://github.com/philippgerard/lethe.git
 cd lethe
-cargo build --release
+cargo build --release --locked --bin lethe
+mkdir -p ~/.local/bin
 install -m 755 target/release/lethe ~/.local/bin/lethe
-lethe init            # add --yolo for a native (uncontained) setup
+LETHE_REPO_OWNER=philippgerard ~/.local/bin/lethe init  # add --yolo for a native setup
 ```
 
-`lethe init` writes `~/.lethe/config/.env`, seeds the workspace and core memory blocks, and runs a smoke test against the LLM and embedding pipeline before declaring success. It runs **non-interactively** when stdin isn't a terminal (Docker/CI): pass `--provider`/`--model`/`--aux-model` and supply the key via the provider's env var (e.g. `OPENROUTER_API_KEY`). If you'd rather configure by hand, copy `.env.example` and edit. The first turn that uses recall/notes triggers a one-time ~150MB download of the embedding runtime and model (progress is shown).
+The remaining command examples assume `~/.local/bin` is on `PATH`; otherwise
+invoke the binary as `~/.local/bin/lethe`.
 
-Then check on her:
+The inherited installer can also install fork release assets, but its repository
+defaults are still upstream-compatible and therefore must be explicit:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/philippgerard/lethe/main/install.sh |
+  env LETHE_REPO_OWNER=philippgerard \
+      LETHE_REPO_URL=https://github.com/philippgerard/lethe.git \
+      bash
+```
+
+Do not use `https://lethe.gg/install` when you intend to install this fork; that
+endpoint belongs to upstream. The same `LETHE_REPO_OWNER=philippgerard`
+override is required by `update.sh` and by macOS or other cross-architecture
+`lethe container up` runs so downloaded binaries stay on the fork release line.
+
+`lethe init` writes `~/.lethe/config/.env`, seeds the workspace and core memory
+blocks, and runs a smoke test against the LLM and embedding pipeline. It runs
+non-interactively when stdin is not a terminal: pass
+`--provider`/`--model`/`--aux-model` and supply credentials through the
+provider's environment variable. If you prefer manual configuration, copy
+`.env.example`. The first semantic-memory use downloads the embedding runtime
+and model.
+
+Then inspect the runtime:
 
 ```bash
 lethe                 # status: version + current config (no live probes)
@@ -40,7 +132,8 @@ lethe check           # live health check (LLM + embeddings)
 lethe chat -m "hello" # one-off message straight to the model
 ```
 
-To sign in (or re-auth) a single provider without re-running the full wizard, use `lethe login`:
+To sign in or re-authenticate one provider without rerunning the full wizard,
+use `lethe login`:
 
 ```bash
 lethe login openai       # asks: ChatGPT Plus/Pro subscription (default) or API key
@@ -56,68 +149,70 @@ Sanity-check an existing setup any time with `lethe check` — it pings the mode
 ## Architecture
 
 ```
-                 Telegram / HTTP API
-                        |
-                        v
-              Cortex: user-facing agent
-        memory, tools, delegation, final replies
-                        |
-       +----------------+----------------+
-       |                |                |
-       v                v                v
- Hippocampus       Actor System     Notification Pipeline
- recall over       subagents,       scoring, gating,
- notes/archive/    registry,        and proactive
- conversations     event bus        transport output
-       |                |
-       v                +----------------+
- Memory Stack                            |
- markdown blocks,                       v
- notes, SQLite-vec index,     DMN + heartbeat
- message history              background thought
-                        |
-                        v
-                    Tool Registry
-       files, shell/PTY, browser, web, Telegram/API transport
+       Telegram / HTTP+SSE / TUI / POST /wake
+                         |
+                         v
+              Transport supervisor
+          one Agent, registry, and Brainstem
+                         |
+                         v
+               Cortex + tool loop
+       prompt, memory, delegation, model tiers
+                         |
+       +-----------------+------------------+
+       |                 |                  |
+       v                 v                  v
+ Associative memory   Actor runtime     Brainstem + DMN
+ lexical/vector       durable workers   heartbeat, gating,
+ recall               and checkpoints   proactive delivery
+       |                 |                  |
+       v                 v                  |
+ Memory storage     SQLite actor            |
+ traits             snapshots               |
+ SQLite by default;     |                  |
+ Postgres for hosts     +---------+--------+
+       |                          |
+       +--------------------------+
+                         |
+                         v
+                    Tool registry
+ built-ins | Alien vault/browser | remote MCP | hosted plugins
 ```
 
 Core runtime pieces:
 
 | Area | Rust modules | Responsibility |
 |------|--------------|----------------|
-| Agent/cortex | `src/agent.rs` | Prompt assembly, LLM calls, tool loop, and actor turn execution. |
+| Agent/cortex | `src/agent.rs`, `src/agent/` | Prompt assembly, LLM calls, bounded tool loops, summarization, and actor turn execution. |
 | LLM routing | `src/llm/` | `genai` client, OAuth (ChatGPT Plus/Pro, Claude Pro/Max) and API-key auth, per-model prompt-cache dialects, OpenRouter prompt-cache forwarding via vendored genai patch, model metadata. |
-| Memory | `src/memory/` | Markdown memory blocks, SQLite-vec recall tables (`memory`, `message_history`, plus their `*_vec` virtual siblings), SQLite todos. |
-| Recall | `src/hippocampus.rs` | Hybrid lexical/vector recall over notes, archival memories, and conversation history. |
+| Memory | `src/memory/`, `src/todos.rs` | Storage contracts, Markdown blocks, archival memory, messages, notes, todos, SQLite-vec, and the optional PostgreSQL host backend. |
+| Recall | `src/memory/recall.rs`, `src/memory/search.rs` | Hybrid lexical/vector recall over notes, archival memories, and conversation history. |
 | Actors | `src/actor.rs`, `src/actor/` | Resident Kameo actors, supervisor-owned state, mailbox/event routing, autonomous subagent wakeups, persistent DMN, SQLite-backed actor snapshots that survive restarts. |
-| Notifications | `src/notification.rs`, `src/heartbeat.rs`, `src/runtime.rs` | Background candidate gating and proactive output limits. |
-| Transports | `src/telegram.rs`, `src/api.rs`, `src/conversation.rs` | Telegram polling, HTTP/SSE API, debounce/cancel handling. |
-| Tools | `src/tools/` | Filesystem, shell, PTY terminal, browser, image, web, memory, notes, todos, actors, transport tools. |
+| Background work | `src/scheduler/`, `src/actor/notification.rs` | Heartbeats, DMN wakeups, memory curation, candidate gating, and proactive output limits. |
+| Transports | `src/interfaces/`, `src/cli/telegram_loop.rs`, `src/conversation/` | Telegram polling, HTTP/SSE, scheduled wakes, transcription, debounce, and cancellation. |
+| Tools | `src/tools/` | Filesystem, shell/PTY, image, web/research, memory, todos, actors, Telegram/client egress, Alien browser, remote MCP, and hosted plugins. |
 
 ## Build
 
 ```bash
-git clone https://github.com/alien-id/lethe.git
+git clone https://github.com/philippgerard/lethe.git
 cd lethe
 cp .env.example .env
-cargo build --release
-target/release/lethe check
+cargo build --release --locked --bin lethe
+target/release/lethe --version
 ```
 
-Native installer:
-
-```bash
-curl -fsSL https://lethe.gg/install | bash
-~/.lethe/bin/lethe check
-```
-
-The installer downloads the latest GitHub binary release for the current platform when available. If no release asset matches, it falls back to a local Cargo build. Force source builds with `LETHE_INSTALL_FROM_SOURCE=1`.
+Release archives and their SHA-256 files are published for Linux x86_64, Linux
+ARM64, and Apple-silicon macOS. See the fork-aware installer invocation in
+[Quickstart](#quickstart); `lethe.gg` tracks upstream, not this release line.
 
 Run tests:
 
 ```bash
-cargo test
-cargo build --release
+cargo fmt --check
+cargo test --locked --no-default-features
+cargo test --locked --manifest-path vendor/genai/Cargo.toml --lib
+cargo build --release --locked --bin lethe
 ```
 
 Browser automation uses the vault-sealed Alien Browser exclusively; the former
@@ -126,11 +221,19 @@ standalone `agent-browser`/`browser_*` integration has been removed. See
 
 ## Running
 
-Lethe's default home is an isolated, rootless container managed as a background service — `lethe init` sets that up for you. The CLI drives and inspects the whole deployment.
+For a normal local install, `lethe init` creates an isolated container managed
+as a background service. Native `--yolo` mode is also supported. Production
+uses the external Dokploy Compose stack described above rather than these CLI
+container commands.
+
+On macOS and other cross-architecture container builds, export
+`LETHE_REPO_OWNER=philippgerard` before `lethe container up`; otherwise the
+inherited download default resolves to the upstream release repository.
 
 **Deploy & manage**
 
 ```bash
+export LETHE_REPO_OWNER=philippgerard  # keep cross-arch downloads on the fork
 lethe run                      # run in the foreground here (Ctrl-C to stop); --yolo for native
 lethe service install --now    # install + start the background service (systemd user unit / launchd agent)
 lethe service status           # platform, unit path, live status
@@ -145,7 +248,7 @@ lethe uninstall                # remove the service/container (add --purge to al
 
 Share extra host directories with the container via `lethe container up --mount host[:container]` (repeatable; persisted).
 
-**Reach her**
+**Reach Lethe**
 
 ```bash
 lethe transport list                       # API + Telegram channels and their status
@@ -159,7 +262,7 @@ Under the hood a single `lethe api` process hosts the HTTP/SSE transport **and**
 
 ```bash
 lethe status                   # version + current config, secrets censored (this is also the bare `lethe`)
-lethe identity set --name "…"  # change who she is (name + persona); `lethe identity edit` opens $EDITOR
+lethe identity set --name "…"  # change identity/persona; `lethe identity edit` opens $EDITOR
 lethe model                    # show current model + catalog; `lethe model <id>` or `--pick` to change
 lethe login anthropic          # (re-)auth a single provider
 lethe completions fish         # print a shell completion script
@@ -179,6 +282,25 @@ Inline tool cards, an actors/todos sidebar, streaming assistant text
 autocomplete, and slash commands (`/help`, `/clear`, `/cancel`,
 `/todos`, `/actors`, `/model`, `/quit`).
 
+## External tool bridges
+
+This fork supports two deliberately separate extension paths:
+
+- **Remote MCP** connects the standalone runtime directly to one Streamable
+  HTTP MCP hub. `MCP_SERVER_URL` and a narrowly scoped `MCP_SERVER_TOKEN`
+  enable `mcp_list_tools`, `mcp_describe_tool`, and `mcp_call`; with either
+  value missing, the whole family stays hidden. Tool visibility remains the
+  server's responsibility, based on the token's grants.
+- **Hosted plugins** let a trusted embedding host provide a user-scoped tool
+  catalog, prompt context, and execution bridge. Lethe loads tools on demand
+  through `request_tool` and does not need one credential per plugin. A hosted
+  Agenda can replace local todos completely, including during gateway failure,
+  to avoid a split-brain task list.
+
+MCP is a direct protocol integration owned by the standalone process. Hosted
+plugins are an application-host contract. They can coexist, but they are not
+aliases and do not share configuration.
+
 ## LLM Providers
 
 Lethe routes chat through `genai`. The runtime supports both API-key and subscription-OAuth auth, plus OpenAI-compatible local servers:
@@ -197,7 +319,7 @@ Lethe routes chat through `genai`. The runtime supports both API-key and subscri
 
 `LLM_PROVIDER` is optional but useful when a model id does not carry a provider prefix — for example `LLM_PROVIDER=openrouter` with `LLM_MODEL=moonshotai/kimi-k2.6`. Subscription auth also requires `LLM_PROVIDER=openai` or `LLM_PROVIDER=anthropic` so the router picks the OAuth path instead of looking for an API key (the `lethe login` commands set this for you).
 
-Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX` (defaults to the main model) handles lightweight/background calls (summarizer, curator, heartbeat). Two optional tiers let a turn change models mid-flight: `LLM_MODEL_TOOL` is a stronger reasoner a turn switches to the moment a tool is used, and `LLM_MODEL_DEEP` is a powerful "deep thinking" model the agent **escalates to on demand** for hard tasks — by calling the `think_deeply` tool (self-recognition), automatically when a turn is visibly struggling, or for a subagent spawned on the `deep` tier. Both reset to `LLM_MODEL` on the next turn; deep escalation outranks the tool switch. Set them at runtime via `POST /model` (`model_deep`) or, over Telegram, `/deep <model-id>`.
+Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX` (defaults to the main model) handles lightweight/background calls (summarizer, curator, heartbeat). Two optional tiers let a turn change models mid-flight: `LLM_MODEL_TOOL` is a stronger reasoner a turn switches to the moment a tool is used, and `LLM_MODEL_DEEP` is a powerful "deep thinking" model the agent **escalates to on demand** for hard tasks — by calling the `think_deeply` tool (self-recognition), automatically when a turn is visibly struggling, or for a subagent spawned on the `deep` tier. Both reset to `LLM_MODEL` on the next turn; deep escalation outranks the tool switch. The deep tier can also be changed at runtime via `POST /model` (`model_deep`) or Telegram `/deep <model-id>`; the tool tier is environment/config only.
 
 ### Subscription OAuth
 
@@ -210,15 +332,18 @@ Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX
 Lethe stamps cache breakpoints on the system prompt — a 1h-TTL prefix (identity, persona, instructions) plus a 5min-TTL tail (clock, memory state, recall) — but only for models that need an explicit breakpoint. Which marker a model gets is decided by its dialect in [`src/llm/dialect.rs`](src/llm/dialect.rs):
 
 - **Anthropic direct** and **Anthropic OAuth** — emitted on system blocks, 1h + 5min.
+- **OpenCode Go models using the Anthropic protocol** — emitted on system blocks, 1h + 5min.
 - **OpenRouter → Anthropic** — emitted on system content parts. OpenRouter relays `cache_control` to the upstream vendor (converting between the Anthropic and OpenAI marker formats), and Anthropic is the only vendor accepting the extended `ttl: "1h"`.
 - **OpenRouter → Gemini / Qwen** — explicit breakpoints too, but 5min only: the 1h TTL is Anthropic-only.
-- **Everything else** — no marker. OpenAI, Grok, Moonshot/Kimi, Groq, DeepSeek and Z.AI/GLM cache automatically, so a breakpoint buys nothing.
+- **Everything else** — no explicit marker. OpenAI, Grok, Moonshot/Kimi, Groq, DeepSeek and Z.AI/GLM cache automatically, so a breakpoint buys nothing.
 
 See [OpenRouter's prompt-caching docs](https://openrouter.ai/docs/features/prompt-caching) for the per-vendor rules. Upstream `genai` only supports request-level `cache_control` (OpenAI's native `prompt_cache_retention`), which does not cover the OpenRouter route — forwarding it per-message is the one patch our vendored fork carries. See [`vendor/genai/LETHE_FORK.md`](vendor/genai/LETHE_FORK.md).
 
 ## Configuration
 
-Configuration is read from process environment, a local `.env`, and `$LETHE_HOME/config/.env`.
+Configuration is read from process environment, a local `.env`, and
+`$LETHE_HOME/config/.env`. The table lists the common operational settings;
+[`.env.example`](.env.example) is an annotated starting point.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -228,7 +353,7 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `LETHE_CONFIG_FILE` | Config `.env` path (also `--config`) | `$LETHE_HOME/config/.env` |
 | `WORKSPACE_DIR` | Workspace directory | `$LETHE_HOME/workspace` |
 | `MEMORY_DIR` | Memory data directory | `$LETHE_HOME/data/memory` |
-| `DB_PATH` | SQLite todo database path | `$LETHE_HOME/data/lethe.db` |
+| `DB_PATH` | Legacy todo database imported into unified memory on first run | `$LETHE_HOME/data/lethe.db` |
 | `LOGS_DIR` | Runtime log directory | `$LETHE_HOME/logs` |
 | `TELEGRAM_BOT_TOKEN` | Bot token from BotFather | required for Telegram |
 | `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated allowlist | all users |
@@ -243,6 +368,7 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `LLM_MODEL_DEEP` | Optional powerful "deep thinking" model the agent escalates to for hard tasks — via the `think_deeply` tool, an auto-escalate backstop when a turn struggles, or a `deep`-tier subagent; resets next turn. Outranks `LLM_MODEL_TOOL` | unset (no escalation) |
 | `LLM_API_BASE` | Custom OpenAI-compatible base URL | unset |
 | `LLM_CONTEXT_LIMIT` | Context size hint | `100000` |
+| `LLM_MAX_OUTPUT` | Per-request output-token limit | `8000` |
 | `OPENROUTER_API_KEY` | OpenRouter key | unset |
 | `ANTHROPIC_API_KEY` | Anthropic key | unset |
 | `ANTHROPIC_AUTH_TOKEN` | Optional Anthropic OAuth access token (raw) | unset |
@@ -253,6 +379,13 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `OPENCODE_GO_API_KEY` | OpenCode Go key | unset |
 | `MISTRAL_API_KEY` | Mistral key — Voxtral transcription only (not the chat LLM) | unset |
 | `EXA_API_KEY` | Exa search/fetch tools | unset |
+| `MCP_SERVER_URL` | Remote MCP Streamable HTTP endpoint | unset |
+| `MCP_SERVER_TOKEN` | Bearer token scoped by the MCP server | unset |
+| `MCP_SERVER_LABEL` | Optional name shown by the MCP discovery tools | unset |
+| `LETHE_HOSTED_API_BASE` | Trusted hosted-plugin gateway base URL | unset |
+| `LETHE_HOSTED_API_TOKEN` | User-scoped hosted-plugin credential | unset |
+| `LETHE_HOSTED_DISABLE_LOCAL_TODOS` | Replace local todos with hosted Agenda without fallback | `false` |
+| `LETHE_HOSTED_CATALOG_TTL` | Hosted tool-catalog cache lifetime in seconds | `30` |
 | `LETHE_SEMANTIC_SEARCH_ENABLED` | Enable vector recall (fallback is keyword search) | `true` |
 | `LETHE_EMBEDDING_PROVIDER` | `fastembed` or `hash` | `fastembed` |
 | `LETHE_EMBEDDING_MODEL` | FastEmbed model id | `Snowflake/snowflake-arctic-embed-m-v2.0` |
@@ -261,6 +394,7 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `CURATOR_ENABLED` | Enable memory curator | `true` |
 | `HEARTBEAT_ENABLED` | Enable proactive heartbeat loop | `true` |
 | `HEARTBEAT_INTERVAL` | Heartbeat interval seconds | `3600` |
+| `DEBOUNCE_SECONDS` | Merge a burst of Telegram messages into one turn | `5.0` |
 | `PROACTIVE_MAX_PER_DAY` | Proactive message daily limit | `4` |
 | `PROACTIVE_COOLDOWN_MINUTES` | Minimum spacing for proactive messages | `60` |
 | `TRANSCRIPTION_PROVIDER` | `auto`, `openrouter`, `openai`, `mistral`, or `local` | `auto` |
@@ -269,6 +403,10 @@ Configuration is read from process environment, a local `.env`, and `$LETHE_HOME
 | `TRANSCRIPTION_LOCAL_COMMAND` | Local Whisper command | `whisper` |
 
 ## Memory
+
+The standalone runtime always opens the local memory store. Building with
+`postgres-memory` only makes the PostgreSQL types available to an embedding
+host; it does not change this path or interpret `DATABASE_URL` in the CLI.
 
 Lethe stores runtime state under the workspace and data directories:
 
@@ -332,13 +470,17 @@ Override the dump directory with `LLM_DEBUG_DIR`.
 
 ## API
 
-All API routes require `Authorization: Bearer <LETHE_API_TOKEN>` or `x-lethe-token`.
+`GET /health` is intentionally unauthenticated for readiness probes. Every
+other HTTP route and the browser WebSocket require
+`Authorization: Bearer <LETHE_API_TOKEN>` or `x-lethe-token`.
 
 | Route | Method | Purpose |
 |-------|--------|---------|
-| `/health` | `GET` | Readiness check. |
+| `/health` | `GET` | Process readiness check; does not probe LLMs or external tools. |
 | `/chat` | `POST` | Send a user message and receive SSE response events. |
+| `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress (`message`, optional `chat_id`). |
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |
+| `/browser/stream` | `GET`/WebSocket | Relay the live vault-sealed browser viewport and input stream. |
 | `/cancel` | `POST` | Cancel active work for a chat. |
 | `/configure` | `POST` | Store user metadata in memory. |
 | `/model` | `GET`/`POST` | Inspect or update the main/aux/deep model ids (`model`, `model_aux`, `model_deep`). |
@@ -350,16 +492,22 @@ All API routes require `Authorization: Bearer <LETHE_API_TOKEN>` or `x-lethe-tok
 | `/secure-input/cancel` | `POST` | Dismiss a pending secure-input request. |
 | `/secure-input/pending` | `GET` | Live secure-input requests (with sealing envelope) for tab re-hydration. |
 
-SSE event vocabulary on `/chat` and `/events`:
+Combined event vocabulary for `/chat` and `/events` follows. Not every event is
+emitted on both streams: `/chat` owns the live turn, while `/events` carries the
+durable/background mirror used by reloaded or secondary clients.
 
 | Event | Payload | Meaning |
 |-------|---------|---------|
 | `turn.start` | `{chat_id}` | A new agent turn has begun. |
+| `turn.active` | `{active}` | Durable activity state for reloaded or secondary clients. |
 | `assistant.delta` | `{content}` | Streamed assistant token chunk (Anthropic + OpenAI OAuth). |
+| `assistant.reasoning` | `{content}` | Streamed reasoning chunk when the selected provider exposes one. |
 | `text` | `{content, parse_mode, message_id}` | Complete (sub-)message; submessage boundaries follow the `---` rule from `interfaces/telegram/formatting.rs`. |
+| `message` | `{role, content}` | Durable mirror of a completed assistant reply. |
 | `tool.start` | `{call_id, name, args_preview}` | Tool execution started. |
 | `tool.end` | `{call_id, name, success, output_preview, duration_ms}` | Tool execution finished. |
-| `actor.spawned` / `actor.state` / `actor.task` / `actor.message` | `{actor_id, payload}` | Actor lifecycle events fanned out from `ActorEventBus`. |
+| `actor.spawned` / `actor.state` / `actor.task` / `actor.message` | `{actor_id, group, payload}` | Actor lifecycle events fanned out from `ActorEventBus`; payloads include typed background/source metadata where applicable. |
+| `actor.user_notify` | `{actor_id, group, payload}` | A worker or the DMN addressed the user directly. |
 | `usage` | `{prompt_tokens}` | Updated context window usage. |
 | `typing_start` / `typing_stop` | `{}` | Compatibility hints for chat clients. |
 | `secure_input.request` | `{request_id, title, description, fields, server_pub, alg, expires_at, …}` | The agent needs a human-typed secret; render a sealed credential card (hosted). |
@@ -395,13 +543,15 @@ and browser CLI health.
 ### Browser tools (optional)
 
 The vault-sealed browser adds the `alien_browser_*` tools (`_open` starts a
-session, `_act` runs any page verb — snapshot/click/type/navigate/… — and
-`_fill_secret` / `_fill_otp` inject vaulted credentials the model never sees).
+session, `_act` runs page verbs, `_inspect_form` / `_fill_form` operate on a
+whole form, and `_fill_secret` / `_fill_otp` inject vaulted credentials the
+model never sees).
 It is Lethe's only browser: when the CLI is absent — or present but unable to
 start; Lethe probes it once per run — the `alien_browser_*` tools are hidden and
-`lethe check` says why. The CLI drives **real Google Chrome** via
-`channel:"chrome"` (a stealth-tuned patchright launch — not bundled Chromium),
-so the host needs Chrome installed:
+`lethe check` says why. A normal host install drives Google Chrome through
+Patchright's `channel:"chrome"`; the ARM64 production image instead pins
+Patchright Chromium and supplies it at the channel-compatible path because
+branded Chrome is unavailable there. Host installs therefore need Chrome:
 
 ```bash
 npm i -g @alien-id/agent-id-browser   # pulls matching core/vault + patchright
@@ -447,10 +597,11 @@ may still need a one-time headed sign-in on a machine with a display.)
 | `ALIEN_PROVIDER_ADDRESS` | — | Alien SSO provider for `agent_id_bind`. |
 | `LETHE_SECURE_PROMPT` | `off` | `hosted` runs the secure-input socket server (set by lethe-hosted). |
 
-Tools (requested on demand): `agent_id_status`, `agent_id_bind`, `agent_id_sign`,
+Examples (requested on demand): `agent_id_status`, `agent_id_bind`, `agent_id_sign`,
 `vault_list`, `vault_add`, `vault_remove`, `vault_set_totp`, and the browser tools
 `alien_browser_login` / `_auto_login` / `_open` / `_close` / `_act` /
-`_fill_secret` / `_fill_otp`.
+`_request_viewport` / `_inspect_form` / `_fill_form` / `_fill_secret` /
+`_fill_otp`.
 
 ### Security model
 
@@ -504,14 +655,15 @@ LLM_CONTEXT_LIMIT=96000
 
 ```bash
 cargo fmt --check
-cargo test
-cargo build --release
+cargo test --locked --no-default-features
+cargo test --locked --manifest-path vendor/genai/Cargo.toml --lib
+cargo build --release --locked --bin lethe
 ```
 
 Build a local release archive:
 
 ```bash
-cargo build --release
+cargo build --release --locked --bin lethe
 scripts/package-release
 ls dist/
 ```
@@ -532,6 +684,21 @@ target/release/lethe check
 target/release/lethe telegram split "hello from lethe"
 ```
 
+### Upstream integration policy
+
+`origin` is the fork and `upstream` is `alien-id/lethe`. Upstream releases are
+integrated as explicit merges so ancestry remains inspectable. Before a merge,
+tests characterize the downstream behavior that must survive it; after the
+merge, the root and vendored test suites plus every release target run again.
+
+An upstream implementation may replace a local patch when it preserves the
+same contract. Otherwise the fork keeps its behavior and documents the
+divergence. The current inventory belongs in [CHANGELOG.md](CHANGELOG.md), while
+the deliberately minimal `genai` patch surface is tracked separately in
+[`vendor/genai/LETHE_FORK.md`](vendor/genai/LETHE_FORK.md).
+
 ## License
 
-MIT
+MIT, as declared in `Cargo.toml`. This fork retains the upstream Git history
+and attribution. Vendored dependencies retain their own license files and
+notices.
