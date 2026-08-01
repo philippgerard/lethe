@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::anyhow;
-use genai::chat::{ChatMessage, ContentPart, MessageContent, ToolCall, ToolResponse};
+use genai::chat::{ChatMessage, ChatRole, ContentPart, MessageContent, ToolCall, ToolResponse};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -64,10 +64,11 @@ const FREE_TOOL_NAMES: &[&str] = &[
     "conversation_search",
     "note_search",
     "note_get",
-    // Telegram
+    // Chat egress (Telegram-branded + the client-transport alias)
     "telegram_send_message",
     "telegram_send_file",
     "telegram_react",
+    "chat_send_message",
     // Actor lifecycle
     "send_message",
     "user_notify",
@@ -98,7 +99,91 @@ fn skip_tool_log(name: &str) -> bool {
 }
 
 fn is_error_result(result: &str) -> bool {
-    result.starts_with("Error:") || result.starts_with("Unknown tool:")
+    let trimmed = result.trim_start();
+    if trimmed.starts_with("Error:")
+        || trimmed.starts_with("Unknown tool:")
+        || trimmed.starts_with("✗")
+        || trimmed
+            .strip_prefix("Exit code:")
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| code != 0)
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .is_some_and(|value| {
+            value.get("ok").and_then(Value::as_bool) == Some(false)
+                || value.get("error").is_some_and(|error| !error.is_null())
+                || value
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("error"))
+        })
+}
+
+/// Re-apply a hard context ceiling on every tool iteration. The initial turn
+/// clamp cannot account for schemas loaded later via `request_tool`, nor for a
+/// long chain of assistant/tool-result pairs appended after assembly. Prefer
+/// dropping the oldest completed tool exchanges; if needed, then drop oldest
+/// pre-turn history while preserving system messages and the current user ask.
+fn clamp_chat_request_to_budget(
+    request: &mut genai::chat::ChatRequest,
+    current_user_index: &mut usize,
+    max_total_chars: usize,
+) -> usize {
+    if max_total_chars == 0 {
+        return 0;
+    }
+    let tool_chars = request
+        .tools
+        .as_ref()
+        .map(|tools| tools.iter().map(genai::chat::Tool::size).sum::<usize>())
+        .unwrap_or_default();
+    let message_budget = max_total_chars.saturating_sub(tool_chars);
+    let total = |messages: &[ChatMessage]| messages.iter().map(ChatMessage::size).sum::<usize>();
+    let mut dropped = 0;
+
+    // Completed exchanges appended after the current user request are the most
+    // disposable and are usually the source of runaway form/research turns.
+    // Remove each exchange as one slice, ending immediately before the next
+    // assistant message. In particular, never keep the final tool response of
+    // a parallel tool-call batch after removing the assistant that issued it.
+    while total(&request.messages) > message_budget
+        && *current_user_index + 1 < request.messages.len()
+    {
+        let exchange_start = *current_user_index + 1;
+        let exchange_end = request.messages[exchange_start + 1..]
+            .iter()
+            .position(|message| message.role == ChatRole::Assistant)
+            .map_or(request.messages.len(), |offset| {
+                exchange_start + 1 + offset
+            });
+        dropped += exchange_end - exchange_start;
+        request.messages.drain(exchange_start..exchange_end);
+    }
+
+    // If schemas themselves grew enough to squeeze the initial prompt, prune
+    // oldest non-system history but never the current user message.
+    let history_start = request
+        .messages
+        .iter()
+        .position(|message| message.role != ChatRole::System)
+        .unwrap_or(request.messages.len());
+    while total(&request.messages) > message_budget && history_start < *current_user_index {
+        request.messages.remove(history_start);
+        *current_user_index = current_user_index.saturating_sub(1);
+        dropped += 1;
+        while history_start < *current_user_index
+            && request.messages[history_start].role == ChatRole::Tool
+        {
+            request.messages.remove(history_start);
+            *current_user_index = current_user_index.saturating_sub(1);
+            dropped += 1;
+        }
+    }
+    dropped
 }
 
 /// Transient failures — the kind that often succeed on a later attempt
@@ -179,6 +264,13 @@ struct ToolLogEntry {
     result_preview: String,
     success: bool,
 }
+
+/// Upper bound on the args/output preview streamed to UI clients (desktop
+/// debug card, TUI). Generous so the card shows the whole real-world result
+/// (memory, file reads, search), capped only to guard SSE/render against a
+/// pathological multi-megabyte tool output. The model still gets the full,
+/// untruncated result in its context.
+const TOOL_PREVIEW_CHARS: usize = 16_384;
 
 fn truncate_chars(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
@@ -336,16 +428,23 @@ pub(super) struct TurnExecutionContext {
     /// the next turn's compaction budget reflects real usage instead of a
     /// crude char estimate. Zero means "no measurement yet".
     pub last_prompt_tokens: Arc<AtomicU64>,
+    pub hosted_plugins: Option<Arc<crate::tools::hosted_plugins::HostedPluginClient>>,
 }
 
 /// Build the actor turn executor that the [`ActorRuntime`] supervisor calls
 /// to run each subagent turn. Wraps the standard tool loop with actor wiring.
+/// `tool_policy` is the hosting process's capability boundary: subagent turns
+/// run under the exact same policy as the cortex turns that spawned them, so
+/// a hosted subagent can never reach tools its host denies.
 pub(super) fn actor_turn_executor(
     settings: Settings,
     memory: Arc<MemoryStore>,
     router: Arc<RwLock<LlmRouter>>,
     shell: ShellTools,
     last_prompt_tokens: Arc<AtomicU64>,
+    hosted_plugins: Option<Arc<crate::tools::hosted_plugins::HostedPluginClient>>,
+    tool_policy: crate::tools::registry::ToolPolicy,
+    subagent_observer: crate::tools::registry::SubagentObserverSlot,
 ) -> ActorTurnExecutor {
     let context = TurnExecutionContext {
         settings,
@@ -353,9 +452,17 @@ pub(super) fn actor_turn_executor(
         router,
         shell,
         last_prompt_tokens,
+        hosted_plugins,
     };
     Arc::new(move |spec: ActorRunSpec, runtime: ActorRuntime| {
         let context = context.clone();
+        // Resolve the host's observer factory (if any) per turn, so a factory
+        // installed after startup covers turns already in flight next cycle.
+        let observer = subagent_observer
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .map(|factory| factory(&spec.actor_id));
         Box::pin(async move {
             let tool_runtime = ToolRuntime {
                 actor: Some(ActorToolContext {
@@ -367,10 +474,51 @@ pub(super) fn actor_turn_executor(
                 // A subagent spawned on the `deep` tier starts already escalated,
                 // so its whole turn runs on the powerful model.
                 start_escalated: actor_starts_escalated(spec.model),
+                policy: tool_policy,
+                observer,
                 ..ToolRuntime::default()
             };
+            let mut system_prompt = spec.system_prompt.clone();
+            if let Some(client) = context.hosted_plugins.as_ref() {
+                if let Err(error) = client.refresh_catalog().await {
+                    tracing::warn!(error = %error, "hosted plugin catalog unavailable to subagent");
+                }
+                // ActorRegistry builds its requestable directory before a
+                // ToolRuntime exists. Remove hosted-owned local definitions,
+                // then append the dynamic directory and bounded plugin data.
+                system_prompt = system_prompt
+                    .lines()
+                    .filter(|line| {
+                        let name = line
+                            .strip_prefix("- ")
+                            .and_then(|line| line.split_once(" — "))
+                            .map(|(name, _)| name.trim());
+                        !name.is_some_and(|name| client.replaces_builtin(name))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let directory = client.requestable_directory();
+                if !directory.is_empty() {
+                    system_prompt.push_str(
+                        "\n\n<available_on_request source=\"hosted_plugins\">\n\
+                         Tools below are NOT loaded. Call request_tool(name=...) to enable one for this turn.\n",
+                    );
+                    system_prompt.push_str(&directory);
+                    system_prompt.push_str("\n</available_on_request>");
+                }
+                match client.context_blocks().await {
+                    Ok(plugin_context) if !plugin_context.trim().is_empty() => {
+                        system_prompt.push_str("\n\n");
+                        system_prompt.push_str(plugin_context.trim());
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "hosted plugin context unavailable to subagent")
+                    }
+                }
+            }
             let messages = vec![
-                LlmMessage::system(spec.system_prompt.clone()),
+                LlmMessage::system(system_prompt),
                 LlmMessage::user(actor_turn_instruction(&spec)),
             ];
             complete_turn_with_tools_config_shared(
@@ -408,11 +556,12 @@ fn select_turn_model(
     config: &LlmRouterConfig,
     use_aux: bool,
     entered_tool_chain: bool,
+    tool_model_disabled: bool,
     escalated: bool,
 ) -> (&str, bool) {
     if escalated && config.has_deep_model() {
         (config.deep_model(), true)
-    } else if entered_tool_chain && config.has_tool_model() {
+    } else if entered_tool_chain && !tool_model_disabled && config.has_tool_model() {
         (config.tool_model(), false)
     } else {
         (config.model_for(use_aux), false)
@@ -426,13 +575,23 @@ fn select_turn_model(
 pub(super) async fn complete_turn_with_tools_config_shared(
     context: TurnExecutionContext,
     messages: Vec<LlmMessage>,
-    runtime: ToolRuntime,
+    mut runtime: ToolRuntime,
     use_aux: bool,
     record_tool_messages: bool,
 ) -> AgentResult<TurnOutput> {
     // Read before `runtime` is moved into the registry below: a `deep`-tier
     // subagent starts already escalated onto the powerful model.
     let start_escalated = runtime.start_escalated;
+    if runtime.hosted_plugins.is_none() {
+        runtime.hosted_plugins = context.hosted_plugins.clone();
+    }
+    if let Some(client) = runtime.hosted_plugins.as_ref()
+        && let Err(error) = client.refresh_catalog().await
+    {
+        // Keep the last-known catalog. On a cold outage, configured replacement
+        // families remain hidden rather than falling back to local state.
+        tracing::warn!(error = %error, "hosted plugin catalog refresh failed");
+    }
     let mut active_tools = runtime
         .requested_tools
         .iter()
@@ -447,6 +606,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         runtime,
     );
     let mut request = build_chat_request(messages);
+    let mut current_user_index = request.messages.len().saturating_sub(1);
     let mut last_text = String::new();
     let mut total_tool_calls: usize = 0;
     let mut total_tool_errors: usize = 0;
@@ -471,6 +631,9 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // Telegram surfaces the otherwise-quiet switch once, immediately before
     // the first request that actually uses the deep model.
     let mut power_mode_notified = false;
+    // A tool model that returns an empty response is bypassed for the remainder
+    // of this chain. Deep escalation still outranks this fallback.
+    let mut tool_model_disabled = false;
 
     for iteration in 0..MAX_TOOL_ITERATIONS {
         request.tools = Some(registry.tools_for_active(&active_tools));
@@ -489,8 +652,13 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         // Model for this call, in priority order: an active deep-thinking
         // escalation wins; else the dedicated tool model once inside a tool
         // chain; else the base model selected by `use_aux` for this turn.
-        let (model_id, using_deep_model) =
-            select_turn_model(router.config(), use_aux, entered_tool_chain, escalated);
+        let (model_id, using_deep_model) = select_turn_model(
+            router.config(),
+            use_aux,
+            entered_tool_chain,
+            tool_model_disabled,
+            escalated,
+        );
         let model_id = model_id.to_string();
         notify_power_mode_once(
             registry.turn_observer(),
@@ -499,6 +667,17 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             &mut power_mode_notified,
         )
         .await;
+        let max_total_chars = context
+            .settings
+            .llm
+            .context_limit_for(&model_id)
+            .saturating_sub(context.settings.llm.llm_max_output as u64)
+            .saturating_mul(4) as usize;
+        let dropped =
+            clamp_chat_request_to_budget(&mut request, &mut current_user_index, max_total_chars);
+        if dropped > 0 {
+            tracing::warn!(iteration, dropped, model = %model_id, "trimmed tool-loop context to budget");
+        }
         let observer_for_stream = registry.turn_observer().cloned();
         let response = match observer_for_stream {
             Some(observer) => {
@@ -563,6 +742,22 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             // Empty content + no tool calls — model stuck. Nudge once;
             // on second strike, fall through to the no-tools wrap-up.
             empty_count += 1;
+            if entered_tool_chain
+                && !tool_model_disabled
+                && !using_deep_model
+                && router.config().has_tool_model()
+            {
+                tool_model_disabled = true;
+                tracing::warn!(
+                    tool_model = %router.config().tool_model(),
+                    "tool model returned empty; falling back to the base model for this chain"
+                );
+                request.messages.push(ChatMessage::user(
+                    "[The tool model returned an empty response. Continue the task from the tool results above.]"
+                        .to_string(),
+                ));
+                continue;
+            }
             if empty_count >= MAX_EMPTY_RESPONSES {
                 tracing::warn!(
                     empty_count,
@@ -592,7 +787,10 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 .router
                 .read()
                 .map_err(|error| AgentError::Llm(anyhow!("router lock poisoned: {error}")))?;
-            if router.config().has_tool_model() {
+            if router.config().has_tool_model()
+                && !tool_model_disabled
+                && !using_deep_model
+            {
                 tracing::info!(
                     tool_model = %router.config().tool_model(),
                     "tool call detected — switching to the tool model for the rest of the chain"
@@ -635,7 +833,11 @@ pub(super) async fn complete_turn_with_tools_config_shared(
 
             let observer_for_tool = registry.turn_observer().cloned();
             if let Some(observer) = observer_for_tool.as_ref() {
-                observer.on_tool_start(&tool_name, &call_id, &truncate_chars(&args_string, 200));
+                observer.on_tool_start(
+                    &tool_name,
+                    &call_id,
+                    &truncate_chars(&args_string, TOOL_PREVIEW_CHARS),
+                );
             }
             let tool_started_at = std::time::Instant::now();
 
@@ -676,8 +878,11 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                         .to_string()
                 }
             } else if registry.tool_is_active(&call.fn_name, &active_tools) {
-                let inner: BoxToolFuture<'_> =
-                    Box::pin(registry.execute_async(&call.fn_name, &call.fn_arguments));
+                let inner: BoxToolFuture<'_> = Box::pin(registry.execute_async_with_call_id(
+                    &call.fn_name,
+                    &call.fn_arguments,
+                    Some(&call_id),
+                ));
                 match registry.turn_observer() {
                     Some(observer) => observer.wrap_tool_call(&call.fn_name, inner).await,
                     None => inner.await,
@@ -722,7 +927,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                     &tool_name,
                     &call_id,
                     !is_error,
-                    &truncate_chars(&result, 200),
+                    &truncate_chars(&result, TOOL_PREVIEW_CHARS),
                     tool_started_at.elapsed().as_millis(),
                 );
             }
@@ -847,8 +1052,13 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // The wrap-up reply is the user-facing answer, so honor the same priority as
     // the loop: a live escalation writes the final answer on the deep model; else
     // the tool model when we entered a tool chain; else the base model.
-    let (wrap_model, wrap_uses_deep_model) =
-        select_turn_model(router.config(), use_aux, entered_tool_chain, escalated);
+    let (wrap_model, wrap_uses_deep_model) = select_turn_model(
+        router.config(),
+        use_aux,
+        entered_tool_chain,
+        tool_model_disabled,
+        escalated,
+    );
     let wrap_model = wrap_model.to_string();
     notify_power_mode_once(
         registry.turn_observer(),
@@ -1012,7 +1222,17 @@ fn request_tool_for_turn(
         return format!("Tool '{name}' is already available. You can use it now.");
     }
     active_tools.insert(name.to_string());
-    format!("Tool '{name}' is now available. You can use it in the next tool call.")
+    let siblings = registry.group_siblings(name);
+    if siblings.is_empty() {
+        return format!("Tool '{name}' is now available. You can use it in the next tool call.");
+    }
+    for sibling in &siblings {
+        active_tools.insert(sibling.clone());
+    }
+    format!(
+        "Tool '{name}' is now available, together with its whole family: {}. You can use them from the next tool call on without further request_tool calls.",
+        siblings.join(", ")
+    )
 }
 
 fn truncate_log_text(value: &str, limit: usize) -> String {
@@ -1146,16 +1366,26 @@ mod tests {
         let config = model_routing_config();
 
         assert_eq!(
-            select_turn_model(&config, false, false, false),
+            select_turn_model(&config, false, false, false, false),
             ("main-model", false)
         );
         assert_eq!(
-            select_turn_model(&config, false, true, false),
+            select_turn_model(&config, false, true, false, false),
             ("tool-model", false)
         );
         assert_eq!(
-            select_turn_model(&config, false, true, true),
+            select_turn_model(&config, false, true, false, true),
             ("deep-model", true)
+        );
+        assert_eq!(
+            select_turn_model(&config, false, true, true, false),
+            ("main-model", false),
+            "a disabled empty tool model must fall back to the base model"
+        );
+        assert_eq!(
+            select_turn_model(&config, false, true, true, true),
+            ("deep-model", true),
+            "deep escalation must outrank the empty-tool-model fallback"
         );
     }
 
@@ -1168,7 +1398,7 @@ mod tests {
         assert!(!actor_starts_escalated(ModelTier::Main));
         assert!(!actor_starts_escalated(ModelTier::Aux));
         assert_eq!(
-            select_turn_model(&config, false, false, start_escalated),
+            select_turn_model(&config, false, false, false, start_escalated),
             ("deep-model", true)
         );
     }
@@ -1314,8 +1544,76 @@ mod tests {
     fn is_error_result_detects_standard_error_prefixes() {
         assert!(is_error_result("Error: file not found"));
         assert!(is_error_result("Unknown tool: foo"));
+        assert!(is_error_result("Exit code: 1\n✗ invalid selector"));
+        assert!(is_error_result("✗ command failed"));
+        assert!(is_error_result(
+            r#"{"status":"error","message":"browser failed"}"#
+        ));
+        assert!(is_error_result(r#"{"ok":false,"error":"stale ref"}"#));
+        assert!(is_error_result(r#"{"error":"browser failed"}"#));
+        assert!(!is_error_result(r#"{"ok":true,"error":null}"#));
+        assert!(!is_error_result(r#"{"status":"OK","message":"opened"}"#));
         assert!(!is_error_result("Successfully wrote 12 bytes"));
         assert!(!is_error_result(""));
+    }
+
+    #[test]
+    fn tool_loop_budget_counts_schemas_and_drops_old_exchanges() {
+        let mut request = genai::chat::ChatRequest::new(vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("current request"),
+            ChatMessage::assistant("old assistant output that is intentionally long"),
+            ChatMessage::from(ToolResponse::new(
+                "call-1",
+                "old tool result that is intentionally long",
+            )),
+            ChatMessage::assistant("latest answer"),
+        ]);
+        request.tools = Some(vec![
+            genai::chat::Tool::new("large_tool").with_description("x".repeat(80)),
+        ]);
+        let mut current_user_index = 1;
+        let dropped = clamp_chat_request_to_budget(&mut request, &mut current_user_index, 125);
+        assert!(dropped >= 2, "old assistant/tool pair should be removed");
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[current_user_index].role, ChatRole::User);
+        assert_eq!(request.messages.last().unwrap().role, ChatRole::Assistant);
+    }
+
+    #[test]
+    fn tool_loop_budget_drops_all_parallel_results_with_their_assistant() {
+        let mut request = genai::chat::ChatRequest::new(vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("current request"),
+            ChatMessage::assistant("parallel tool calls that are intentionally long"),
+            ChatMessage::from(ToolResponse::new(
+                "call-1",
+                "first tool result that is intentionally long",
+            )),
+            ChatMessage::from(ToolResponse::new(
+                "call-2",
+                "second tool result that is intentionally long",
+            )),
+            ChatMessage::from(ToolResponse::new(
+                "call-3",
+                "third tool result that is intentionally long",
+            )),
+        ]);
+        let mut current_user_index = 1;
+
+        let dropped = clamp_chat_request_to_budget(&mut request, &mut current_user_index, 40);
+
+        assert_eq!(dropped, 4, "the complete parallel exchange must be removed");
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, ChatRole::System);
+        assert_eq!(request.messages[current_user_index].role, ChatRole::User);
+        assert!(
+            request
+                .messages
+                .iter()
+                .all(|message| message.role != ChatRole::Tool),
+            "a tool response without its assistant call would be provider-invalid"
+        );
     }
 
     #[test]

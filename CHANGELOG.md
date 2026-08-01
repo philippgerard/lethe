@@ -1,5 +1,243 @@
 # Changelog
 
+## 0.28.0 - Agent-id installs itself, browser CLI health probe
+
+- **A broken browser CLI no longer swallows the browser** (#53). The
+  `alien_browser_*` tools were gated on the CLI merely existing on PATH,
+  so an install whose dependency tree didn't match its imports (e.g. a
+  mid-release-cycle plugin pack against an older published
+  `@alien-id/agent-id-core`) exposed tools whose every call died in the
+  CLI's module loader. `browser_cli_health()` now probes the CLI once per
+  process (`--help`, which exercises the whole import graph); a CLI that
+  can't start keeps the tools hidden and logs the reinstall hint.
+- **`lethe check` diagnoses agent-id.** New lines report core/vault CLI
+  presence, identity provisioning state, and browser CLI health — each
+  with the command that fixes it. The same paths are available standalone
+  via the hidden `lethe agent-id status` / `lethe agent-id provision`.
+- **`install.sh` installs and provisions agent-id.** When npm is present
+  it installs `@alien-id/agent-id-core` + `-vault` (and
+  `@alien-id/agent-id-browser` when Google Chrome is on the host), then
+  runs `lethe agent-id provision`, so identity + vault exist even when
+  the init wizard is skipped (existing config, `LETHE_SKIP_INIT`, no
+  TTY). `LETHE_SKIP_AGENT_ID=1` opts out entirely.
+- **README: install the browser CLI from npm.** The "marketplace-only —
+  not on npm" claim was stale; `@alien-id/agent-id-browser` is published,
+  and installing from npm keeps core/vault/browser one matching release
+  set. Bleeding-edge from an agent-id checkout goes through `bun install`
+  + `AGENT_ID_BROWSER_BIN=<checkout>/plugins/agent-id-browser/bin/cli.mjs`
+  so the workspace supplies matching siblings.
+
+## 0.27.0 - Typed background actor markers, client reply keyboards, full tool previews
+
+- **Background/system activity is now typed on the actor event wire**
+  (closes #44). `actor_spawned` and `actor_restored` payloads carry
+  `is_background`, backed by a new `ActorConfig::background` flag set for
+  the DMN reflector (and any future system-driven actor) — consumers no
+  longer need to hardcode the `"dmn"` name. `actor_message` payloads
+  forward the message metadata's `source`/`kind`, so the DMN heartbeat
+  kickoff (`source: "background_heartbeat", kind: "heartbeat"`) and
+  subagent termination notices (`source: "termination"`) are
+  distinguishable without content sniffing. The flag persists through the
+  actor store (new `background` column, migrated on open), so restored
+  DMN actors keep it across restarts. All fields are additive; lethe-mux
+  passes them through unchanged.
+- **`chat_send_message` accepts `reply_markup_json`** (#42, thanks
+  @zasulskii). The shared executor and client egress already handled
+  keyboards; the tool spec now declares the param, so the model can offer
+  quick-reply buttons on web/desktop chat sessions, not just Telegram.
+  Optional — omitting it sends a plain message as before.
+- **Tool previews streamed to UI clients grew 200 chars → 16 KB** (#43,
+  thanks @alekseiEti). `tool.start`/`tool.end` args and output previews
+  were cut mid-word at 200 chars in every UI; the cap is now a named
+  `TOOL_PREVIEW_CHARS = 16_384`, enough for real-world results while
+  still bounding pathological outputs. The model's own context was and
+  remains untruncated.
+- **Opening the browser drawer guarantees a live viewport.** When the
+  `/browser/stream` relay finds no dialable source it launches the shared
+  `main` session (headless, anonymous profile) and re-dials, with a 30s
+  backoff so the viewer's redial loop can't spawn-storm. Browser opens
+  are serialized behind a process-wide lock and reuse a live daemon,
+  making `alien_browser_open` safe against double-opens.
+
+## 0.26.0 - GPT-5.x via Responses API, genai 0.6.5, OpenRouter prompt caching, sealed-browser forms
+
+- **gpt-5.x agent turns work again.** OpenAI's Chat Completions endpoint
+  rejects function tools combined with any reasoning effort other than `none`
+  on the gpt-5 reasoning family, and an agent request always carries tools —
+  so every gpt-5.x turn 400'd. Direct-OpenAI gpt-5 reasoning models now route
+  to `/v1/responses` (`AdapterKind::OpenAIResp`), which supports tools and
+  reasoning together. Sampling params are handled at the caller:
+  `LlmRouterConfig::chat_options` now takes the model and skips
+  `temperature` for OpenAI reasoning models (they reject non-default
+  sampling); relayed ids (`openrouter/…`, `opencode-go/…`) are untouched.
+- **Vendored genai upgraded 0.5.3 → 0.6.5; the fork shrank from four patches
+  to one.** Upstream absorbed the 1h cache TTL (`CacheControl::Ephemeral1h`
+  replaces the fork's `Persistent`), `max_completion_tokens`, and ships a
+  real OpenAI Responses streamer (tool-call deltas included). The single
+  remaining patch forwards per-message `cache_control` through the OpenAI
+  adapter — upstream only supports request-level cache control, which cannot
+  reach providers behind OpenRouter. See `vendor/genai/LETHE_FORK.md`.
+- **OpenRouter prompt caching actually engages now.** The dialect layer
+  routed all OpenRouter models to "no cache markers" on the mistaken belief
+  that OpenRouter strips `cache_control`; it forwards it upstream. Every
+  turn on OpenRouter → Anthropic/Gemini/Qwen re-billed the full system
+  prompt since May. `openrouter/anthropic/*` now gets the 1h + 5m
+  breakpoints, `openrouter/google/*` and `openrouter/qwen/*` get explicit
+  5m markers (1h TTL is Anthropic-only), and vendors with automatic prefix
+  caching (OpenAI, Grok, Moonshot, Z.AI, …) correctly stay unmarked.
+- **Web and knowledge-graph tools no longer panic the turn.** `web_search`,
+  `fetch_webpage` and the `kg_*` family used `reqwest::blocking` inside
+  `ToolExecutor::Sync`, which runs on the tokio worker — the blocking
+  client's internal runtime dies there with "Cannot drop a runtime in a
+  context where blocking is not allowed", killing the turn (surfaced under
+  lethe-mux once the tools were unblocked). All of them are now genuinely
+  async (`ToolExecutor::Async`, async `reqwest`, explicit 30s timeouts —
+  the async client has no default timeout, unlike the blocking one).
+  Remaining Sync executors (e.g. Telegram egress) run under
+  `tokio::task::block_in_place` on multi-thread runtimes as a safety net,
+  and the no-blocking-I/O constraint is documented on `SyncExecutor`.
+- **The standalone browser tool family is removed; the sealed Alien browser
+  is the only browser.** `src/tools/browser.rs` (the `browser_*` tools) is
+  gone; the shell tool detects and refuses attempts to reinstall or drive
+  the removed `agent-browser` package. New `alien_browser_inspect_form` /
+  `alien_browser_fill_form` tools handle whole forms in one call — fields,
+  checks, selects, uploads and submit — with upload paths resolved through
+  the turn's file-access policy, so hosted form filling stays
+  workspace-jailed. The browser stream drops the plain (non-Alien) source.
+- **Hard context ceiling re-applied on every tool iteration.** The initial
+  turn clamp couldn't account for schemas loaded mid-turn via
+  `request_tool` or long assistant/tool-result chains; the tool loop now
+  re-clamps each iteration, dropping the oldest completed tool exchanges
+  first, then oldest pre-turn history, always preserving system messages
+  and the current user ask.
+
+## 0.25.0 - Host-observable subagent turns, richer actor events
+
+- **Hosts can observe subagent turns.** A new
+  `Agent::install_subagent_observer` hook accepts a factory
+  (`SubagentObserverFactory`) that the actor turn executor calls with the
+  acting actor's id at the start of every subagent turn; the returned
+  `TurnObserver` is threaded through the tool loop, so hosts can attribute
+  per-subagent tool calls and reasoning on their own event streams. Without an
+  installed factory subagent turns run unobserved, exactly as before.
+- **`actor_spawned` carries the actor's `goals`**, so clients can title a
+  subagent's task straight from the spawn event instead of fetching the
+  roster.
+- **Richer `actor.*` events on the standalone `/events` feed:** every event
+  (`actor.state`, `actor.task`, `actor.message`) now carries `group` — not
+  just `actor.spawned` — so principal (`main`) and subagent activity separate
+  without stateful correlation; and `user_notify` bus events surface as
+  `actor.user_notify` (full message text, intent under `kind`) instead of
+  being dropped.
+
+## 0.24.0 - Postgres memory backend, hosted subagents/DMN, jailed file tools, browser stream
+
+- **Pluggable memory storage with a tenant-scoped PostgreSQL backend.** The
+  block/archival/message/note/todo stores now sit behind storage traits
+  (`src/memory/backend.rs`); the new `postgres-memory` feature provides
+  `PostgresMemory`/`PostgresMemoryFactory` for multi-tenant hosts, with
+  transaction-local tenant scoping. SQLite remains the standalone default.
+- **Hosted hardening for Agent ID and the sealed browser.** Tenant-safe
+  browser logs, a generalized hosted browser gate, a single bind poll per
+  pending-auth file, and no builtin browser under the hosted policy.
+- **`/browser/stream` WebSocket relay** for the live sealed-browser viewport
+  feed on the standalone HTTP API.
+- **Workspace-jailed file/image tools under the hosted policy.**
+  `FileTools::sandboxed` / `ImageTools::sandboxed` confine every path —
+  absolute, relative, `~`, `..`, or through a symlink — to the workspace
+  directory, checked on the canonicalized form against the real filesystem
+  (non-existent write targets resolve their longest existing prefix).
+  `ToolRegistry::with_runtime` constructs the jailed instances under
+  `ToolPolicy::HostedSafe`, and the policy now allowlists `read_file`,
+  `write_file`, `edit_file`, `list_directory`, `glob_search`, `grep_search`,
+  and `view_image`. Standalone (`Full` policy) keeps unrestricted access.
+
+- **Subagent orchestration works under the hosted-safe policy.** The actor
+  tools (`spawn_actor`, `spawn_chain`, `send_message`, `terminate`, …) are now
+  allowlisted by `ToolPolicy::HostedSafe`: they only manage internal LLM
+  workers, and every subagent turn re-enters the same policy gate. The host's
+  policy is threaded into the agent via the new
+  `Agent::from_settings_with_memory_policy`, so internally executed subagent
+  turns no longer default to the full local catalog, and the actor prompt
+  `<available_on_request>` directories honor the active policy (previously
+  hardcoded `Full`) plus the per-turn agent-id state so hosted agents are
+  never shown tools that dispatch would reject.
+- **Brainstem beats are host-drivable.** New `brainstem::beat` runs one beat
+  with caller-owned, serializable state (`BeatState`: heartbeat counters,
+  proactive rate limiter, deferred outbox — `Heartbeat` gained
+  `state()`/`with_state`), takes the host's per-turn `ToolRuntime`, and
+  returns the messages to deliver. The resident `run` loop and `trigger_once`
+  are now thin wrappers over it.
+- **DMN and subagent notifications reach users in server mode.** Beats now
+  drain the gated `user_notify` pipeline (heuristic + aux-LLM review) and emit
+  survivors alongside the heartbeat's own proactive message; previously only
+  the CLI `heartbeat trigger` path harvested them. Delivered proactive
+  messages are also recorded in conversation history, so the agent remembers
+  what it proactively told the user.
+- **Heartbeat reminders read the injected memory store.** `active_reminders`
+  no longer rebuilds a local store from settings — hosted deployments with an
+  injected backend were silently reading an empty local database.
+- **`ActorRuntime::shutdown()` for embedding hosts.** The kameo supervisor
+  and its resident workers hold mutually referencing refs; hosts that drop
+  agents while the process lives (LRU caches) can now stop the runtime
+  explicitly instead of leaking it. Unfinished subagents restore from the
+  write-through store on the next build, exactly like a process restart.
+
+## 0.23.7 - gpt-5.x on Chat Completions, agent-browser freshness
+
+- **OpenAI reasoning models work again.** gpt-5.x / o-series turns on Chat
+  Completions failed with a 400 on every request: those models require
+  `max_completion_tokens` (classic `max_tokens` is rejected) and accept only
+  the default temperature. The vendored genai fork now detects reasoning-era
+  model names on the direct OpenAI adapter, sends `max_completion_tokens`,
+  and drops non-default `temperature`/`top_p` (the `gpt-5-chat*` variants
+  keep sampling params). Other OpenAI-compatible providers are unaffected.
+- **Stale agent-browser installs get flagged.** Lethe never pinned
+  `agent-browser`, but the CLI is pre-1.0, so npm's caret semantics mean
+  `npm update -g` never moves an old install forward (a February 0.10.0
+  stays 0.10.0 while npm's latest is 0.31.x) — and the old binary survives
+  reinstalls on the host PATH and in the persistent container. `browser_open`
+  now checks the installed version once per process and, when it's below a
+  known-good floor, tells the agent to run
+  `npm install -g agent-browser@latest`.
+
+## 0.23.6 - Hosted plugins and authoritative Agenda
+
+- **Hosted plugins are discovered and invoked through one trusted bridge.**
+  Hosted deployments can inject a user-scoped catalog endpoint; Lethe then
+  loads enabled plugin tools and prompt context dynamically, dispatches calls
+  with bounded retries and idempotency, and refreshes the catalog without
+  teaching the core binary about each plugin. Standalone installs remain fully
+  local when the bridge is not configured.
+- **Hosted Agenda can be the single task authority.** With
+  `LETHE_HOSTED_DISABLE_LOCAL_TODOS=true`, Agenda's `todo_*` tools replace the
+  local set and its current work is surfaced automatically in model context.
+  Local active-task prompts, heartbeat checks, and brainstem reminders are also
+  suppressed, preventing duplicate or split-brain reminders during a gateway
+  outage.
+
+## 0.23.5 - Tool-family loading, browser-act schema, client chat egress
+
+- **Requesting one tool now loads its whole family.** The vault/identity tools,
+  the vault-sealed browser set, and the built-in browser are each one workflow
+  (open/act/close, add/list/remove). Loading them one at a time made real flows
+  stall mid-turn on "available but not loaded" (`alien_browser_close` / `_login`
+  bounced right after `_act` loaded). `request_tool` on any member now activates
+  the whole visible family, and says so in its result.
+- **`alien_browser_act` params are in the schema.** The executor already turned a
+  `params` object into `--flags`, but the declared schema only had `action`/`name`
+  (with `additionalProperties:false`), so schema-strict models couldn't pass a URL
+  to navigate or a ref to click. Added `ParamKind::Object` and declared `params`.
+- **Telegram tools split from client chat egress.** `telegram_send_message`/etc.
+  were gated on *any* transport, so API/desktop/hosted-web sessions carried
+  Telegram-branded tools with no Telegram configured (and `_send_file`/`_react`
+  silently no-op'd in those chat UIs). Client sessions now get a transport-neutral
+  `chat_send_message`; Telegram sessions keep the branded set.
+- **Owner-binding QR renders in GUI chats.** The bind result now tells the model
+  to present `deep_link` as a ` ```qr ` fenced block (GUI chats render those as
+  real scannable codes) instead of pasting terminal box-drawing `qr_code`, which
+  is unscannable in a proportional-font chat.
+
 ## 0.23.4 - One browser at a time
 
 - **No more two competing browsers.** Lethe has a built-in browser (`browser_*`,

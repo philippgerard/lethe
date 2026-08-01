@@ -5,6 +5,7 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::memory::MemoryStore;
+use crate::tools::hosted_plugins::{HostedPluginClient, RemoteToolDef, RemoteToolExposure};
 use crate::tools::shell::ShellTools;
 use crate::tools::web::WebTools;
 
@@ -26,7 +27,7 @@ fn exposes_core_tool_specs() {
     let names = registry
         .tools()
         .into_iter()
-        .map(|tool| tool.name)
+        .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
     assert!(names.contains(&"read_file".to_string()));
     assert!(names.contains(&"bash".to_string()));
@@ -38,10 +39,7 @@ fn exposes_core_tool_specs() {
     assert!(names.contains(&"note_search".to_string()));
     assert!(names.contains(&"web_search".to_string()));
     assert!(names.contains(&"fetch_webpage".to_string()));
-    assert!(names.contains(&"browser_open".to_string()));
-    assert!(names.contains(&"browser_snapshot".to_string()));
-    assert!(names.contains(&"browser_click".to_string()));
-    assert!(names.contains(&"browser_fill".to_string()));
+    assert!(!names.iter().any(|name| name.starts_with("browser_")));
     assert!(names.contains(&"view_image".to_string()));
     assert!(names.contains(&"todo_update".to_string()));
     assert!(names.contains(&"todo_remind_check".to_string()));
@@ -56,7 +54,7 @@ fn active_tool_specs_start_small_and_expand_on_request() {
     let initial = registry
         .tools_for_active(&active)
         .into_iter()
-        .map(|tool| tool.name)
+        .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
     assert!(initial.contains(&"request_tool".to_string()));
     // Always loaded so the agent can self-escalate to the deep model on demand.
@@ -94,16 +92,77 @@ fn active_tool_specs_start_small_and_expand_on_request() {
         initial.len()
     );
 
-    let active = ["browser_open".to_string(), "fetch_webpage".to_string()]
+    let active = ["fetch_webpage".to_string()]
         .into_iter()
         .collect::<HashSet<_>>();
     let expanded = registry
         .tools_for_active(&active)
         .into_iter()
-        .map(|tool| tool.name)
+        .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
-    assert!(expanded.contains(&"browser_open".to_string()));
     assert!(expanded.contains(&"fetch_webpage".to_string()));
+}
+
+#[test]
+fn hosted_tools_replace_local_defs_and_join_requestable_groups() {
+    let (_tmp, memory, shell) = registry();
+    let hosted = HostedPluginClient::with_catalog_for_test(
+        vec![
+            RemoteToolDef {
+                plugin_id: "agenda".to_string(),
+                name: "todo_list".to_string(),
+                description: "List hosted todos".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer"}},
+                    "additionalProperties": false,
+                }),
+                exposure: RemoteToolExposure::Requestable,
+                group: Some("agenda.todos".to_string()),
+                replaces: vec!["todo_remind_check".to_string()],
+                mutating: false,
+            },
+            RemoteToolDef {
+                plugin_id: "agenda".to_string(),
+                name: "todo_reopen".to_string(),
+                description: "Reopen a hosted todo".to_string(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                exposure: RemoteToolExposure::Requestable,
+                group: Some("agenda.todos".to_string()),
+                replaces: Vec::new(),
+                mutating: true,
+            },
+        ],
+        false,
+    );
+    let registry = ToolRegistry::with_runtime(
+        &memory,
+        memory.workspace_dir(),
+        "/tmp/lethe-cache",
+        &shell,
+        ToolRuntime {
+            hosted_plugins: Some(hosted),
+            ..ToolRuntime::default()
+        },
+    );
+
+    let all = registry.tools();
+    assert_eq!(
+        all.iter().filter(|tool| tool.name.as_str() == "todo_list").count(),
+        1,
+        "remote todo_list must replace, not duplicate, the local schema"
+    );
+    assert!(all.iter().any(|tool| tool.name.as_str() == "todo_reopen"));
+    assert!(!all.iter().any(|tool| tool.name.as_str() == "todo_remind_check"));
+    assert_eq!(
+        registry.group_siblings("todo_list"),
+        vec!["todo_reopen".to_string()]
+    );
+    assert!(
+        registry
+            .requestable_tools_directory()
+            .contains("todo_reopen — Reopen a hosted todo")
+    );
 }
 
 #[test]
@@ -173,13 +232,259 @@ fn executes_files_memory_notes_and_shell_tools() {
             .execute("check_command_exists", &json!({"command_name": "ls"}))
             .contains("available")
     );
+    // web_search is an Async executor (blocking HTTP on the async worker
+    // panics the turn), so the sync dispatch path must refuse it cleanly.
+    assert!(
+        registry
+            .execute("web_search", &json!({"query": "rust"}))
+            .contains("requires async tool execution")
+    );
+}
+
+/// Multi-thread flavor on purpose: this is the runtime lethe-mux runs, and the
+/// flavor where async dispatch routes Sync executors through `block_in_place`
+/// (on current-thread test runtimes that guard is skipped). Locks in that a
+/// Sync tool still works through the guarded path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_tools_still_run_through_async_dispatch_on_multi_thread_runtime() {
+    let (_tmp, memory, shell) = registry();
+    let registry = ToolRegistry::new(&memory, memory.workspace_dir(), "/tmp/lethe-cache", &shell);
+    assert_eq!(
+        registry
+            .execute_async("bash", &json!({"command": "echo ok"}))
+            .await,
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn web_search_dispatches_async_and_reports_missing_key() {
+    let (_tmp, memory, shell) = registry();
+    let registry = ToolRegistry::new(&memory, memory.workspace_dir(), "/tmp/lethe-cache", &shell);
     if !WebTools::is_available() {
         assert!(
             registry
-                .execute("web_search", &json!({"query": "rust"}))
+                .execute_async("web_search", &json!({"query": "rust"}))
+                .await
                 .contains("EXA_API_KEY")
         );
     }
+}
+
+#[test]
+fn hosted_safe_policy_exposes_memory_but_blocks_local_execution() {
+    assert!(ToolPolicy::HostedSafe.allows_builtin("think_deeply"));
+    assert!(ToolPolicy::HostedSafe.allows_builtin("agent_id_status"));
+    assert!(ToolPolicy::HostedSafe.allows_builtin("vault_list"));
+    assert!(ToolPolicy::HostedSafe.allows_builtin("alien_browser_open"));
+    // Workspace file tools are hosted capabilities (jailed instances are
+    // constructed by with_runtime); shell/PTY/web stay out.
+    assert!(ToolPolicy::HostedSafe.allows_builtin("read_file"));
+    assert!(ToolPolicy::HostedSafe.allows_builtin("write_file"));
+    assert!(ToolPolicy::HostedSafe.allows_builtin("view_image"));
+    assert!(!ToolPolicy::HostedSafe.allows_builtin("bash"));
+    assert!(ToolPolicy::Full.allows_builtin("mcp_list_tools"));
+    assert!(
+        !ToolPolicy::HostedSafe.allows_builtin("mcp_list_tools"),
+        "a process-global MCP token must not cross a HostedSafe tenant boundary"
+    );
+    // Web tools are a deployment opt-in, off unless the host enables them.
+    assert!(!hosted_web_tools_enabled());
+    assert!(!ToolPolicy::HostedSafe.allows_builtin("web_search"));
+    for name in ["web_search", "fetch_webpage", "research"] {
+        assert!(
+            !ToolPolicy::HostedSafe.allows_builtin_with(name, false),
+            "{name} must stay blocked while the web-tools switch is off"
+        );
+        assert!(
+            ToolPolicy::HostedSafe.allows_builtin_with(name, true),
+            "{name} must be allowed once the host opts in"
+        );
+    }
+    // The switch widens the hosted allowlist by exactly the web family.
+    assert!(!ToolPolicy::HostedSafe.allows_builtin_with("bash", true));
+    assert!(!ToolPolicy::HostedSafe.allows_builtin_with("browser_open", true));
+    // The removed standalone browser family must not resurface under policy.
+    assert!(!ToolPolicy::HostedSafe.allows_builtin("browser_open"));
+    assert!(!ToolPolicy::HostedSafe.allows_builtin("browser_snapshot"));
+
+    let (_tmp, memory, shell) = registry();
+    let registry = ToolRegistry::with_runtime(
+        &memory,
+        memory.workspace_dir(),
+        "/tmp/lethe-cache",
+        &shell,
+        ToolRuntime {
+            policy: ToolPolicy::HostedSafe,
+            ..ToolRuntime::default()
+        },
+    );
+
+    let names = registry
+        .tools()
+        .into_iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(names.contains("memory_read"));
+    assert!(names.contains("memory_update"));
+    assert!(names.contains("read_file"));
+    // Hosted browsing is exclusively the Alien browser family.
+    assert!(!names.contains("browser_open"));
+    assert!(!names.contains("bash"));
+    assert!(!registry.tool_is_available("bash"));
+    assert!(!registry.tool_is_available("browser_open"));
+    assert!(
+        registry
+            .execute("bash", &json!({"command": "echo forbidden"}))
+            .contains("disabled by the active capability policy")
+    );
+}
+
+#[test]
+fn hosted_safe_file_tools_are_jailed_to_the_workspace() {
+    let (_tmp, memory, shell) = registry();
+    let workspace = memory.workspace_dir().to_path_buf();
+    let registry = ToolRegistry::with_runtime(
+        &memory,
+        &workspace,
+        "/tmp/lethe-cache",
+        &shell,
+        ToolRuntime {
+            policy: ToolPolicy::HostedSafe,
+            ..ToolRuntime::default()
+        },
+    );
+
+    // Inside the workspace: relative and workspace-absolute paths both work.
+    let write = registry.execute(
+        "write_file",
+        &json!({"file_path": "notes/inside.txt", "content": "hello"}),
+    );
+    assert!(write.contains("Successfully"), "write failed: {write}");
+    let absolute_inside = workspace.join("notes/inside.txt");
+    let read = registry.execute(
+        "read_file",
+        &json!({"file_path": absolute_inside.to_str().unwrap()}),
+    );
+    assert_eq!(read, "hello");
+
+    // Escapes are rejected: absolute outside, `..` traversal, tilde.
+    for path in [
+        "/etc/hosts",
+        "../outside.txt",
+        "nested/../../outside.txt",
+        "~/outside.txt",
+    ] {
+        let denied = registry.execute("read_file", &json!({"file_path": path}));
+        assert!(
+            denied.contains("Access denied") || denied.contains("outside the workspace"),
+            "path {path} was not denied: {denied}"
+        );
+        let denied = registry.execute("write_file", &json!({"file_path": path, "content": "nope"}));
+        assert!(
+            denied.contains("Access denied") || denied.contains("outside the workspace"),
+            "write to {path} was not denied: {denied}"
+        );
+    }
+    let denied = registry.execute("list_directory", &json!({"path": "/"}));
+    assert!(denied.contains("Access denied") || denied.contains("outside the workspace"));
+    let denied = registry.execute("view_image", &json!({"file_path": "/etc/hosts"}));
+    assert!(denied.contains("Access denied") || denied.contains("outside the workspace"));
+
+    // A symlink pointing out of the workspace must not be followable.
+    #[cfg(unix)]
+    {
+        let link = workspace.join("escape-link");
+        let _ = std::os::unix::fs::symlink("/etc", &link);
+        let denied = registry.execute("read_file", &json!({"file_path": "escape-link/hosts"}));
+        assert!(
+            denied.contains("Access denied") || denied.contains("outside the workspace"),
+            "symlink escape was not denied: {denied}"
+        );
+    }
+
+    // The full policy keeps unrestricted access (standalone behavior).
+    let full = ToolRegistry::with_runtime(
+        &memory,
+        &workspace,
+        "/tmp/lethe-cache",
+        &shell,
+        ToolRuntime::default(),
+    );
+    let read = full.execute("read_file", &json!({"file_path": "/etc/hosts"}));
+    assert!(!read.contains("Access denied"));
+}
+
+#[test]
+fn hosted_safe_policy_allows_subagent_orchestration() {
+    // Actor tools manage internal LLM workers only, and every subagent turn
+    // re-enters the same policy gate — so hosted agents may orchestrate.
+    for name in [
+        "spawn_actor",
+        "spawn_chain",
+        "send_message",
+        "wait_for_response",
+        "discover_actors",
+        "ping_actor",
+        "kill_actor",
+        "update_task_state",
+        "get_task_state",
+        "terminate",
+        "restart_self",
+    ] {
+        assert!(
+            ToolPolicy::HostedSafe.allows_builtin(name),
+            "hosted policy must allow actor tool {name}"
+        );
+    }
+    // The category lookup must not accidentally admit non-actor tools that
+    // share no hosted prefix.
+    assert!(!ToolPolicy::HostedSafe.allows_builtin("bash"));
+    assert!(!ToolPolicy::HostedSafe.allows_builtin("web_search"));
+
+    // With an actor context attached under the hosted policy, orchestration is
+    // available to the cortex on request (not pre-loaded), exactly as in the
+    // full-policy standalone binary.
+    let (_tmp, memory, shell) = registry();
+    let actor_runtime = crate::actor::ActorRuntime::new(crate::actor::ActorRegistry::new());
+    let registry = ToolRegistry::with_runtime(
+        &memory,
+        memory.workspace_dir(),
+        "/tmp/lethe-cache",
+        &shell,
+        ToolRuntime {
+            policy: ToolPolicy::HostedSafe,
+            actor: Some(ActorToolContext {
+                runtime: actor_runtime,
+                actor_id: "cortex-test".to_string(),
+                is_subagent: false,
+            }),
+            ..ToolRuntime::default()
+        },
+    );
+    assert!(registry.tool_is_available("spawn_actor"));
+    assert!(registry.tool_is_available("send_message"));
+    assert!(!registry.is_initial_tool("spawn_actor"));
+    assert!(!registry.tool_is_available("bash"));
+
+    // The subagent-facing requestable directory honors the hosted policy: no
+    // local execution families, no identity/vault families without a tenant
+    // agent-id state dir. Actor tools are pre-loaded for subagents, so they
+    // are deliberately absent from the on-request listing too.
+    let directory = requestable_tools_directory_for_shape(ToolContextShape {
+        has_actor: true,
+        is_subagent: true,
+        has_telegram: false,
+        has_client: false,
+        has_agent_id_state: false,
+        policy: ToolPolicy::HostedSafe,
+    });
+    assert!(!directory.contains("spawn_actor"));
+    assert!(!directory.contains("bash"));
+    assert!(!directory.contains("read_file"));
+    assert!(!directory.contains("web_search"));
+    assert!(!directory.contains("alien_browser_open"));
+    assert!(!directory.contains("agent_id_status"));
 }
 
 #[test]
@@ -251,7 +556,7 @@ async fn exposes_and_executes_actor_tools_when_context_is_present() {
     let names = registry
         .tools()
         .into_iter()
-        .map(|tool| tool.name)
+        .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
     assert!(names.contains(&"spawn_actor".to_string()));
     assert!(names.contains(&"spawn_chain".to_string()));
@@ -349,11 +654,13 @@ fn exposes_and_executes_telegram_tools_when_context_is_present() {
     let names = registry
         .tools()
         .into_iter()
-        .map(|tool| tool.name)
+        .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
     assert!(names.contains(&"telegram_send_message".to_string()));
     assert!(names.contains(&"telegram_send_file".to_string()));
     assert!(names.contains(&"telegram_react".to_string()));
+    // Telegram sessions keep the branded set; the neutral alias stays hidden.
+    assert!(!names.contains(&"chat_send_message".to_string()));
 
     let message_payload = registry.execute(
         "telegram_send_message",
@@ -430,14 +737,17 @@ fn client_tool_context_exposes_telegram_tools_as_events() {
     let names = registry
         .tools()
         .into_iter()
-        .map(|tool| tool.name)
+        .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
-    assert!(names.contains(&"telegram_send_message".to_string()));
-    assert!(names.contains(&"telegram_send_file".to_string()));
-    assert!(names.contains(&"telegram_react".to_string()));
+    // Client-only sessions get the transport-neutral chat egress, never the
+    // Telegram-branded tool set (a desktop/web user has no Telegram attached).
+    assert!(names.contains(&"chat_send_message".to_string()));
+    assert!(!names.contains(&"telegram_send_message".to_string()));
+    assert!(!names.contains(&"telegram_send_file".to_string()));
+    assert!(!names.contains(&"telegram_react".to_string()));
 
     let message_payload = registry.execute(
-        "telegram_send_message",
+        "chat_send_message",
         &json!({
             "text": "progress",
             "parse_mode": "markdown",

@@ -662,16 +662,23 @@ fn telegram_process_callback(
                     response_chars = response.chars().count(),
                     "telegram conversation turn completed"
                 );
-                send_guarded_telegram_final_response(&client, context.chat_id, &response, guard)
-                    .await?;
-                agent.emit_conversation_event(
-                    "message",
-                    serde_json::json!({
-                        "role": "assistant",
-                        "content": response,
-                        "source": "telegram",
-                    }),
-                );
+                let final_response_delivered = send_guarded_telegram_final_response(
+                    &client,
+                    context.chat_id,
+                    &response,
+                    guard,
+                )
+                .await?;
+                if final_response_delivered {
+                    agent.emit_conversation_event(
+                        "message",
+                        serde_json::json!({
+                            "role": "assistant",
+                            "content": response,
+                            "source": "telegram",
+                        }),
+                    );
+                }
             }
             Ok(())
         })
@@ -1559,7 +1566,7 @@ async fn send_guarded_telegram_final_response(
     chat_id: i64,
     response: &str,
     guard: SharedTelegramTurnGuard,
-) -> Result<()> {
+) -> Result<bool> {
     let (pending_reactions, channel, tool_messages_sent) = {
         let mut guard = guard
             .lock()
@@ -1590,7 +1597,7 @@ async fn send_guarded_telegram_final_response(
                 "dropping final response text: tool already delivered messages this turn"
             );
         }
-        return Ok(());
+        return Ok(false);
     }
 
     if is_emoji_only_reply(response) && !pending_reactions.is_empty() {
@@ -1601,12 +1608,12 @@ async fn send_guarded_telegram_final_response(
                 .await
                 .unwrap_or(false)
             {
-                return Ok(());
+                return Ok(true);
             }
         }
         send_telegram_messages_with_delays(client, chat_id, split_telegram_messages(response))
             .await?;
-        return Ok(());
+        return Ok(true);
     }
 
     for pending in pending_reactions {
@@ -1619,8 +1626,9 @@ async fn send_guarded_telegram_final_response(
     if !response.trim().is_empty() {
         send_telegram_messages_with_delays(client, chat_id, split_telegram_messages(response))
             .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn send_telegram_messages_with_delays(
@@ -1784,9 +1792,15 @@ mod tests {
         // Passes ONLY via the suppression branch: with no queued reactions the
         // function must return before any Telegram API call — an attempted
         // send would dial api.telegram.org with a bogus token and error out.
-        send_guarded_telegram_final_response(&client, 99, "reworded wrap-up", guard)
+        let delivered = send_guarded_telegram_final_response(
+            &client,
+            99,
+            "reworded wrap-up",
+            guard,
+        )
             .await
             .expect("final text suppressed without dialing");
+        assert!(!delivered, "suppressed text must not be broadcast as delivered");
     }
 
     fn test_settings(root: &std::path::Path) -> Settings {

@@ -1,10 +1,11 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::actor::ActorRuntime;
 use crate::interfaces::telegram::TelegramToolContext;
 use crate::memory::MemoryStore;
-use crate::tools::browser::BrowserTools;
 use crate::tools::filesystem::FileTools;
+use crate::tools::hosted_plugins::HostedPluginClient;
 use crate::tools::image::ImageTools;
 use crate::tools::shell::ShellTools;
 use crate::tools::web::WebTools;
@@ -21,7 +22,10 @@ mod payload;
 mod telegram_specs;
 
 pub use egress::MessageEgress;
-pub use observer::{BoxObserverFuture, BoxToolFuture, SharedTurnObserver, TurnObserver};
+pub use observer::{
+    BoxObserverFuture, BoxToolFuture, SharedTurnObserver, SubagentObserverFactory,
+    SubagentObserverSlot, TurnObserver,
+};
 
 pub use catalog::find_def;
 pub use client::{ClientToolContext, ClientToolEvent};
@@ -30,6 +34,99 @@ pub use client::{ClientToolContext, ClientToolEvent};
 mod tests;
 
 pub type SharedActorRegistry = ActorRuntime;
+
+/// Deployment-wide opt-in: `HostedSafe` turns may also use the Exa-backed web
+/// tools (`web_search`, `fetch_webpage`) and the `research` harness built on
+/// them. Process-global rather than threaded through `ToolRuntime` on purpose:
+/// every internally constructed turn (subagents, DMN, heartbeats) must see the
+/// same answer, and a per-turn field that defaults to "off" would silently
+/// strip the tools from exactly those paths. The host sets it once at startup.
+static HOSTED_WEB_TOOLS: AtomicBool = AtomicBool::new(false);
+
+/// Called by a hosted multiplexer at startup, before any turn runs. The web
+/// tools read `EXA_API_KEY` from the process environment, so enabling this
+/// without that key yields tools that always return a configuration error.
+pub fn set_hosted_web_tools(enabled: bool) {
+    HOSTED_WEB_TOOLS.store(enabled, Ordering::Relaxed);
+}
+
+pub fn hosted_web_tools_enabled() -> bool {
+    HOSTED_WEB_TOOLS.load(Ordering::Relaxed)
+}
+
+const HOSTED_WEB_TOOL_NAMES: &[&str] = &["web_search", "fetch_webpage", "research"];
+
+/// Controls which built-in capabilities exist for a turn. `HostedSafe` is an
+/// allowlist enforced both while schemas are assembled and again at dispatch,
+/// so a model cannot invoke a hidden local capability by name. It retains the
+/// Alien browser and identity/vault families; callers must provide
+/// tenant-private cache and agent-id state paths.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolPolicy {
+    #[default]
+    Full,
+    HostedSafe,
+}
+
+impl ToolPolicy {
+    fn allows_builtin(self, name: &str) -> bool {
+        self.allows_builtin_with(name, hosted_web_tools_enabled())
+    }
+
+    /// Pure form of the policy check; `hosted_web` mirrors
+    /// [`hosted_web_tools_enabled`] so tests can cover both switch states
+    /// without mutating process-global state.
+    fn allows_builtin_with(self, name: &str, hosted_web: bool) -> bool {
+        match self {
+            Self::Full => true,
+            Self::HostedSafe => {
+                name == "request_tool"
+                    || name == "think_deeply"
+                    || name == "chat_send_message"
+                    || name.starts_with("memory_")
+                    || name.starts_with("archival_")
+                    || name.starts_with("conversation_")
+                    || name.starts_with("note_")
+                    || name.starts_with("todo_")
+                    || name.starts_with("agent_id_")
+                    || name.starts_with("vault_")
+                    || name.starts_with("alien_browser_")
+                    // Workspace file access. Admissible only because
+                    // `ToolRegistry::with_runtime` constructs the jailed
+                    // (sandboxed) FileTools/ImageTools under this policy, so
+                    // every path is confined to the tenant workspace.
+                    || matches!(
+                        name,
+                        "read_file"
+                            | "write_file"
+                            | "edit_file"
+                            | "list_directory"
+                            | "glob_search"
+                            | "grep_search"
+                            | "view_image"
+                    )
+                    // Subagent orchestration (spawn/message/terminate/...) is
+                    // allowed: these tools only manage internal LLM workers and
+                    // never touch host resources directly. Every subagent turn
+                    // re-enters this same policy gate for its own tool catalog,
+                    // so a hosted subagent cannot escalate past HostedSafe.
+                    || find_def(name).is_some_and(|def| {
+                        matches!(
+                            def.category,
+                            crate::tools::spec::ToolCategory::Actor
+                                | crate::tools::spec::ToolCategory::ActorSubagent
+                        )
+                    })
+                    // Exa-backed web reading (and the research harness, whose
+                    // hypothesis subagents re-enter this gate for web_search /
+                    // fetch_webpage) is a deployment opt-in: the host decides
+                    // whether hosted tenants may reach the public web through
+                    // the shared EXA_API_KEY.
+                    || (hosted_web && HOSTED_WEB_TOOL_NAMES.contains(&name))
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ActorToolContext {
@@ -48,6 +145,17 @@ pub struct ToolRuntime {
     /// end-to-end-sealed credential cards in the frontend and emit identity
     /// lifecycle events.
     pub secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
+    /// Tenant-private agent-id identity, vault, and sealed-browser state. A
+    /// multiplexed host must set this on every turn; standalone Lethe falls
+    /// back to its process-local configured state directory.
+    pub agent_id_state_dir: Option<std::path::PathBuf>,
+    /// Trusted remote tools advertised by the lethe-hosted plugin gateway.
+    /// The client owns a short-lived catalog cache, so the synchronous schema
+    /// assembly path never performs network I/O.
+    pub hosted_plugins: Option<std::sync::Arc<HostedPluginClient>>,
+    /// Capability boundary for the current turn. Hosted multiplexers use the
+    /// allowlisted policy; the standalone binary retains the full catalog.
+    pub policy: ToolPolicy,
     pub requested_tools: Vec<String>,
     /// When true, the turn starts already escalated onto the deep-thinking model
     /// (set for `deep`-tier subagents). The cortex leaves this false and escalates
@@ -63,6 +171,9 @@ impl std::fmt::Debug for ToolRuntime {
             .field("actor", &self.actor.is_some())
             .field("observer", &self.observer.is_some())
             .field("secure_prompt", &self.secure_prompt.is_some())
+            .field("agent_id_state_dir", &self.agent_id_state_dir)
+            .field("hosted_plugins", &self.hosted_plugins.is_some())
+            .field("policy", &self.policy)
             .field("requested_tools", &self.requested_tools)
             .field("start_escalated", &self.start_escalated)
             .finish()
@@ -76,7 +187,6 @@ pub struct ToolRegistry<'a> {
     pub(crate) image: ImageTools,
     pub(crate) shell: &'a ShellTools,
     pub(crate) web: WebTools,
-    pub(crate) browser: BrowserTools,
     pub(crate) runtime: ToolRuntime,
 }
 
@@ -105,13 +215,27 @@ impl<'a> ToolRegistry<'a> {
     ) -> Self {
         let workspace_dir = workspace_dir.into();
         let cache_dir = cache_dir.into();
+        let hosted = runtime.policy == ToolPolicy::HostedSafe;
+        // Under the hosted policy the file/image tools are jailed to the
+        // (tenant-private) workspace; the allowlist below admits them only
+        // because this constructor guarantees the jailed instances.
+        let (files, image) = if hosted {
+            (
+                FileTools::sandboxed(workspace_dir.clone()),
+                ImageTools::sandboxed(workspace_dir),
+            )
+        } else {
+            (
+                FileTools::new(workspace_dir.clone()),
+                ImageTools::new(workspace_dir),
+            )
+        };
         Self {
             memory,
-            files: FileTools::new(workspace_dir.clone()),
-            image: ImageTools::new(workspace_dir),
+            files,
+            image,
             shell,
             web: WebTools::new(cache_dir.clone()),
-            browser: BrowserTools::new(cache_dir),
             runtime,
         }
     }
@@ -120,13 +244,29 @@ impl<'a> ToolRegistry<'a> {
         self.tools()
             .into_iter()
             .filter(|tool| {
-                self.is_initial_tool(&tool.name) || active_tools.contains(tool.name.as_str())
+                self.is_initial_tool(tool.name.as_str()) || active_tools.contains(tool.name.as_str())
             })
             .collect()
     }
 
     pub fn tool_is_available(&self, name: &str) -> bool {
         let name = name.trim();
+        if self
+            .runtime
+            .hosted_plugins
+            .as_ref()
+            .is_some_and(|client| client.tool(name).is_some())
+        {
+            return true;
+        }
+        if self
+            .runtime
+            .hosted_plugins
+            .as_ref()
+            .is_some_and(|client| client.replaces_builtin(name))
+        {
+            return false;
+        }
         find_def(name).is_some_and(|def| self.def_is_visible(def))
     }
 
@@ -141,9 +281,28 @@ impl<'a> ToolRegistry<'a> {
     pub fn requestable_tool_names(&self) -> Vec<String> {
         let mut names = catalog::all_defs()
             .filter(|def| self.def_is_visible(def) && !self.def_is_initial(def))
+            .filter(|def| {
+                !self
+                    .runtime
+                    .hosted_plugins
+                    .as_ref()
+                    .is_some_and(|client| client.replaces_builtin(def.name))
+            })
             .filter(|def| def.name != "request_tool")
             .map(|def| def.name.to_string())
             .collect::<Vec<_>>();
+        if let Some(client) = self.runtime.hosted_plugins.as_ref() {
+            names.extend(
+                client
+                    .tools()
+                    .into_iter()
+                    .filter(|tool| {
+                        tool.exposure
+                            == crate::tools::hosted_plugins::RemoteToolExposure::Requestable
+                    })
+                    .map(|tool| tool.name),
+            );
+        }
         names.sort();
         names.dedup();
         names
@@ -156,6 +315,37 @@ impl<'a> ToolRegistry<'a> {
     pub fn requestable_tools_directory(&self) -> String {
         requestable_tools_directory_for(&self.runtime)
     }
+
+    /// Tool families that form a single workflow (the vault-sealed browser's
+    /// open/act/close/fill set and the agent-id identity+vault set): requesting
+    /// any member should load the whole family, so the
+    /// model doesn't stall mid-flow on an "available but not loaded" sibling.
+    pub fn group_siblings(&self, name: &str) -> Vec<String> {
+        use crate::tools::spec::ToolCategory;
+        let name = name.trim();
+        if let Some(client) = self.runtime.hosted_plugins.as_ref()
+            && client.tool(name).is_some()
+        {
+            return client.group_siblings(name);
+        }
+        let Some(def) = find_def(name) else {
+            return Vec::new();
+        };
+        if !matches!(
+            def.category,
+            ToolCategory::AgentId | ToolCategory::AgentIdBrowser
+        ) {
+            return Vec::new();
+        }
+        let mut names = catalog::all_defs()
+            .filter(|sibling| sibling.category == def.category && self.def_is_visible(sibling))
+            .map(|sibling| sibling.name.to_string())
+            .filter(|sibling| sibling != name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
 }
 
 /// Shape inputs for [`requestable_tools_directory_for_shape`]. Lets callers
@@ -167,18 +357,47 @@ impl<'a> ToolRegistry<'a> {
 pub struct ToolContextShape {
     pub has_actor: bool,
     pub is_subagent: bool,
-    pub has_transport: bool,
+    /// Telegram transport attached (Telegram-branded egress tools).
+    pub has_telegram: bool,
+    /// Client (web/desktop chat) transport attached (neutral chat egress).
+    pub has_client: bool,
+    /// A tenant-private identity/vault directory is attached. Required by the
+    /// hosted-safe policy so a mux can never fall back to process-global state.
+    pub has_agent_id_state: bool,
+    pub policy: ToolPolicy,
 }
 
 pub fn requestable_tools_directory_for(runtime: &ToolRuntime) -> String {
-    requestable_tools_directory_for_shape(ToolContextShape {
+    let builtin = requestable_tools_directory_for_shape(ToolContextShape {
         has_actor: runtime.actor.is_some(),
         is_subagent: runtime
             .actor
             .as_ref()
             .is_some_and(|context| context.is_subagent),
-        has_transport: runtime.telegram.is_some() || runtime.client.is_some(),
-    })
+        has_telegram: runtime.telegram.is_some(),
+        has_client: runtime.client.is_some(),
+        has_agent_id_state: runtime.agent_id_state_dir.is_some(),
+        policy: runtime.policy,
+    });
+    let Some(client) = runtime.hosted_plugins.as_ref() else {
+        return builtin;
+    };
+    let mut lines = builtin
+        .lines()
+        .filter(|line| {
+            let name = line
+                .strip_prefix("- ")
+                .and_then(|line| line.split_once(" — "))
+                .map(|(name, _)| name)
+                .unwrap_or("");
+            !client.replaces_builtin(name)
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    lines.extend(client.requestable_directory().lines().map(str::to_string));
+    lines.sort();
+    lines.dedup();
+    lines.join("\n")
 }
 
 pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String {
@@ -186,28 +405,37 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
     let ToolContextShape {
         has_actor,
         is_subagent,
-        has_transport,
+        has_telegram,
+        has_client,
+        has_agent_id_state,
+        policy,
     } = shape;
 
     let visible = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
-        // Built-in browser hides when the vault-sealed browser is active.
-        ToolCategory::BrowserBuiltin => !crate::agent_id::browser_tools_available(),
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
-        ToolCategory::Transport => has_transport,
+        ToolCategory::Transport => has_telegram,
+        ToolCategory::TransportClient => has_client && !has_telegram,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
         ToolCategory::Mcp => crate::tools::mcp::is_configured(),
-        ToolCategory::AgentId => crate::agent_id::vault_tools_available(),
-        ToolCategory::AgentIdBrowser => crate::agent_id::browser_tools_available(),
-    };
+        ToolCategory::AgentId => {
+            crate::agent_id::vault_tools_available()
+                && (policy != ToolPolicy::HostedSafe || has_agent_id_state)
+        }
+        ToolCategory::AgentIdBrowser => {
+            crate::agent_id::browser_tools_available()
+                && (policy != ToolPolicy::HostedSafe || has_agent_id_state)
+        }
+    } && policy.allows_builtin(def.name);
     let initial = |def: &crate::tools::spec::ToolDef| match def.category {
         ToolCategory::Initial => true,
-        ToolCategory::Requestable | ToolCategory::BrowserBuiltin => false,
+        ToolCategory::Requestable => false,
         ToolCategory::CortexOnly => !is_subagent,
         ToolCategory::Actor => has_actor,
         ToolCategory::ActorSubagent => is_subagent,
-        ToolCategory::Transport => has_transport,
+        ToolCategory::Transport => has_telegram,
+        ToolCategory::TransportClient => has_client && !has_telegram,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
         ToolCategory::Mcp => crate::tools::mcp::is_configured(),
         ToolCategory::AgentId | ToolCategory::AgentIdBrowser => false,
@@ -225,6 +453,21 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
 
 impl<'a> ToolRegistry<'a> {
     pub(super) fn is_initial_tool(&self, name: &str) -> bool {
+        if self.remote_is_initial(name) {
+            return true;
+        }
+        if self
+            .runtime
+            .hosted_plugins
+            .as_ref()
+            .is_some_and(|client| client.replaces_builtin(name))
+        {
+            return false;
+        }
         find_def(name).is_some_and(|def| self.def_is_initial(def))
+    }
+
+    pub(super) fn policy_allows(&self, name: &str) -> bool {
+        self.runtime.policy.allows_builtin(name)
     }
 }

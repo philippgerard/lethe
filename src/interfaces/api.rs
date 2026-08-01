@@ -298,6 +298,35 @@ impl ApiState {
         sender.send(ApiEvent::new(event, data)).await.is_ok()
     }
 
+    /// Mirror an event onto the durable `/events` broadcast (per-user). Turn
+    /// events go to the per-request `/chat` SSE, which dies on reload; the
+    /// broadcast survives reloads, so a reloaded/second tab can re-attach to a
+    /// running turn (thinking indicator, tool pills, final reply). The owning
+    /// tab ignores these while its own `/chat` stream is live (see the UI's
+    /// `streamingRef` gate) so nothing double-renders. Sync + best-effort.
+    fn broadcast_events(&self, event: &str, data: Value) {
+        let _ = self.stream_tx.send(ApiEvent::new(event, data));
+    }
+
+    /// Deliver to the chat's CURRENT session, whichever request that is by
+    /// now. Turn output must use this, not the session that originated the
+    /// turn: a message sent mid-turn replaces the SSE, and events pinned to
+    /// the originating session vanish into the closed stream.
+    async fn send_to_chat(&self, chat_id: i64, event: &str, data: Value) -> bool {
+        let sender = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .by_chat
+                .get(&chat_id)
+                .and_then(|id| sessions.by_id.get(id))
+                .map(|session| session.sender.clone())
+        };
+        let Some(sender) = sender else {
+            return false;
+        };
+        sender.send(ApiEvent::new(event, data)).await.is_ok()
+    }
+
     async fn client_tool_context(
         &self,
         session_id: &str,
@@ -332,12 +361,54 @@ async fn close_sender(sender: mpsc::Sender<ApiEvent>) {
 /// session sender is the same `mpsc::Sender` used for `text`/`typing_*`,
 /// so tool cards appear inline with the assistant transcript on the TUI.
 struct ApiTurnObserver {
-    sender: mpsc::Sender<ApiEvent>,
+    /// Live session registry, NOT a frozen sender: the user can replace their
+    /// SSE mid-turn (every new /chat message does), and a captured sender
+    /// would keep streaming the rest of the turn into the dead old stream —
+    /// the UI then looks frozen while the agent works (observed live: every
+    /// message sent during a long turn rendered nothing).
+    sessions: Arc<Mutex<ApiSessions>>,
+    chat_id: i64,
+    broadcast: broadcast::Sender<ApiEvent>,
 }
 
 impl ApiTurnObserver {
-    fn new(sender: mpsc::Sender<ApiEvent>) -> Self {
-        Self { sender }
+    fn new(
+        sessions: Arc<Mutex<ApiSessions>>,
+        chat_id: i64,
+        broadcast: broadcast::Sender<ApiEvent>,
+    ) -> Self {
+        Self {
+            sessions,
+            chat_id,
+            broadcast,
+        }
+    }
+
+    /// Deliver to the chat's CURRENT session. Observer methods are sync, so
+    /// use try_lock + try_send; on contention or a full queue the event is
+    /// dropped, same as the previous try_send semantics.
+    fn deliver(&self, event: ApiEvent) {
+        let Ok(sessions) = self.sessions.try_lock() else {
+            return;
+        };
+        let Some(sender) = sessions
+            .by_chat
+            .get(&self.chat_id)
+            .and_then(|id| sessions.by_id.get(id))
+            .map(|session| session.sender.clone())
+        else {
+            return;
+        };
+        drop(sessions);
+        let _ = sender.try_send(event);
+    }
+
+    /// Also mirror tool lifecycle onto the durable `/events` broadcast so a
+    /// reloaded/second tab shows tool activity for a turn it doesn't own.
+    /// Deltas/reasoning are deliberately NOT broadcast (per-token volume); the
+    /// final `text` mirror carries the full reply.
+    fn mirror(&self, event: ApiEvent) {
+        let _ = self.broadcast.send(event);
     }
 }
 
@@ -347,14 +418,16 @@ impl TurnObserver for ApiTurnObserver {
     }
 
     fn on_tool_start(&self, name: &str, call_id: &str, args_preview: &str) {
-        let _ = self.sender.try_send(ApiEvent::new(
+        let ev = ApiEvent::new(
             "tool.start",
             json!({
                 "name": name,
                 "call_id": call_id,
                 "args_preview": args_preview,
             }),
-        ));
+        );
+        self.deliver(ev.clone());
+        self.mirror(ev);
     }
 
     fn on_tool_end(
@@ -365,7 +438,7 @@ impl TurnObserver for ApiTurnObserver {
         output_preview: &str,
         duration_ms: u128,
     ) {
-        let _ = self.sender.try_send(ApiEvent::new(
+        let ev = ApiEvent::new(
             "tool.end",
             json!({
                 "name": name,
@@ -374,14 +447,16 @@ impl TurnObserver for ApiTurnObserver {
                 "output_preview": output_preview,
                 "duration_ms": duration_ms as u64,
             }),
-        ));
+        );
+        self.deliver(ev.clone());
+        self.mirror(ev);
     }
 
     fn on_assistant_delta(&self, content: &str) {
         if content.is_empty() {
             return;
         }
-        let _ = self.sender.try_send(ApiEvent::new(
+        self.deliver(ApiEvent::new(
             "assistant.delta",
             json!({"content": content}),
         ));
@@ -391,7 +466,7 @@ impl TurnObserver for ApiTurnObserver {
         if content.is_empty() {
             return;
         }
-        let _ = self.sender.try_send(ApiEvent::new(
+        self.deliver(ApiEvent::new(
             "assistant.reasoning",
             json!({"content": content}),
         ));
@@ -416,6 +491,7 @@ fn actor_event_to_api(event: &ActorEvent) -> Option<ApiEvent> {
             "actor.state",
             json!({
                 "actor_id": event.actor_id,
+                "group": event.group,
                 "kind": event.event_type,
                 "payload": payload,
             }),
@@ -424,6 +500,7 @@ fn actor_event_to_api(event: &ActorEvent) -> Option<ApiEvent> {
             "actor.task",
             json!({
                 "actor_id": event.actor_id,
+                "group": event.group,
                 "payload": payload,
             }),
         )),
@@ -431,6 +508,19 @@ fn actor_event_to_api(event: &ActorEvent) -> Option<ApiEvent> {
             "actor.message",
             json!({
                 "actor_id": event.actor_id,
+                "group": event.group,
+                "payload": payload,
+            }),
+        )),
+        // A worker (or the DMN) addressed the user directly. The payload
+        // carries the full message (not just a preview) plus the message
+        // intent under `kind`, so clients can render it as a user-facing
+        // question/notice from that subagent.
+        "user_notify" => Some(ApiEvent::new(
+            "actor.user_notify",
+            json!({
+                "actor_id": event.actor_id,
+                "group": event.group,
                 "payload": payload,
             }),
         )),
@@ -447,6 +537,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/configure", post(configure))
         .route("/model", get(model_get).post(model_post))
         .route("/events", get(events))
+        .route("/browser/stream", get(browser_stream))
         .route("/file", get(serve_file))
         .route("/actors", get(list_actors))
         .route("/todos", get(list_todos))
@@ -637,6 +728,7 @@ async fn chat(
 
     let chat_id = body.chat_id.unwrap_or(body.user_id);
     let (sender, mut receiver) = mpsc::channel::<ApiEvent>(SESSION_QUEUE_DEPTH);
+    let mid_turn = state.conversations.is_processing(chat_id).await;
     let session_id = state.register_session(chat_id, sender).await;
     body.metadata
         .insert("_api_session_id".to_string(), json!(session_id.clone()));
@@ -652,6 +744,16 @@ async fn chat(
             Some(callback),
         )
         .await;
+    if mid_turn {
+        // The message interrupts a running turn: it was queued, and the
+        // in-flight turn's remaining output now lands on THIS session (see
+        // send_to_chat). Ack immediately so the new stream isn't byte-less
+        // until the next observer event — a silent stream reads as "no
+        // response" (its only traffic would be the 15s SSE keepalive).
+        let _ = state
+            .send_to_session(&session_id, "typing_start", json!({}))
+            .await;
+    }
 
     let stream_state = state.clone();
     let stream_session_id = session_id.clone();
@@ -695,21 +797,24 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
     }
 
     let _ = state
-        .send_to_session(&session_id, "typing_start", json!({}))
+        .send_to_chat(context.chat_id, "typing_start", json!({}))
         .await;
     let _ = state
-        .send_to_session(
-            &session_id,
+        .send_to_chat(
+            context.chat_id,
             "turn.start",
             json!({"chat_id": context.chat_id}),
         )
         .await;
-    let observer: Option<SharedTurnObserver> = {
-        let sessions = state.sessions.lock().await;
-        sessions.by_id.get(&session_id).map(|session| {
-            Arc::new(ApiTurnObserver::new(session.sender.clone())) as SharedTurnObserver
-        })
-    };
+    // Durable mirror: tell reloaded/second tabs a turn is running so they can
+    // show the thinking indicator (the /chat SSE that owns the live stream
+    // dies on reload; /events survives).
+    state.broadcast_events("turn.active", json!({"active": true}));
+    let observer: Option<SharedTurnObserver> = Some(Arc::new(ApiTurnObserver::new(
+        state.sessions.clone(),
+        context.chat_id,
+        state.stream_tx.clone(),
+    )) as SharedTurnObserver);
     let tool_runtime = ToolRuntime {
         client: state
             .client_tool_context(
@@ -734,22 +839,28 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
         // research turn whose answer only ever existed after a page reload).
         Ok(message) if !message.trim().is_empty() => {
             let _ = state
-                .send_to_session(
-                    &session_id,
+                .send_to_chat(
+                    context.chat_id,
                     "text",
                     json!({
-                        "content": message,
+                        "content": &message,
                         "parse_mode": "Markdown",
                         "message_id": 0,
                     }),
                 )
                 .await;
+            // Durable mirror of the final reply so a reloaded/second tab
+            // renders it live (reuses the UI's existing `message` handler).
+            state.broadcast_events(
+                "message",
+                json!({"role": "assistant", "content": message}),
+            );
         }
         Ok(_) => {}
         Err(error) if !context.interrupt.is_interrupted() => {
             let _ = state
-                .send_to_session(
-                    &session_id,
+                .send_to_chat(
+                    context.chat_id,
                     "text",
                     json!({
                         "content": format!("Error: {error}"),
@@ -764,13 +875,22 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
 
     if let Some(tokens) = state.agent.last_prompt_tokens() {
         let _ = state
-            .send_to_session(&session_id, "usage", json!({"prompt_tokens": tokens}))
+            .send_to_chat(context.chat_id, "usage", json!({"prompt_tokens": tokens}))
             .await;
     }
     let _ = state
-        .send_to_session(&session_id, "typing_stop", json!({}))
+        .send_to_chat(context.chat_id, "typing_stop", json!({}))
         .await;
-    let _ = state.send_to_session(&session_id, "done", json!({})).await;
+    // `done` ends the client stream. When messages are already queued behind
+    // this turn (typed mid-turn), the SAME stream must survive to carry the
+    // next turn's output — closing it here would orphan that turn exactly the
+    // way the stale-session bug did. The final turn of the run sends the done.
+    if state.conversations.pending_count(context.chat_id).await == 0 {
+        let _ = state.send_to_chat(context.chat_id, "done", json!({})).await;
+        // Clear the reloaded-tab thinking indicator only when the whole run is
+        // done (queued follow-up turns keep it active).
+        state.broadcast_events("turn.active", json!({"active": false}));
+    }
     state.unregister_session(&session_id).await;
 }
 
@@ -1071,6 +1191,26 @@ fn serialize_message(message: StoredMessage) -> Value {
 }
 
 #[derive(Debug, Deserialize)]
+struct BrowserStreamQuery {
+    source: Option<String>,
+}
+
+// Live browser viewport relay (see interfaces::browser_stream). WS because
+// frames + input events flow both ways; the control plane relays it onward to
+// the owner's web client.
+async fn browser_stream(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Query(query): Query<BrowserStreamQuery>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    if let Some(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    ws.on_upgrade(move |socket| crate::interfaces::browser_stream::relay(socket, query.source))
+}
+
+#[derive(Debug, Deserialize)]
 struct FileQuery {
     path: String,
 }
@@ -1207,7 +1347,7 @@ async fn wake(
             StatusCode::BAD_REQUEST,
             "no chat_id given and no allowed user configured to deliver to",
         );
-    }
+    };
 
     // Bind the turn to the real Telegram egress. message_egress() prefers
     // runtime.telegram over the SSE client egress, so telegram_send_message
@@ -1322,6 +1462,32 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"], message);
+    }
+
+    #[test]
+    fn actor_events_carry_group_and_surface_user_notify() {
+        let mut event = ActorEvent::new("task_state_changed", "worker-1");
+        event.group = "default".to_string();
+        let api_event = actor_event_to_api(&event).unwrap();
+        assert_eq!(api_event.event, "actor.task");
+        assert_eq!(api_event.data["group"], "default");
+
+        let mut notify = ActorEvent::new("user_notify", "worker-1");
+        notify.group = "default".to_string();
+        notify.payload = serde_json::json!({
+            "message": "Need your input on the draft.",
+            "kind": "user_notify",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        let api_event = actor_event_to_api(&notify).unwrap();
+        assert_eq!(api_event.event, "actor.user_notify");
+        assert_eq!(api_event.data["actor_id"], "worker-1");
+        assert_eq!(
+            api_event.data["payload"]["message"],
+            "Need your input on the draft."
+        );
     }
 
     #[test]

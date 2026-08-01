@@ -47,6 +47,25 @@ fn exec_telegram_react(registry: &ToolRegistry<'_>, args: &Value) -> String {
 }
 
 pub const TOOL_DEFS: &[ToolDef] = &[
+    // Transport-neutral chat egress for client (web/desktop) sessions. Shares
+    // the executor with telegram_send_message — MessageEgress routes to the
+    // attached transport. Only send_message is exposed for clients: the chat
+    // UIs render intermediate `text` events, but drop `file`/`reaction`
+    // events, so those tools would be silent no-ops outside Telegram.
+    ToolDef {
+        name: "chat_send_message",
+        description: "Send an extra message to the user's chat during a long task — it appears immediately, before your final answer. Use it for progress notes on multi-minute work. May also attach quick-reply buttons via reply_markup_json: a reply keyboard whose button texts ARE the replies the user sends when tapped (example: {\"keyboard\":[[{\"text\":\"Yes\"},{\"text\":\"No\"}]],\"resize_keyboard\":true,\"one_time_keyboard\":true}). Use it to offer 2-4 short answers when your message invites a quick pick; omit it for open-ended replies.",
+        params: &[
+            p_str_req("text", "Message text (markdown)."),
+            p_str("parse_mode", "markdown, html, or empty."),
+            p_str(
+                "reply_markup_json",
+                "Optional quick-reply keyboard JSON. Button text = the reply sent on tap.",
+            ),
+        ],
+        category: ToolCategory::TransportClient,
+        execute: ToolExecutor::Sync(exec_telegram_send_message),
+    },
     ToolDef {
         name: "telegram_send_message",
         description: "Send an extra Telegram message during a long task (progress updates), or deliver the result of a scheduled/automated turn whose plain output is discarded. In an INTERACTIVE chat your final reply text is delivered to the user automatically — answer there, and do NOT send the answer with this tool and then restate it (once you send via this tool, your final reply text is dropped, not delivered). Optionally attach Telegram reply_markup_json. Use reply keyboards for short visible replies; they default to one_time_keyboard=true unless explicitly set, should usually include resize_keyboard=true, and are removed after a matching button text arrives (example: {\"keyboard\":[[{\"text\":\"Yes\"},{\"text\":\"No\"}]],\"resize_keyboard\":true,\"one_time_keyboard\":true}). Use inline keyboards for message-scoped actions with short non-secret callback_data; callbacks are consumed and buttons are removed after press (example: {\"inline_keyboard\":[[{\"text\":\"Start\",\"callback_data\":\"start_now\"}]]}).",

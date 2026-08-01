@@ -20,7 +20,8 @@ use crate::agent_id::secure_prompt::SecurePromptHub;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::args::{bool_arg, nonempty_string, string_arg, string_vec_arg};
 use crate::tools::spec::{
-    ToolCategory, ToolDef, ToolExecutor, p_bool, p_enum, p_object, p_str, p_str_array, p_str_req,
+    ToolCategory, ToolDef, ToolExecutor, p_bool, p_enum, p_form_plan_req, p_obj, p_str,
+    p_str_array, p_str_req,
 };
 
 type BoxFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
@@ -31,6 +32,33 @@ fn err(message: impl Into<String>) -> String {
 
 fn hub_of<'a>(registry: &'a ToolRegistry<'a>) -> Option<&'a SecurePromptHub> {
     registry.runtime.secure_prompt.as_ref()
+}
+
+fn state_dir_of(registry: &ToolRegistry<'_>) -> PathBuf {
+    registry
+        .runtime
+        .agent_id_state_dir
+        .clone()
+        .unwrap_or_else(crate::agent_id::cached_state_dir)
+}
+
+fn hosted_safe(registry: &ToolRegistry<'_>) -> bool {
+    registry.runtime.policy == crate::tools::registry::ToolPolicy::HostedSafe
+}
+
+fn interactive_hub<'a>(
+    registry: &'a ToolRegistry<'a>,
+) -> Result<Option<&'a SecurePromptHub>, String> {
+    let hub = hub_of(registry);
+    if hosted_safe(registry) && hub.is_none() {
+        return Err(err("Secure credential input is temporarily unavailable."));
+    }
+    Ok(hub)
+}
+
+fn is_http_url(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.starts_with("https://") || value.starts_with("http://")
 }
 
 /// A secure-form credential write BLOCKS until the owner types and submits the
@@ -66,10 +94,69 @@ fn note_secret_collected(result: String, hosted: bool) -> String {
     value.to_string()
 }
 
+/// The event name raised when a sealed browser profile's stored session is dead.
+pub const REAUTH_EVENT: &str = "browser.reauth_required";
+
+/// Raise a re-auth card when an agent-id browser result reports a dead session.
+///
+/// agent-id sets `sessionExpired` when a navigation or authenticated request
+/// lands on a known identity-provider host or reads like a sign-in page (see
+/// `lib/session.mjs`). For a Google-SSO profile that means the one session every
+/// "Sign in with Google" site rides on is gone, and only the owner can revive it
+/// — the agent cannot, by design. The tool result is returned untouched (it
+/// already carries `action: "re_login"` for the model); this is purely the
+/// out-of-band nudge to the human, who may not be looking at the chat.
+///
+/// The hub is the agent-id event channel on both hosts: standalone Lethe puts it
+/// on `/events`, and a multiplexer forwards the name verbatim to its own stream.
+fn note_session_expired(result: String, hub: Option<&SecurePromptHub>, profile: &str) -> String {
+    let Some(hub) = hub else {
+        return result;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&result) else {
+        return result;
+    };
+    if value.get("sessionExpired").and_then(Value::as_bool) != Some(true) {
+        return result;
+    }
+    hub.emit_event(REAUTH_EVENT, reauth_payload(&value, profile));
+    result
+}
+
+/// Shape the client-facing payload. `profile` is what the owner must re-login,
+/// so it is always present even when agent-id omits it from its own result.
+fn reauth_payload(value: &Value, profile: &str) -> Value {
+    json!({
+        "profile": profile,
+        "final_url": value.get("finalUrl").and_then(Value::as_str),
+        "message": value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("The stored browser session is signed out and needs the owner to sign in again."),
+    })
+}
+
 /// Run a fast subcommand and return its JSON as the tool string.
 async fn fast(bin: Bin, sd: &Path, argv: &[String]) -> String {
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     cli::run_json(bin, sd, &refs).await.to_string()
+}
+
+/// `fast` for the browser CLI, with the dead-session check applied to the result.
+/// Every page-touching verb goes through here so a profile that has been signed
+/// out is reported the first time anything notices, whichever verb noticed.
+async fn browser_fast(
+    r: &ToolRegistry<'_>,
+    sd: &Path,
+    argv: &[String],
+    profile: &str,
+) -> String {
+    note_session_expired(fast(Bin::Browser, sd, argv).await, hub_of(r), profile)
+}
+
+/// The session name a browser tool call targets; agent-id defaults to `main`.
+fn profile_of(args: &Value) -> String {
+    nonempty_string(args, "name").unwrap_or_else(|| "main".to_string())
 }
 
 /// Run a subcommand that can block on a human (secure form / headed window).
@@ -88,16 +175,16 @@ async fn interactive(
 
 // ── Identity ───────────────────────────────────────────────────────────────
 
-fn exec_agent_id_status<'a>(_r: &'a ToolRegistry<'a>, _args: &'a Value) -> BoxFuture<'a> {
+fn exec_agent_id_status<'a>(r: &'a ToolRegistry<'a>, _args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         fast(Bin::Core, &sd, &["status".to_string()]).await
     })
 }
 
-fn exec_agent_id_sign<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+fn exec_agent_id_sign<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let (Some(op_type), Some(action), Some(payload)) = (
             nonempty_string(args, "type"),
             nonempty_string(args, "action"),
@@ -124,7 +211,7 @@ fn exec_agent_id_sign<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFutur
 
 fn exec_agent_id_bind<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let hub = hub_of(r).cloned();
 
         // Resume a live pending binding rather than voiding the user's in-flight
@@ -135,7 +222,7 @@ fn exec_agent_id_bind<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture
                 "ok": true,
                 "resumed": true,
                 "deep_link": pending.get("deepLink").cloned().unwrap_or(Value::Null),
-                "message": "Resuming a pending owner-binding — approve it in your Alien app. I'll confirm when it completes (or call agent_id_status).",
+                "message": "Resuming a pending owner-binding — approve it in your Alien app. I'll confirm when it completes (or call agent_id_status). In a markdown chat, show deep_link inside a ```qr fenced code block (the UI renders it as a scannable QR) plus as a plain link.",
             })
             .to_string();
         }
@@ -172,7 +259,7 @@ fn exec_agent_id_bind<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture
             "deep_link": auth.get("deepLink").cloned().unwrap_or(Value::Null),
             "qr_code": auth.get("qrCode").cloned().unwrap_or(Value::Null),
             "expires_at": auth.get("expiredAt").cloned().unwrap_or(Value::Null),
-            "message": "Scan the QR (or open the deep link) in your Alien app to bind this agent to you. I'll confirm here when it completes, or call agent_id_status.",
+            "message": "Ask the owner to approve in their Alien app; I'll confirm here when it completes (or call agent_id_status). Presentation: in a markdown chat, show deep_link inside a ```qr fenced code block (the UI renders it as a scannable QR) plus as a plain link — qr_code is box-drawing art that is ONLY legible in a terminal, never paste it into markdown.",
         })
         .to_string()
     })
@@ -183,9 +270,27 @@ async fn fast_json(bin: Bin, sd: &Path, argv: &[String]) -> Value {
     cli::run_json(bin, sd, &refs).await
 }
 
+/// Tracks which state dirs already have a live `bind` poller, so repeated
+/// `agent_id_bind` calls (a model retrying across turns) don't stack N
+/// concurrent 14-minute `agent-id-core bind` child processes against one
+/// pending-auth file — which, unbounded and detached, can exhaust a shared
+/// multi-tenant container's `--pids-limit`.
+static ACTIVE_BIND_POLLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 /// Poll `bind` in the background so the turn never blocks the ~14-minute human
-/// ceremony. Emits `agent_id.bound` on success when a hub is present.
+/// ceremony. Emits `agent_id.bound` on success when a hub is present. At most
+/// one poll runs per state dir; a call while one is already live is a no-op
+/// (the existing poll will observe the same pending binding).
 fn spawn_bind_poll(sd: PathBuf, hub: Option<SecurePromptHub>) {
+    {
+        let mut active = ACTIVE_BIND_POLLS.lock().expect("bind-poll set poisoned");
+        if !active.insert(sd.clone()) {
+            tracing::debug!("agent-id: bind poll already active for this identity; not stacking");
+            return;
+        }
+    }
     tokio::spawn(async move {
         let result =
             cli::run_interactive(Bin::Core, &sd, &["bind", "--timeout-sec", "840"], None).await;
@@ -205,6 +310,10 @@ fn spawn_bind_poll(sd: PathBuf, hub: Option<SecurePromptHub>) {
             Ok(r) => tracing::info!(result = %r.json, "agent-id: owner binding did not complete"),
             Err(e) => tracing::info!(error = %e, "agent-id: owner binding poll ended"),
         }
+        ACTIVE_BIND_POLLS
+            .lock()
+            .expect("bind-poll set poisoned")
+            .remove(&sd);
     });
 }
 
@@ -222,22 +331,46 @@ fn read_live_pending_auth(sd: &Path) -> Option<Value> {
 
 // ── Vault ───────────────────────────────────────────────────────────────────
 
-fn exec_vault_list<'a>(_r: &'a ToolRegistry<'a>, _args: &'a Value) -> BoxFuture<'a> {
+fn exec_vault_list<'a>(r: &'a ToolRegistry<'a>, _args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         fast(Bin::Vault, &sd, &["list".to_string()]).await
     })
 }
 
 fn exec_vault_add<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let Some(name) = nonempty_string(args, "name") else {
             return err("`name` is required.");
         };
         let Some(cred_type) = nonempty_string(args, "type") else {
             return err("`type` is required (e.g. bearer, basic, header, oauth2, login, totp).");
         };
+        // Re-adding an existing credential re-raises the owner-facing secret
+        // form — a confused model looping on vault_add freezes the whole
+        // conversation for 15 minutes per attempt. Short-circuit with the
+        // stored entry unless the model explicitly asks to overwrite.
+        if !bool_arg(args, "overwrite", false) {
+            let listing = cli::run_json(Bin::Vault, &sd, &["list"]).await;
+            let existing = listing
+                .get("credentials")
+                .and_then(Value::as_array)
+                .and_then(|creds| {
+                    creds
+                        .iter()
+                        .find(|c| c.get("name").and_then(Value::as_str) == Some(name.as_str()))
+                });
+            if let Some(existing) = existing {
+                return json!({
+                    "ok": true,
+                    "already_stored": true,
+                    "credential": existing,
+                    "note": "A credential with this name ALREADY EXISTS, secrets included — the owner does not need to enter anything. Do NOT call vault_add for it again; use it directly (alien_browser_auto_login / alien_browser_login). Pass overwrite=true ONLY if the owner explicitly said the stored secret is wrong.",
+                })
+                .to_string();
+            }
+        }
         let domains = string_vec_arg(args, "domains");
         let mut argv = vec![
             "add".to_string(),
@@ -264,17 +397,24 @@ fn exec_vault_add<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a>
         // Non-secret: the sign-in page a `login` credential drives. Required for
         // alien_browser_auto_login to work — without it there is nowhere to start.
         if let Some(login_url) = nonempty_string(args, "login_url") {
+            if hosted_safe(r) && !is_http_url(&login_url) {
+                return err("Hosted login URLs must use http:// or https://.");
+            }
             argv.push("--login-url".to_string());
             argv.push(login_url);
         }
-        let hosted = hub_of(r).is_some();
-        note_secret_collected(interactive(Bin::Vault, &sd, &argv, hub_of(r)).await, hosted)
+        let hub = match interactive_hub(r) {
+            Ok(hub) => hub,
+            Err(error) => return error,
+        };
+        let hosted = hub.is_some();
+        note_secret_collected(interactive(Bin::Vault, &sd, &argv, hub).await, hosted)
     })
 }
 
-fn exec_vault_remove<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+fn exec_vault_remove<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let Some(name) = nonempty_string(args, "name") else {
             return err("`name` is required.");
         };
@@ -289,7 +429,7 @@ fn exec_vault_remove<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture
 
 fn exec_vault_set_totp<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let Some(name) = nonempty_string(args, "name") else {
             return err("`name` is required.");
         };
@@ -299,21 +439,36 @@ fn exec_vault_set_totp<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFutur
             name,
             "--form".to_string(),
         ];
-        let hosted = hub_of(r).is_some();
-        note_secret_collected(interactive(Bin::Vault, &sd, &argv, hub_of(r)).await, hosted)
+        let hub = match interactive_hub(r) {
+            Ok(hub) => hub,
+            Err(error) => return error,
+        };
+        let hosted = hub.is_some();
+        note_secret_collected(interactive(Bin::Vault, &sd, &argv, hub).await, hosted)
     })
 }
 
 // ── Browser (local) ──────────────────────────────────────────────────────────
 
-fn exec_browser_login<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+fn exec_browser_login<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
         if !crate::agent_id::browser_headed_available() {
-            return err(
-                "A headed browser login needs a GUI session (none detected). Use auto_login with stored credentials instead.",
-            );
+            // Do NOT send the model to auto_login here. auto_login's own dead
+            // ends advise a headed login, so the two pointed at each other and
+            // the agent bounced between them — or asked for a password that,
+            // for an account created through "Sign in with Google", does not
+            // exist. The viewport is the one real exit.
+            return json!({
+                "error": "A headed browser login needs a GUI session, and none is available here.",
+                "action": "owner_must_drive",
+                "reason": "no_display",
+                "message": "Call alien_browser_request_viewport to ask the owner to sign in from \
+                            their device, then continue once they say they are done. Do NOT retry \
+                            headed login and do NOT ask for the password.",
+            })
+            .to_string();
         }
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let mut argv = vec!["login".to_string()];
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
         push_opt(&mut argv, "--url", nonempty_string(args, "url"));
@@ -333,21 +488,32 @@ fn exec_browser_login<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFutur
 
 fn exec_browser_auto_login<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let Some(cred) = nonempty_string(args, "cred") else {
             return err("`cred` (a `login` credential name) is required.");
         };
         let mut argv = vec!["auto-login".to_string(), "--cred".to_string(), cred];
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
         // May prompt for an interactive OTP when there's no stored TOTP seed.
-        interactive(Bin::Browser, &sd, &argv, hub_of(r)).await
+        let hub = match interactive_hub(r) {
+            Ok(hub) => hub,
+            Err(error) => return error,
+        };
+        interactive(Bin::Browser, &sd, &argv, hub).await
     })
 }
 
-fn exec_browser_open<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+fn exec_browser_open<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let name = nonempty_string(args, "name").unwrap_or_else(|| "main".to_string());
+        let url = nonempty_string(args, "url");
+        if hosted_safe(r)
+            && let Some(url) = url.as_deref()
+            && !is_http_url(url)
+        {
+            return err("Hosted browser navigation must use http:// or https://.");
+        }
         let mut argv = vec!["open".to_string(), "--name".to_string(), name.clone()];
         if bool_arg(args, "headed", false) {
             if !crate::agent_id::browser_headed_available() {
@@ -355,35 +521,106 @@ fn exec_browser_open<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture
             }
             argv.push("--headed".to_string());
         }
-        // Keep the daemon log inside the 0700 state dir (not world-readable /tmp)
-        // and slugify the model-chosen name so it can't traverse out of it.
-        let slug: String = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let log = sd.join(format!("browser-{slug}.log"));
+        // Keep the daemon log inside this tenant's state dir, not a shared
+        // /tmp path: many tenants run in one process, so a global
+        // `browser-{name}.log` lets one tenant's daemon truncate and
+        // interleave another's diagnostics — and `name` is model-controlled,
+        // so a global path also invites traversal. `sanitize_session_name`
+        // keeps the filename to a safe slug.
+        let log_dir = sd.join("browser-logs");
+        if let Err(error) = std::fs::create_dir_all(&log_dir) {
+            return err(format!("could not create browser log dir: {error}"));
+        }
+        let log = log_dir.join(format!("open-{}.log", sanitize_session_name(&name)));
         match cli::spawn_daemon_ready(
             &sd,
+            &name,
             &argv.iter().map(String::as_str).collect::<Vec<_>>(),
             log,
         )
         .await
         {
-            Ok(ready) => ready.to_string(),
+            Ok(ready) => {
+                let Some(url) = url else {
+                    return ready.to_string();
+                };
+                let navigation = fast_json(
+                    Bin::Browser,
+                    &sd,
+                    &[
+                        "navigate".to_string(),
+                        "--url".to_string(),
+                        url,
+                        "--name".to_string(),
+                        name.clone(),
+                    ],
+                )
+                .await;
+                if navigation.get("sessionExpired").and_then(Value::as_bool) == Some(true)
+                    && let Some(hub) = hub_of(r)
+                {
+                    hub.emit_event(REAUTH_EVENT, reauth_payload(&navigation, &name));
+                }
+                json!({
+                    "ok": navigation.get("ok").and_then(Value::as_bool) == Some(true),
+                    "session": ready,
+                    "navigation": navigation,
+                })
+                .to_string()
+            }
             Err(message) => err(message),
         }
     })
 }
 
-fn exec_browser_close<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+/// The event a client listens for to offer the owner the browser viewport.
+pub const VIEWPORT_EVENT: &str = "browser.viewport_requested";
+
+/// Hand the browser to the owner.
+///
+/// Some sign-ins cannot be completed by any credential — a bot challenge, or an
+/// identity provider that refuses automated entry. Before this existed the agent
+/// had no way to act on that: it could only say "please open the browser" in
+/// prose, with no card raised and no way to know if anyone did. That left the
+/// dead ends genuinely dead on a host with no display.
+fn exec_browser_request_viewport<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let profile = profile_of(args);
+        let reason = nonempty_string(args, "reason").unwrap_or_else(|| "owner_must_drive".into());
+        let Some(hub) = hub_of(r) else {
+            return err(
+                "No client is attached to show the browser to. Ask the owner to open Lethe on a \
+                 device with the browser view, then try again.",
+            );
+        };
+        let what = nonempty_string(args, "what_to_do").unwrap_or_else(|| {
+            "Finish the sign-in in the browser view, then come back here.".to_string()
+        });
+        hub.emit_event(
+            VIEWPORT_EVENT,
+            json!({ "profile": profile, "reason": reason, "message": what }),
+        );
+        // Non-blocking on purpose: driving a login takes minutes, and holding a
+        // tool call open for that would burn the turn's budget. The owner's
+        // reply in chat is the resume signal.
+        json!({
+            "ok": true,
+            "requested": true,
+            "profile": profile,
+            "note": format!(
+                "The owner has been shown a card asking them to open the browser view for \
+                 profile '{profile}'. Tell them what to do there in your reply and STOP — do not \
+                 poll, do not retry the login, and do not ask for a password. Continue when they \
+                 say they are done."
+            ),
+        })
+        .to_string()
+    })
+}
+
+fn exec_browser_close<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+    Box::pin(async move {
+        let sd = state_dir_of(r);
         let name = nonempty_string(args, "name").unwrap_or_else(|| "main".to_string());
         fast(
             Bin::Browser,
@@ -394,9 +631,9 @@ fn exec_browser_close<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFutur
     })
 }
 
-fn exec_browser_act<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+fn exec_browser_act<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let Some(action) = nonempty_string(args, "action") else {
             return err(
                 "`action` is required (e.g. snapshot, click, type, navigate, page-text, wait, tabs, screenshot).",
@@ -409,18 +646,95 @@ fn exec_browser_act<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<
                 "Use alien_browser_fill_secret / alien_browser_fill_otp for credential injection.",
             );
         }
-        let mut argv = vec![action];
-        if let Some(Value::Object(params)) = args.get("params") {
-            append_flags(&mut argv, params);
+        if matches!(
+            action.as_str(),
+            "fill" | "upload" | "form-inspect" | "form-fill"
+        ) {
+            return err(
+                "Use alien_browser_inspect_form and alien_browser_fill_form for ordinary form fields and workspace file uploads.",
+            );
         }
+        let mut params = args
+            .get("params")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if hosted_safe(r)
+            && let Err(message) = enforce_hosted_browser_params(&action, &mut params)
+        {
+            return err(&message);
+        }
+        let mut argv = vec![action];
+        append_flags(&mut argv, &params);
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
-        fast(Bin::Browser, &sd, &argv).await
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
     })
 }
 
-fn exec_browser_fill_secret<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+fn exec_browser_inspect_form<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
+        let mut argv = vec!["form-inspect".to_string()];
+        push_opt(&mut argv, "--name", nonempty_string(args, "name"));
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
+    })
+}
+
+fn exec_browser_fill_form<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+    Box::pin(async move {
+        let sd = state_dir_of(r);
+        let Some(mut plan) = args.get("plan").and_then(Value::as_object).cloned() else {
+            return err("`plan` is required.");
+        };
+        if let Err(message) = resolve_form_uploads(r, &mut plan) {
+            return err(message);
+        }
+        let Ok(spec) = serde_json::to_string(&plan) else {
+            return err("Could not encode the form plan.");
+        };
+        let mut argv = vec!["form-fill".to_string(), "--spec".to_string(), spec];
+        push_opt(&mut argv, "--name", nonempty_string(args, "name"));
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
+    })
+}
+
+/// Canonicalize only upload paths, through the same FileTools policy the rest
+/// of the turn uses. Hosted registries are workspace-jailed; standalone keeps
+/// its established full-machine behavior. Other form values are untouched.
+fn resolve_form_uploads(
+    registry: &ToolRegistry<'_>,
+    plan: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some(uploads) = plan.get_mut("uploads") else {
+        return Ok(());
+    };
+    let Some(uploads) = uploads.as_array_mut() else {
+        return Err("`plan.uploads` must be an array.".to_string());
+    };
+    for upload in uploads {
+        let Some(upload) = upload.as_object_mut() else {
+            return Err("Each upload must be an object with `ref` and `files`.".to_string());
+        };
+        let Some(files) = upload.get_mut("files").and_then(Value::as_array_mut) else {
+            return Err("Each upload needs a `files` array.".to_string());
+        };
+        for file in files {
+            let Some(raw) = file.as_str() else {
+                return Err("Upload file paths must be strings.".to_string());
+            };
+            let resolved = registry
+                .files
+                .resolve_existing_file(raw)
+                .map_err(|message| format!("Upload denied: {message}"))?;
+            *file = Value::String(resolved.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+fn exec_browser_fill_secret<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
+    Box::pin(async move {
+        let sd = state_dir_of(r);
         let (Some(reference), Some(cred)) =
             (nonempty_string(args, "ref"), nonempty_string(args, "cred"))
         else {
@@ -437,13 +751,13 @@ fn exec_browser_fill_secret<'a>(_r: &'a ToolRegistry<'a>, args: &'a Value) -> Bo
             argv.push("--submit".to_string());
         }
         push_opt(&mut argv, "--name", nonempty_string(args, "name"));
-        fast(Bin::Browser, &sd, &argv).await
+        browser_fast(r, &sd, &argv, &profile_of(args)).await
     })
 }
 
 fn exec_browser_fill_otp<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFuture<'a> {
     Box::pin(async move {
-        let sd = crate::agent_id::cached_state_dir();
+        let sd = state_dir_of(r);
         let (Some(reference), Some(cred)) =
             (nonempty_string(args, "ref"), nonempty_string(args, "cred"))
         else {
@@ -457,8 +771,36 @@ fn exec_browser_fill_otp<'a>(r: &'a ToolRegistry<'a>, args: &'a Value) -> BoxFut
             cred,
         ];
         // May prompt for an interactive code if the cred has no TOTP seed.
-        interactive(Bin::Browser, &sd, &argv, hub_of(r)).await
+        let hub = match interactive_hub(r) {
+            Ok(hub) => hub,
+            Err(error) => return error,
+        };
+        interactive(Bin::Browser, &sd, &argv, hub).await
     })
+}
+
+/// Reduce a model-supplied session name to a filesystem-safe slug for use in a
+/// log filename: alphanumerics, dash, and underscore survive; everything else
+/// (path separators, `..`, dots) becomes `_`. Bounded so a huge name can't
+/// blow past filename limits. The value passed to the daemon as `--name` is
+/// unchanged; this only guards the derived log path.
+fn sanitize_session_name(name: &str) -> String {
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if slug.is_empty() {
+        "session".to_string()
+    } else {
+        slug
+    }
 }
 
 fn push_opt(argv: &mut Vec<String>, flag: &str, value: Option<String>) {
@@ -466,6 +808,51 @@ fn push_opt(argv: &mut Vec<String>, flag: &str, value: Option<String>) {
         argv.push(flag.to_string());
         argv.push(value);
     }
+}
+
+/// Verbs that hand the page arbitrary local files. Blocked wholesale under the
+/// hosted policy — filesystem tools are disabled, so these would be the only
+/// path back to the disk.
+const HOSTED_BLOCKED_BROWSER_ACTIONS: &[&str] = &["upload"];
+
+/// Param keys that name a caller-chosen output/input path. Stripped from EVERY
+/// action under the hosted policy (not just the file-writing verbs known
+/// today), so a plugin that later adds `pdf`/`har`/`record`/`trace`/`download`
+/// with a `--path`/`--output` flag can't become an indirect file-write. When a
+/// verb needs a file (screenshot/zoom), dropping the key falls back to the
+/// plugin's default inside this tenant's state directory.
+const HOSTED_BLOCKED_PATH_KEYS: &[&str] =
+    &["path", "output", "out", "dest", "file", "files", "save"];
+
+/// Param keys carrying a navigation target. Every one must be http(s) under the
+/// hosted policy so no action can reach file://, chrome://, or a custom scheme.
+const HOSTED_URL_KEYS: &[&str] = &["url", "start"];
+
+/// Apply the hosted browser-action policy in place. Generalizes what used to be
+/// a three-verb denylist: block file-handoff verbs, strip output-path flags
+/// from all actions, and require http(s) on any navigation flag. A stricter
+/// verb+flag allowlist owned by the plugin would be the deeper fix; this keeps
+/// the gate from silently failing open as the plugin's verb set grows.
+fn enforce_hosted_browser_params(
+    action: &str,
+    params: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    if HOSTED_BLOCKED_BROWSER_ACTIONS.contains(&action) {
+        return Err(format!(
+            "The `{action}` browser action is disabled by the hosted capability policy."
+        ));
+    }
+    for key in HOSTED_URL_KEYS {
+        if let Some(url) = params.get(*key).and_then(Value::as_str)
+            && !is_http_url(url)
+        {
+            return Err("Hosted browser navigation must use http:// or https://.".to_string());
+        }
+    }
+    for key in HOSTED_BLOCKED_PATH_KEYS {
+        params.remove(*key);
+    }
+    Ok(())
 }
 
 /// Turn a `params` object into `--key value` flags for the browser CLI. Bools
@@ -575,6 +962,10 @@ pub const TOOL_DEFS: &[ToolDef] = &[
                 "login_url",
                 "For type=login only: the sign-in page URL (e.g. https://www.reddit.com/login). REQUIRED for alien_browser_auto_login to work — set it whenever you add a login credential you'll log in with.",
             ),
+            p_bool(
+                "overwrite",
+                "Replace an existing credential of the same name (re-prompts the owner for secrets). Only when the owner explicitly says the stored secret is wrong or changed — adding an existing name without this returns the stored entry instead.",
+            ),
         ],
         category: ToolCategory::AgentId,
         execute: ToolExecutor::Async(exec_vault_add),
@@ -615,7 +1006,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_auto_login",
-        description: "Headlessly log in using a stored `login` credential (username + password + 2FA policy) and SEAL the resulting signed-in session into a browser-profile for reuse. This is the FIRST step of the headless browser flow (there is no profile to open until this runs) — call it before alien_browser_open/act. Requires the login credential to have a login_url (set it on vault_add). 2FA is answered from a stored TOTP seed, or via a secure prompt to the owner. If it reports the login was blocked by an anti-automation wall, headed login is not available on a server — report that to the owner rather than retrying.",
+        description: "Headlessly log in using a stored `login` credential (username + password + 2FA policy) and SEAL the resulting signed-in session into a browser-profile for reuse. Public browsing does not require this: alien_browser_open auto-creates the anonymous default profile. Use auto-login only when the task actually needs an account and no connected-account API operation already covers it. Requires the login credential to have a login_url (set it on vault_add). 2FA is answered from a stored TOTP seed, or via a secure prompt to the owner.",
         params: &[
             p_str_req("cred", "Name of a `login` credential in the vault."),
             p_str(
@@ -628,13 +1019,25 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_open",
-        description: "Start a persistent browser session daemon by unsealing an EXISTING browser-profile. A profile must already exist (created by alien_browser_auto_login, or a headed alien_browser_login on a machine with a display) — if none does this returns a 'no browser-profile' error, which means run alien_browser_auto_login first, NOT that the browser is missing. Returns once ready; drive it with alien_browser_act and close it with alien_browser_close.",
+        description: "Start the persistent Alien browser and optionally navigate in the same call. When MCP or API operations covering the task are available (e.g. connectors_search / connectors_execute on deployments that have them), prefer them over the browser: they call the service's API directly and are faster and more reliable than driving web pages — browse only for what no operation covers. The shared `main` profile is created automatically as an anonymous L0 profile on first use, so public pages need no login/setup. Returns once ready; use the typed form tools for forms and alien_browser_act for other actions.",
         params: &[
-            p_str("name", "Session name (default 'main')."),
+            p_str("name", "Session name (default 'main'). Only 'main' auto-creates; any other name must match a profile sealed by alien_browser_login/auto_login, else open fails with NO_PROFILE. For public browsing omit this."),
+            p_str("url", "Optional http(s) URL to open immediately."),
             p_bool("headed", "Show the window (requires a GUI session)."),
         ],
         category: ToolCategory::AgentIdBrowser,
         execute: ToolExecutor::Async(exec_browser_open),
+    },
+    ToolDef {
+        name: "alien_browser_request_viewport",
+        description: "Ask the OWNER to take over the browser on their own device, and stop. Call this — and nothing else — whenever a result carries `action: \"owner_must_drive\"`: a bot challenge, or a sign-in the provider will not let an agent complete (Google/Microsoft SSO). Those cannot be solved by any stored credential, so do NOT retry the login, do NOT call alien_browser_login, and do NOT ask for a password (an account created via 'Sign in with Google' has none). Raises a card on the owner's client; they finish the sign-in there and tell you when done.",
+        params: &[
+            p_str("name", "Session name whose browser the owner should drive (default 'main')."),
+            p_str("reason", "Why a human is needed: bot_challenge, idp_refuses_automation, no_display, or device_approval."),
+            p_str("what_to_do", "One sentence telling the owner exactly what to do in the browser view, e.g. 'Sign in to Google, then close the view.'"),
+        ],
+        category: ToolCategory::AgentIdBrowser,
+        execute: ToolExecutor::Async(exec_browser_request_viewport),
     },
     ToolDef {
         name: "alien_browser_close",
@@ -645,17 +1048,40 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "alien_browser_act",
-        description: "Run a browser action in an open session. `action` is a verb (snapshot, click, type, navigate, page-text, wait, tabs, tab-new, screenshot, get, scroll, press, …) and `params` its flags (e.g. {\"ref\":\"e3\",\"text\":\"hi\"}). For credential injection use the dedicated fill tools.",
+        description: "Run a non-form browser action in an open Alien session: snapshot, click, navigate, page-text, wait, tabs, screenshot, get, scroll, press, etc. Flags belong in `params`; never paste CLI syntax into a ref/value. For forms use alien_browser_inspect_form then ONE alien_browser_fill_form call; for credentials use the dedicated secret/OTP tools.",
         params: &[
-            p_str_req("action", "Browser verb to run."),
-            p_object(
+            p_str_req(
+                "action",
+                "Browser verb to run (bare verb only — flags go in `params`).",
+            ),
+            p_obj(
                 "params",
-                "Flags for the action as a JSON object, e.g. {\"ref\":\"e3\",\"text\":\"hi\"} or {\"url\":\"https://…\"}. Omit for verbs that take none (snapshot, page-text, tabs).",
+                "Flags for the verb as key/value pairs, e.g. {\"url\": \"https://example.com\"} for navigate or {\"ref\": \"e3\", \"text\": \"hi\"} for type. `true` becomes a bare flag, arrays are comma-joined.",
             ),
             p_str("name", "Session name (default 'main')."),
         ],
         category: ToolCategory::AgentIdBrowser,
         execute: ToolExecutor::Async(exec_browser_act),
+    },
+    ToolDef {
+        name: "alien_browser_inspect_form",
+        description: "Inspect only the current page's form controls in a compact structured form: refs, associated labels, types, required/checked state, select options, and file accept rules. Text/password values are never returned. Call once, then pass the refs to alien_browser_fill_form.",
+        params: &[p_str("name", "Session name (default 'main').")],
+        category: ToolCategory::AgentIdBrowser,
+        execute: ToolExecutor::Async(exec_browser_inspect_form),
+    },
+    ToolDef {
+        name: "alien_browser_fill_form",
+        description: "Fill and verify up to 50 ordinary controls in ONE fast atomic browser call. `plan` may contain fields [{ref,value}], checks [{ref,checked}], selects [{ref,values}], uploads [{ref,files}] and optional submit (a button ref). Each result is verified; failed controls and native validation errors are returned individually. Upload paths are confined to the user's workspace in hosted mode. Do not put passwords/OTP here — use the sealed credential tools.",
+        params: &[
+            p_form_plan_req(
+                "plan",
+                "Structured form plan, e.g. {\"fields\":[{\"ref\":\"e1\",\"value\":\"Ada\"}],\"checks\":[{\"ref\":\"e2\",\"checked\":true}],\"selects\":[{\"ref\":\"e3\",\"values\":[\"ms\"]}],\"uploads\":[{\"ref\":\"e4\",\"files\":[\"resume.pdf\"]}]}",
+            ),
+            p_str("name", "Session name (default 'main')."),
+        ],
+        category: ToolCategory::AgentIdBrowser,
+        execute: ToolExecutor::Async(exec_browser_fill_form),
     },
     ToolDef {
         name: "alien_browser_fill_secret",
@@ -690,8 +1116,11 @@ pub const TOOL_DEFS: &[ToolDef] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{TOOL_DEFS, note_secret_collected};
-    use serde_json::Value;
+    use super::{
+        TOOL_DEFS, enforce_hosted_browser_params, is_http_url, note_secret_collected,
+        sanitize_session_name,
+    };
+    use serde_json::{Value, json};
 
     #[test]
     fn browser_act_schema_advertises_the_params_object() {
@@ -760,6 +1189,321 @@ mod tests {
         assert_eq!(
             note_secret_collected("not json".to_string(), true),
             "not json"
+        );
+    }
+
+    #[test]
+    fn hosted_browser_urls_reject_local_file_schemes() {
+        assert!(is_http_url("https://example.com"));
+        assert!(is_http_url(" HTTP://example.com/path "));
+        assert!(!is_http_url("file:///etc/passwd"));
+        assert!(!is_http_url("data:text/plain,secret"));
+        assert!(!is_http_url("javascript:alert(1)"));
+    }
+
+    fn map(value: Value) -> serde_json::Map<String, Value> {
+        value.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn hosted_policy_blocks_file_handoff_verbs() {
+        let mut params = map(json!({"ref": "@e1", "files": "/a.pdf"}));
+        assert!(enforce_hosted_browser_params("upload", &mut params).is_err());
+    }
+
+    #[test]
+    fn hosted_policy_strips_output_paths_from_any_action() {
+        // Not just screenshot/zoom: a future file-writing verb with a path flag
+        // must have it stripped rather than forwarded to the CLI.
+        for action in ["screenshot", "zoom", "pdf", "har", "record", "trace"] {
+            let mut params =
+                map(json!({"path": "/etc/evil", "output": "/tmp/x", "region": "0,0,1,1"}));
+            enforce_hosted_browser_params(action, &mut params).unwrap();
+            assert!(!params.contains_key("path"), "{action} keeps path");
+            assert!(!params.contains_key("output"), "{action} keeps output");
+            // Non-path params survive.
+            assert!(params.contains_key("region"), "{action} dropped region");
+        }
+    }
+
+    #[test]
+    fn hosted_policy_requires_http_on_every_navigation_flag() {
+        for key in ["url", "start"] {
+            let mut params = map(json!({ key: "file:///etc/passwd" }));
+            assert!(
+                enforce_hosted_browser_params("navigate", &mut params).is_err(),
+                "{key} allowed a file scheme"
+            );
+            let mut ok = map(json!({ key: "https://example.com" }));
+            assert!(enforce_hosted_browser_params("navigate", &mut ok).is_ok());
+        }
+    }
+
+    #[test]
+    fn hosted_policy_allows_ordinary_actions() {
+        let mut params = map(json!({"ref": "@e2", "text": "hello"}));
+        enforce_hosted_browser_params("type", &mut params).unwrap();
+        assert_eq!(params.get("ref").and_then(Value::as_str), Some("@e2"));
+        assert_eq!(params.get("text").and_then(Value::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn session_name_sanitizes_traversal_and_bounds_length() {
+        assert_eq!(sanitize_session_name("main"), "main");
+        assert_eq!(sanitize_session_name("work-1_A"), "work-1_A");
+        assert_eq!(
+            sanitize_session_name("../../etc/passwd"),
+            "______etc_passwd"
+        );
+        assert_eq!(sanitize_session_name("a/b"), "a_b");
+        assert_eq!(sanitize_session_name(""), "session");
+        assert_eq!(sanitize_session_name(&"x".repeat(200)).len(), 64);
+        // No path separators or parent refs survive.
+        let slug = sanitize_session_name("..\\..\\win");
+        assert!(!slug.contains('/') && !slug.contains('\\') && !slug.contains(".."));
+    }
+}
+
+/// End-to-end over the agent-id CLI seam: a browser tool call whose result says
+/// the sealed profile is signed out must raise `browser.reauth_required` on the
+/// agent-id event channel. The real CLI is replaced by a stub script through
+/// `AGENT_ID_BROWSER_BIN`, so this runs with no Chrome, no vault, and no network.
+#[cfg(test)]
+mod browser_reauth_tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+
+    use super::{REAUTH_EVENT, reauth_payload};
+    use crate::agent_id::secure_prompt::{Emit, SecurePromptHub};
+    use crate::memory::MemoryStore;
+    use crate::tools::registry::{ToolRegistry, ToolRuntime};
+    use crate::tools::shell::ShellTools;
+
+    type Events = Arc<StdMutex<Vec<(String, Value)>>>;
+
+    /// `AGENT_ID_BROWSER_BIN` is process-global, so the tests that install a stub
+    /// binary must not run concurrently with each other.
+    static BIN_ENV: StdMutex<()> = StdMutex::new(());
+
+    const EXPIRED: &str = r#"{"ok":true,"sessionExpired":true,"action":"re_login","message":"Session looks logged out (landed on https://accounts.google.com/signin).","finalUrl":"https://accounts.google.com/signin","httpStatus":200,"title":"Sign in","loggedOut":true,"text":"Sign in to continue"}"#;
+
+    const LIVE: &str = r#"{"ok":true,"sessionExpired":false,"finalUrl":"https://app.example.com/inbox","httpStatus":200,"title":"Inbox","loggedOut":false,"text":"signed in"}"#;
+
+    /// Write a stub that prints `payload` as the CLI's single stdout JSON object.
+    fn stub_browser_bin(dir: &TempDir, payload: &str) -> std::path::PathBuf {
+        let path = dir.path().join("fake-agent-id-browser");
+        std::fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{payload}\nEOF\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn capturing_hub(dir: &TempDir) -> (SecurePromptHub, Events) {
+        let events: Events = Arc::new(StdMutex::new(Vec::new()));
+        let sink = events.clone();
+        let emit: Emit = Arc::new(move |event: &str, data| {
+            sink.lock().unwrap().push((event.to_string(), data));
+        });
+        // Never bound: this path runs `run_json`, which needs no prompt socket.
+        (
+            SecurePromptHub::new(dir.path().join("secure-prompt.sock"), emit),
+            events,
+        )
+    }
+
+    /// Run `alien_browser_act` against a stub CLI and return (result, events).
+    async fn act_against_stub(payload: &str, args: Value) -> (String, Vec<(String, Value)>) {
+        let _guard = BIN_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = stub_browser_bin(&tmp, payload);
+        // SAFETY: serialized by BIN_ENV; `find_bin` is the only reader.
+        unsafe { std::env::set_var("AGENT_ID_BROWSER_BIN", &bin) };
+
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+        let (hub, events) = capturing_hub(&tmp);
+        let runtime = ToolRuntime {
+            secure_prompt: Some(hub),
+            agent_id_state_dir: Some(tmp.path().join("agent-id")),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            runtime,
+        );
+        let result = registry.execute_async("alien_browser_act", &args).await;
+        let captured = events.lock().unwrap().clone();
+        (result, captured)
+    }
+
+    #[tokio::test]
+    async fn signed_out_profile_raises_a_reauth_event_naming_the_profile() {
+        let (result, events) = act_against_stub(
+            EXPIRED,
+            json!({
+                "action": "read",
+                "name": "google",
+                "params": { "url": "https://app.example.com/inbox" }
+            }),
+        )
+        .await;
+
+        let reauth: Vec<_> = events.iter().filter(|(e, _)| e == REAUTH_EVENT).collect();
+        assert_eq!(reauth.len(), 1, "expected one {REAUTH_EVENT}, got {events:?}");
+        let data = &reauth[0].1;
+        // The client needs to know WHICH login to redo.
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));
+        assert_eq!(
+            data.get("final_url").and_then(Value::as_str),
+            Some("https://accounts.google.com/signin")
+        );
+        assert!(
+            data.get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("logged out"))
+        );
+
+        // The tool result reaches the model unchanged, carrying `re_login`.
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed.get("action").and_then(Value::as_str),
+            Some("re_login")
+        );
+        assert_eq!(
+            parsed.get("sessionExpired").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_session_raises_nothing() {
+        let (result, events) = act_against_stub(
+            LIVE,
+            json!({ "action": "page-text", "name": "google", "params": {} }),
+        )
+        .await;
+        assert!(
+            events.is_empty(),
+            "a live session must stay silent, got {events:?}"
+        );
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.get("title").and_then(Value::as_str), Some("Inbox"));
+    }
+
+    /// The escalation exit: a result carrying `owner_must_drive` has exactly one
+    /// next move, and it raises a card rather than leaving the agent to ask for
+    /// a password that an SSO-only account does not have.
+    #[tokio::test]
+    async fn requesting_the_viewport_raises_a_card_naming_the_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+        let (hub, events) = capturing_hub(&tmp);
+        let runtime = ToolRuntime {
+            secure_prompt: Some(hub),
+            agent_id_state_dir: Some(tmp.path().join("agent-id")),
+            ..Default::default()
+        };
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            runtime,
+        );
+
+        let result = registry
+            .execute_async(
+                "alien_browser_request_viewport",
+                &json!({
+                    "name": "google",
+                    "reason": "idp_refuses_automation",
+                    "what_to_do": "Sign in to Google, then close the view.",
+                }),
+            )
+            .await;
+
+        let captured = events.lock().unwrap().clone();
+        let (name, data) = captured.first().expect("a card was raised").clone();
+        assert_eq!(name, super::VIEWPORT_EVENT);
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("idp_refuses_automation")
+        );
+        assert_eq!(
+            data.get("message").and_then(Value::as_str),
+            Some("Sign in to Google, then close the view.")
+        );
+
+        // The model must be told to stop, or it retries the login it cannot win.
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        let note = parsed.get("note").and_then(Value::as_str).unwrap();
+        assert!(note.contains("STOP"));
+        assert!(note.contains("do not ask for a password"));
+    }
+
+    /// With nothing attached there is no one to show a browser to, and saying so
+    /// beats raising a card into the void.
+    #[tokio::test]
+    async fn requesting_the_viewport_without_a_client_is_an_honest_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            ToolRuntime::default(),
+        );
+        let result = registry
+            .execute_async("alien_browser_request_viewport", &json!({}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .is_some_and(|e| e.contains("No client"))
+        );
+    }
+
+    #[test]
+    fn payload_defaults_the_message_when_agent_id_omits_it() {
+        let data = reauth_payload(&json!({ "sessionExpired": true }), "main");
+        assert_eq!(data.get("profile").and_then(Value::as_str), Some("main"));
+        assert!(data.get("final_url").unwrap().is_null());
+        assert!(
+            data.get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.contains("sign in again"))
         );
     }
 }

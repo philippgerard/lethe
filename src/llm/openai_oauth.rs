@@ -176,7 +176,7 @@ impl OpenAiOAuthClient {
             .await
         {
             Ok(response) => Ok(response),
-            Err(OpenAiOAuthError::RateLimited { .. } | OpenAiOAuthError::Transient { .. }) => {
+            Err(error) if openai_stream_error_is_retryable(&error) => {
                 let response = self.exec_chat_request(model, request, options).await?;
                 if let Some(text) = response.first_text() {
                     on_delta(text);
@@ -684,7 +684,10 @@ fn openai_user_input_items(content: MessageContent) -> Vec<Value> {
                     "output": response.content,
                 }));
             }
-            ContentPart::ToolCall(_) | ContentPart::ThoughtSignature(_) => {}
+            ContentPart::ToolCall(_)
+            | ContentPart::ThoughtSignature(_)
+            | ContentPart::ReasoningContent(_)
+            | ContentPart::Custom(_) => {}
         }
     }
     if !parts.is_empty() {
@@ -728,7 +731,9 @@ fn openai_assistant_input_items(content: MessageContent) -> Vec<Value> {
             }
             ContentPart::Binary(_)
             | ContentPart::ToolResponse(_)
-            | ContentPart::ThoughtSignature(_) => {}
+            | ContentPart::ThoughtSignature(_)
+            | ContentPart::ReasoningContent(_)
+            | ContentPart::Custom(_) => {}
         }
     }
     let mut items: Vec<Value> = Vec::new();
@@ -759,7 +764,7 @@ fn openai_tool_result_input_items(content: MessageContent) -> Vec<Value> {
 fn openai_tool_schema(tool: Tool) -> Value {
     let mut entry = Map::new();
     entry.insert("type".to_string(), Value::String("function".to_string()));
-    entry.insert("name".to_string(), Value::String(tool.name));
+    entry.insert("name".to_string(), Value::String(tool.name.to_string()));
     if let Some(description) = tool.description {
         entry.insert("description".to_string(), Value::String(description));
     }
@@ -1225,6 +1230,7 @@ fn openai_response_to_chat_response(data: Value, requested_model: &str) -> Resul
         {
             usage.prompt_tokens_details = Some(PromptTokensDetails {
                 cache_creation_tokens: None,
+                cache_creation_details: None,
                 cached_tokens: Some(cached as i32),
                 audio_tokens: None,
             });
@@ -1237,6 +1243,8 @@ fn openai_response_to_chat_response(data: Value, requested_model: &str) -> Resul
         reasoning_content: None,
         model_iden: ModelIden::new(AdapterKind::OpenAI, requested_model.to_string()),
         provider_model_iden: ModelIden::new(AdapterKind::OpenAI, provider_model),
+        stop_reason: None,
+        response_id: None,
         usage,
         captured_raw_body: None,
     })
@@ -1616,6 +1624,16 @@ fn openai_rate_limit_is_retryable(retry_after: Duration) -> bool {
     retry_after <= MAX_OPENAI_RATE_LIMIT_WAIT
 }
 
+fn openai_stream_error_is_retryable(error: &OpenAiOAuthError) -> bool {
+    match error {
+        OpenAiOAuthError::RateLimited { retry_after, .. } => {
+            openai_rate_limit_is_retryable(*retry_after)
+        }
+        OpenAiOAuthError::Transient { .. } => true,
+        OpenAiOAuthError::Other(_) => false,
+    }
+}
+
 fn short_uuid() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
 }
@@ -1858,6 +1876,26 @@ mod tests {
         assert!(!openai_rate_limit_is_retryable(Duration::from_secs(
             60 * 60
         )));
+    }
+
+    #[test]
+    fn openai_stream_fallback_skips_long_usage_limit_windows() {
+        let short = OpenAiOAuthError::RateLimited {
+            message: "burst throttle".to_string(),
+            retry_after: Duration::from_secs(1),
+        };
+        let long = OpenAiOAuthError::RateLimited {
+            message: "subscription window".to_string(),
+            retry_after: Duration::from_secs(3600),
+        };
+        let transient = OpenAiOAuthError::Transient {
+            message: "connection reset".to_string(),
+            retry_after: Duration::from_secs(1),
+        };
+
+        assert!(openai_stream_error_is_retryable(&short));
+        assert!(!openai_stream_error_is_retryable(&long));
+        assert!(openai_stream_error_is_retryable(&transient));
     }
 
     #[test]

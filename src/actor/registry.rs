@@ -6,13 +6,20 @@ use serde_json::{Value, json};
 
 use super::helpers::*;
 use super::*;
-use crate::tools::registry::{ToolContextShape, requestable_tools_directory_for_shape};
+use crate::tools::registry::{ToolContextShape, ToolPolicy, requestable_tools_directory_for_shape};
 
-fn requestable_directory_for_actor(actor: &Actor) -> String {
+fn requestable_directory_for_actor(
+    actor: &Actor,
+    policy: ToolPolicy,
+    has_agent_id_state: bool,
+) -> String {
     requestable_tools_directory_for_shape(ToolContextShape {
         has_actor: true,
         is_subagent: !actor.is_principal,
-        has_transport: false,
+        has_telegram: false,
+        has_client: false,
+        has_agent_id_state,
+        policy,
     })
 }
 
@@ -28,6 +35,11 @@ pub struct ActorRegistry {
     /// checkpoint, restart notice, max-turns handoff). Defaults to embedded
     /// templates; `set_prompts` wires the workspace-overridable store.
     prompts: crate::llm::prompts::PromptStore,
+    /// Capability boundary the hosting process runs its turns under. Actor
+    /// prompt fragments (the `<available_on_request>` directory) must list
+    /// only tools that dispatch would actually allow, so hosted agents are
+    /// never shown local capabilities the policy gate will reject.
+    tool_policy: ToolPolicy,
 }
 
 impl ActorRegistry {
@@ -40,6 +52,7 @@ impl ActorRegistry {
             events: ActorEventBus::new(1000),
             store: None,
             prompts: crate::llm::prompts::PromptStore::new("", ""),
+            tool_policy: ToolPolicy::Full,
         }
     }
 
@@ -49,6 +62,10 @@ impl ActorRegistry {
 
     pub fn set_prompts(&mut self, prompts: crate::llm::prompts::PromptStore) {
         self.prompts = prompts;
+    }
+
+    pub fn set_tool_policy(&mut self, policy: ToolPolicy) {
+        self.tool_policy = policy;
     }
 
     /// Best-effort write-through after a mutation. Persistence failures are
@@ -79,8 +96,10 @@ impl ActorRegistry {
             &actor,
             json!({
                 "name": actor.config.name,
+                "goals": actor.config.goals,
                 "spawned_by": actor.spawned_by,
                 "is_principal": is_principal,
+                "is_background": actor.config.background,
             }),
         );
         self.actors.insert(actor_id.clone(), actor);
@@ -167,6 +186,7 @@ impl ActorRegistry {
                     "name": actor.config.name,
                     "task_state": state_name(actor.task_state),
                     "turns_used": actor.turn_count,
+                    "is_background": actor.config.background,
                 }),
             );
             let actor_id = actor.id.clone();
@@ -344,6 +364,8 @@ impl ActorRegistry {
                 "intent": intent_name(resolved_intent),
                 "channel": resolved_intent.channel(),
                 "parent_wake": parent_wake,
+                "kind": message.metadata.get("kind"),
+                "source": message.metadata.get("source"),
             }),
         );
         if parent_wake && resolved_intent.channel() == "user_notify" {
@@ -597,7 +619,10 @@ impl ActorRegistry {
         }
 
         let mut system_prompt = self.build_system_prompt(actor_id)?;
-        let directory = self.build_requestable_directory(actor_id)?;
+        // Subagents never carry a tenant identity/vault directory: under the
+        // hosted policy the agent-id and sealed-browser families stay hidden
+        // from them (the host's per-turn lifecycle only wraps cortex turns).
+        let directory = self.build_requestable_directory(actor_id, false)?;
         if !directory.is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&directory);
@@ -865,12 +890,20 @@ impl ActorRegistry {
     /// The `<available_on_request>` directory, emitted as a sibling of the
     /// actor system prompt (not nested inside it). Returns an empty string
     /// when nothing is requestable in the current context.
-    pub fn build_requestable_directory(&self, actor_id: &str) -> ActorResult<String> {
+    /// `has_agent_id_state` reflects whether the current turn carries a
+    /// tenant-private agent-id state directory — under the hosted policy the
+    /// identity/vault/sealed-browser families are only listed when it does.
+    pub fn build_requestable_directory(
+        &self,
+        actor_id: &str,
+        has_agent_id_state: bool,
+    ) -> ActorResult<String> {
         let actor = self
             .actors
             .get(actor_id)
             .ok_or_else(|| ActorError::NotFound(actor_id.to_string()))?;
-        let directory = requestable_directory_for_actor(actor);
+        let directory =
+            requestable_directory_for_actor(actor, self.tool_policy, has_agent_id_state);
         if directory.is_empty() {
             return Ok(String::new());
         }
@@ -1216,6 +1249,8 @@ impl ActorRegistry {
                 "intent": intent_name(intent),
                 "channel": intent.channel(),
                 "parent_wake": true,
+                "kind": message.metadata.get("kind"),
+                "source": message.metadata.get("source"),
             }),
         );
         Ok(())
