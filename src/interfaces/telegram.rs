@@ -131,6 +131,40 @@ pub struct TelegramClient {
 
 const TELEGRAM_ALLOWED_UPDATES: &str = "[\"message\",\"message_reaction\",\"callback_query\"]";
 const PENDING_REPLY_KEYBOARD_TTL: Duration = Duration::from_secs(30 * 60);
+const TELEGRAM_EGRESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn text_send_request<'a>(
+    client: &reqwest::Client,
+    url: String,
+    payload: &SendMessageRequest<'a>,
+) -> reqwest::RequestBuilder {
+    client
+        .post(url)
+        .timeout(TELEGRAM_EGRESS_REQUEST_TIMEOUT)
+        .json(payload)
+}
+
+fn blocking_json_egress_request<T: Serialize + ?Sized>(
+    client: &reqwest::blocking::Client,
+    url: String,
+    payload: &T,
+) -> reqwest::blocking::RequestBuilder {
+    client
+        .post(url)
+        .timeout(TELEGRAM_EGRESS_REQUEST_TIMEOUT)
+        .json(payload)
+}
+
+fn blocking_multipart_egress_request(
+    client: &reqwest::blocking::Client,
+    url: String,
+    form: reqwest::blocking::multipart::Form,
+) -> reqwest::blocking::RequestBuilder {
+    client
+        .post(url)
+        .timeout(TELEGRAM_EGRESS_REQUEST_TIMEOUT)
+        .multipart(form)
+}
 
 impl TelegramClient {
     pub fn new(token: impl Into<String>, allowed_user_ids: Vec<i64>) -> TelegramResult<Self> {
@@ -274,20 +308,21 @@ impl TelegramClient {
         // body when markdown parsing fails. Skip `error_for_status()` so the
         // description survives into [`TelegramError::Api`] for callers (e.g.
         // [`is_parse_entity_error`]) to inspect.
-        let response = self
-            .http
-            .post(self.method_url("sendMessage"))
-            .json(&SendMessageRequest {
+        let response = text_send_request(
+            &self.http,
+            self.method_url("sendMessage"),
+            &SendMessageRequest {
                 chat_id,
                 text,
                 parse_mode,
                 disable_web_page_preview: true,
                 reply_markup,
-            })
-            .send()
-            .await?
-            .json::<TelegramResponse<SentTelegramMessage>>()
-            .await?;
+            },
+        )
+        .send()
+        .await?
+        .json::<TelegramResponse<SentTelegramMessage>>()
+        .await?;
         response.into_result().map(|message| message.message_id)
     }
 
@@ -1731,6 +1766,37 @@ pub type SharedTelegramTurnGuard = Arc<Mutex<TelegramTurnGuard>>;
 
 const TELEGRAM_TOOL_TYPING_REFRESH_SECONDS: u64 = 3;
 
+/// Owns a background task that must not outlive the future that created it.
+/// In particular, dropping a timed-out tool-call wrapper still aborts the
+/// Telegram typing refresh instead of leaving it detached.
+#[derive(Debug)]
+struct AbortJoinHandleOnDrop {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AbortJoinHandleOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for AbortJoinHandleOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 /// Telegram turn observer: keeps the "typing" indicator alive for tool calls
 /// and surfaces otherwise-quiet deep-model escalation.
 #[derive(Clone, Debug)]
@@ -1761,10 +1827,10 @@ impl crate::tools::registry::TurnObserver for TelegramTypingObserver {
                 return inner.await;
             };
             let _ = client.send_chat_action(chat_id, "typing").await;
-            let typing_task = tokio::spawn(typing_refresh_loop(client, chat_id));
+            let typing_task =
+                AbortJoinHandleOnDrop::new(tokio::spawn(typing_refresh_loop(client, chat_id)));
             let output = inner.await;
-            typing_task.abort();
-            let _ = typing_task.await;
+            typing_task.abort_and_wait().await;
             output
         })
     }
@@ -2030,12 +2096,15 @@ pub fn send_message_blocking(
         reply_markup.validate().map_err(TelegramError::Api)?;
         payload["reply_markup"] = json!(reply_markup);
     }
-    let response = reqwest::blocking::Client::new()
-        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-        .json(&payload)
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<SentTelegramMessage>>()?;
+    let client = reqwest::blocking::Client::new();
+    let response = blocking_json_egress_request(
+        &client,
+        format!("https://api.telegram.org/bot{token}/sendMessage"),
+        &payload,
+    )
+    .send()?
+    .error_for_status()?
+    .json::<TelegramResponse<SentTelegramMessage>>()?;
     response.into_result().map(|message| message.message_id)
 }
 
@@ -2147,15 +2216,18 @@ fn send_file_url_blocking(
     if !caption.trim().is_empty() {
         payload["caption"] = json!(caption.trim());
     }
-    let response = reqwest::blocking::Client::new()
-        .post(format!(
+    let client = reqwest::blocking::Client::new();
+    let response = blocking_json_egress_request(
+        &client,
+        format!(
             "https://api.telegram.org/bot{token}/{}",
             plan.send_type.method()
-        ))
-        .json(&payload)
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<SentTelegramMessage>>()?;
+        ),
+        &payload,
+    )
+    .send()?
+    .error_for_status()?
+    .json::<TelegramResponse<SentTelegramMessage>>()?;
     response.into_result().map(|message| message.message_id)
 }
 
@@ -2177,15 +2249,18 @@ fn send_file_path_blocking(
     if !caption.trim().is_empty() {
         form = form.text("caption", caption.trim().to_string());
     }
-    let response = reqwest::blocking::Client::new()
-        .post(format!(
+    let client = reqwest::blocking::Client::new();
+    let response = blocking_multipart_egress_request(
+        &client,
+        format!(
             "https://api.telegram.org/bot{token}/{}",
             plan.send_type.method()
-        ))
-        .multipart(form)
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<SentTelegramMessage>>()?;
+        ),
+        form,
+    )
+    .send()?
+    .error_for_status()?
+    .json::<TelegramResponse<SentTelegramMessage>>()?;
     response.into_result().map(|message| message.message_id)
 }
 
@@ -2199,21 +2274,22 @@ pub fn set_message_reaction_blocking(
     if emoji.is_empty() {
         return Ok(false);
     }
-    let response = reqwest::blocking::Client::new()
-        .post(format!(
-            "https://api.telegram.org/bot{token}/setMessageReaction"
-        ))
-        .json(&SetReactionRequest {
+    let client = reqwest::blocking::Client::new();
+    let response = blocking_json_egress_request(
+        &client,
+        format!("https://api.telegram.org/bot{token}/setMessageReaction"),
+        &SetReactionRequest {
             chat_id,
             message_id,
             reaction: vec![ReactionTypeEmoji {
                 reaction_type: "emoji",
                 emoji,
             }],
-        })
-        .send()?
-        .error_for_status()?
-        .json::<TelegramResponse<bool>>()?;
+        },
+    )
+    .send()?
+    .error_for_status()?
+    .json::<TelegramResponse<bool>>()?;
     match response.into_result() {
         Ok(value) => Ok(value),
         Err(TelegramError::Api(message)) if is_invalid_reaction_error(&message) => Ok(false),
@@ -2275,6 +2351,102 @@ mod tests {
             power_mode_notice("custom/provider-model"),
             "Using deep thinking model (custom/provider-model) for this query."
         );
+    }
+
+    #[test]
+    fn telegram_json_egress_requests_have_an_explicit_timeout() {
+        let async_client = reqwest::Client::new();
+        let async_payload = SendMessageRequest {
+            chat_id: 42,
+            text: "hello",
+            parse_mode: None,
+            disable_web_page_preview: true,
+            reply_markup: None,
+        };
+        let async_request = text_send_request(
+            &async_client,
+            "https://api.telegram.org/bottest/sendMessage".to_string(),
+            &async_payload,
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            async_request.timeout().copied(),
+            Some(TELEGRAM_EGRESS_REQUEST_TIMEOUT)
+        );
+
+        let blocking_client = reqwest::blocking::Client::new();
+        let blocking_payload = json!({"chat_id": 42, "text": "hello"});
+        for method in ["sendMessage", "sendPhoto", "setMessageReaction"] {
+            let blocking_request = blocking_json_egress_request(
+                &blocking_client,
+                format!("https://api.telegram.org/bottest/{method}"),
+                &blocking_payload,
+            )
+            .build()
+            .unwrap();
+            assert_eq!(
+                blocking_request.timeout().copied(),
+                Some(TELEGRAM_EGRESS_REQUEST_TIMEOUT),
+                "{method} must not block an agent turn indefinitely"
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_multipart_egress_request_has_an_explicit_timeout() {
+        let blocking_client = reqwest::blocking::Client::new();
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("chat_id", "42")
+            .part(
+                "document",
+                reqwest::blocking::multipart::Part::bytes(b"test".to_vec()).file_name("test.txt"),
+            );
+        let request = blocking_multipart_egress_request(
+            &blocking_client,
+            "https://api.telegram.org/bottest/sendDocument".to_string(),
+            form,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.timeout().copied(),
+            Some(TELEGRAM_EGRESS_REQUEST_TIMEOUT)
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_refresh_owner_aborts_its_task_when_dropped() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_in_task = started.clone();
+        let dropped_in_task = dropped.clone();
+        let handle = tokio::spawn(async move {
+            let _drop_flag = DropFlag(dropped_in_task);
+            started_in_task.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+
+        let owner = AbortJoinHandleOnDrop::new(handle);
+        drop(owner);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted refresh task should be dropped promptly");
     }
 
     #[test]

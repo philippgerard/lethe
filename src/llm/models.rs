@@ -270,6 +270,19 @@ mod tests {
     }
 
     #[test]
+    fn context_limit_lookup_covers_bare_and_direct_openai_terra_ids() {
+        assert_eq!(context_limit_for_model("gpt-5.6-terra"), Some(128_000));
+        assert_eq!(
+            context_limit_for_model("openai/gpt-5.6-terra"),
+            Some(128_000)
+        );
+        assert_eq!(
+            context_limit_for_model("  openai/gpt-5.6-terra  "),
+            Some(128_000)
+        );
+    }
+
+    #[test]
     fn normalize_prefixes_bare_openrouter_ids_once() {
         assert_eq!(
             normalize_model_id("openrouter", "moonshotai/kimi-k2.6"),

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,8 @@ use crate::agent::{Agent, TurnRequest};
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use crate::interfaces::telegram::{
-    TelegramClient, TelegramToolContext, TelegramTypingObserver, llm_limit_reply,
+    PendingReaction, SharedTelegramTurnGuard, TelegramClient, TelegramToolContext,
+    TelegramTurnGuard, TelegramTypingObserver, llm_limit_reply, split_telegram_messages,
 };
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
@@ -34,6 +36,12 @@ use crate::tools::registry::{
 
 const SESSION_QUEUE_DEPTH: usize = 32;
 const EVENT_QUEUE_DEPTH: usize = 64;
+const WAKE_TURN_TIMEOUT: Duration = Duration::from_secs(240);
+const WAKE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const WAKE_TURN_FAILURE_MESSAGE: &str =
+    "The scheduled task could not be completed. Please try again.";
+const WAKE_TURN_TIMEOUT_MESSAGE: &str =
+    "The scheduled task timed out before completion. Please try again.";
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -1293,20 +1301,520 @@ fn wake_tool_runtime(
     token: String,
     chat_id: i64,
     secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
-) -> ToolRuntime {
-    ToolRuntime {
+) -> (ToolRuntime, SharedTelegramTurnGuard) {
+    let guard = Arc::new(std::sync::Mutex::new(TelegramTurnGuard::new()));
+    let runtime = ToolRuntime {
         telegram: Some(TelegramToolContext {
             token: token.clone(),
             chat_id,
             user_id: Some(chat_id),
             last_message_id: None,
-            guard: None,
+            guard: Some(guard.clone()),
             dry_run: false,
             sent_messages: None,
         }),
         observer: Some(Arc::new(TelegramTypingObserver::new(token, chat_id))),
         secure_prompt,
         ..ToolRuntime::default()
+    };
+    (runtime, guard)
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct WakeGuardDelivery {
+    tool_messages_sent: usize,
+    pending_reactions: Vec<PendingReaction>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WakeReactionDelivery {
+    requested: usize,
+    delivered: usize,
+    errors: Vec<String>,
+}
+
+impl WakeReactionDelivery {
+    fn failed(&self) -> usize {
+        self.requested.saturating_sub(self.delivered)
+    }
+
+    fn has_failures(&self) -> bool {
+        self.failed() > 0
+    }
+
+    fn error_summary(&self) -> String {
+        if self.errors.is_empty() {
+            format!("{} Telegram reaction(s) were not confirmed", self.failed())
+        } else {
+            self.errors.join("; ")
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WakeDeliveryProgress {
+    confirmed_messages: std::sync::atomic::AtomicUsize,
+    confirmed_reactions: std::sync::atomic::AtomicUsize,
+    requested_reactions: usize,
+}
+
+impl WakeDeliveryProgress {
+    fn new(confirmed_messages: usize, requested_reactions: usize) -> Self {
+        Self {
+            confirmed_messages: std::sync::atomic::AtomicUsize::new(confirmed_messages),
+            confirmed_reactions: std::sync::atomic::AtomicUsize::new(0),
+            requested_reactions,
+        }
+    }
+
+    fn confirmed_messages(&self) -> usize {
+        self.confirmed_messages
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn confirmed_reactions(&self) -> usize {
+        self.confirmed_reactions
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_message(&self) {
+        self.confirmed_messages
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_reaction(&self) {
+        self.confirmed_reactions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn timeout_reactions(&self, timeout_after: Duration) -> WakeReactionDelivery {
+        let delivered = self.confirmed_reactions();
+        let failed = self.requested_reactions.saturating_sub(delivered);
+        WakeReactionDelivery {
+            requested: self.requested_reactions,
+            delivered,
+            errors: (failed > 0)
+                .then(|| {
+                    format!(
+                        "{failed} Telegram reaction(s) were not confirmed before the {}s delivery timeout",
+                        timeout_after.as_secs()
+                    )
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+fn take_wake_guard_delivery(
+    delivery_guard: &SharedTelegramTurnGuard,
+) -> std::result::Result<WakeGuardDelivery, String> {
+    delivery_guard
+        .lock()
+        .map(|mut guard| WakeGuardDelivery {
+            tool_messages_sent: guard.visible_messages_sent(),
+            pending_reactions: guard.drain_pending_reactions(),
+        })
+        .map_err(|error| error.to_string())
+}
+
+async fn deliver_wake_reactions<F, Fut>(
+    pending_reactions: Vec<PendingReaction>,
+    mut send_reaction: F,
+) -> WakeReactionDelivery
+where
+    F: FnMut(PendingReaction) -> Fut,
+    Fut: Future<Output = std::result::Result<(), String>>,
+{
+    let mut delivery = WakeReactionDelivery {
+        requested: pending_reactions.len(),
+        ..WakeReactionDelivery::default()
+    };
+    for pending in pending_reactions {
+        match send_reaction(pending).await {
+            Ok(()) => delivery.delivered += 1,
+            Err(error) => delivery.errors.push(error),
+        }
+    }
+    delivery
+}
+
+fn add_wake_reaction_fields(body: &mut Value, reactions: &WakeReactionDelivery) {
+    body["requested_reactions"] = json!(reactions.requested);
+    body["delivered_reactions"] = json!(reactions.delivered);
+    body["failed_reactions"] = json!(reactions.failed());
+    if !reactions.errors.is_empty() {
+        body["reaction_errors"] = json!(reactions.errors);
+    }
+}
+
+fn wake_delivery_response(
+    chat_id: i64,
+    reply_chars: usize,
+    delivery_status: &str,
+    delivered_messages: usize,
+    message_id: Option<i64>,
+    reactions: &WakeReactionDelivery,
+) -> Response {
+    let mut body = json!({
+        "success": true,
+        "turn_completed": true,
+        "chat_id": chat_id,
+        "reply_chars": reply_chars,
+        "delivered": true,
+        "delivery_status": delivery_status,
+        "delivered_messages": delivered_messages,
+    });
+    add_wake_reaction_fields(&mut body, reactions);
+    if let Some(message_id) = message_id {
+        body["message_id"] = json!(message_id);
+    }
+    Json(body).into_response()
+}
+
+fn wake_delivery_error(
+    status: StatusCode,
+    chat_id: i64,
+    reply_chars: usize,
+    delivery_status: &str,
+    turn_completed: bool,
+    delivered: bool,
+    delivered_messages: usize,
+    message_id: Option<i64>,
+    message: &str,
+    reactions: &WakeReactionDelivery,
+) -> Response {
+    let mut body = json!({
+        "success": false,
+        "turn_completed": turn_completed,
+        "chat_id": chat_id,
+        "reply_chars": reply_chars,
+        "delivered": delivered,
+        "delivery_status": delivery_status,
+        "delivered_messages": delivered_messages,
+        "error": message,
+    });
+    add_wake_reaction_fields(&mut body, reactions);
+    if let Some(message_id) = message_id {
+        body["message_id"] = json!(message_id);
+    }
+    (status, Json(body)).into_response()
+}
+
+fn reaction_failure_status(base: &str, reactions: &WakeReactionDelivery) -> String {
+    if reactions.delivered == 0 {
+        format!("{base}_reactions_failed")
+    } else {
+        format!("{base}_reactions_partially_delivered")
+    }
+}
+
+async fn finish_wake_delivery<RF, RFut, FF, FFut>(
+    chat_id: i64,
+    reply: String,
+    tool_messages_sent: usize,
+    pending_reactions: Vec<PendingReaction>,
+    send_reaction: RF,
+    mut send_fallback: FF,
+) -> Response
+where
+    RF: FnMut(PendingReaction) -> RFut,
+    RFut: Future<Output = std::result::Result<(), String>>,
+    FF: FnMut(String) -> FFut,
+    FFut: Future<Output = std::result::Result<i64, String>>,
+{
+    let reply_chars = reply.chars().count();
+    let reactions = deliver_wake_reactions(pending_reactions, send_reaction).await;
+    if tool_messages_sent > 0 {
+        if reactions.has_failures() {
+            return wake_delivery_error(
+                StatusCode::OK,
+                chat_id,
+                reply_chars,
+                &reaction_failure_status("tool_delivered", &reactions),
+                true,
+                true,
+                tool_messages_sent,
+                None,
+                &reactions.error_summary(),
+                &reactions,
+            );
+        }
+        return wake_delivery_response(
+            chat_id,
+            reply_chars,
+            "tool_delivered",
+            tool_messages_sent,
+            None,
+            &reactions,
+        );
+    }
+
+    let chunks = split_telegram_messages(reply.trim());
+    if chunks.is_empty() {
+        if reactions.requested > 0 {
+            if !reactions.has_failures() && reactions.delivered > 0 {
+                return wake_delivery_response(
+                    chat_id,
+                    reply_chars,
+                    "reaction_delivered",
+                    0,
+                    None,
+                    &reactions,
+                );
+            }
+            return wake_delivery_error(
+                if reactions.delivered > 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                chat_id,
+                reply_chars,
+                &reaction_failure_status("reaction_only", &reactions),
+                true,
+                reactions.delivered > 0,
+                0,
+                None,
+                &reactions.error_summary(),
+                &reactions,
+            );
+        }
+        return wake_delivery_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            chat_id,
+            reply_chars,
+            "empty_reply",
+            true,
+            false,
+            0,
+            None,
+            "turn completed without a Telegram tool delivery or a fallback reply",
+            &reactions,
+        );
+    }
+
+    let mut delivered_messages = 0;
+    let mut last_message_id = None;
+    for chunk in chunks {
+        match send_fallback(chunk).await {
+            Ok(message_id) => {
+                delivered_messages += 1;
+                last_message_id = Some(message_id);
+            }
+            Err(error) => {
+                let delivery_status = if delivered_messages == 0 {
+                    "fallback_failed"
+                } else {
+                    "fallback_partially_delivered"
+                };
+                return wake_delivery_error(
+                    if delivered_messages > 0 {
+                        // Telegram creates a new message on retry. Once any
+                        // chunk is confirmed, surface the partial failure in
+                        // JSON but keep the HTTP response non-retryable.
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    },
+                    chat_id,
+                    reply_chars,
+                    delivery_status,
+                    true,
+                    delivered_messages > 0 || reactions.delivered > 0,
+                    delivered_messages,
+                    last_message_id,
+                    &format!("turn completed but fallback Telegram delivery failed: {error}"),
+                    &reactions,
+                );
+            }
+        }
+    }
+
+    if reactions.has_failures() {
+        return wake_delivery_error(
+            StatusCode::OK,
+            chat_id,
+            reply_chars,
+            &reaction_failure_status("fallback_delivered", &reactions),
+            true,
+            true,
+            delivered_messages,
+            last_message_id,
+            &reactions.error_summary(),
+            &reactions,
+        );
+    }
+    wake_delivery_response(
+        chat_id,
+        reply_chars,
+        "fallback_delivered",
+        delivered_messages,
+        last_message_id,
+        &reactions,
+    )
+}
+
+async fn finish_wake_failure<RF, RFut, NF, NFut>(
+    chat_id: i64,
+    tool_messages_sent: usize,
+    pending_reactions: Vec<PendingReaction>,
+    _status: StatusCode,
+    failure_kind: &str,
+    user_message: &str,
+    error: String,
+    send_reaction: RF,
+    send_notification: NF,
+) -> Response
+where
+    RF: FnMut(PendingReaction) -> RFut,
+    RFut: Future<Output = std::result::Result<(), String>>,
+    NF: FnOnce(String) -> NFut,
+    NFut: Future<Output = std::result::Result<i64, String>>,
+{
+    let reactions = deliver_wake_reactions(pending_reactions, send_reaction).await;
+    if tool_messages_sent > 0 {
+        let delivery_status = if reactions.has_failures() {
+            reaction_failure_status(&format!("{failure_kind}_after_tool_delivery"), &reactions)
+        } else {
+            format!("{failure_kind}_after_tool_delivery")
+        };
+        return wake_delivery_error(
+            // A visible tool delivery is already confirmed. Returning a 5xx
+            // here would make the scheduler retry and can duplicate that
+            // message even though the remainder of the turn did not finish.
+            StatusCode::OK,
+            chat_id,
+            0,
+            &delivery_status,
+            false,
+            true,
+            tool_messages_sent,
+            None,
+            &error,
+            &reactions,
+        );
+    }
+
+    match send_notification(user_message.to_string()).await {
+        Ok(message_id) => wake_delivery_error(
+            // The failure/timeout/limit notice itself is now confirmed. A
+            // retry would send the same notice again, so preserve the turn
+            // failure in JSON while acknowledging delivery at HTTP level.
+            StatusCode::OK,
+            chat_id,
+            0,
+            &format!("{failure_kind}_notice_delivered"),
+            false,
+            true,
+            1,
+            Some(message_id),
+            &error,
+            &reactions,
+        ),
+        Err(send_error) => wake_delivery_error(
+            StatusCode::BAD_GATEWAY,
+            chat_id,
+            0,
+            &format!("{failure_kind}_notice_failed"),
+            false,
+            reactions.delivered > 0,
+            0,
+            None,
+            &format!("{error}; Telegram failure notice could not be sent: {send_error}"),
+            &reactions,
+        ),
+    }
+}
+
+async fn run_wake_turn_with_timeout<T>(
+    timeout_after: Duration,
+    future: impl Future<Output = T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout_after, future).await
+}
+
+async fn run_wake_delivery_with_timeout(
+    timeout_after: Duration,
+    chat_id: i64,
+    reply_chars: usize,
+    turn_completed: bool,
+    delivery_kind: &str,
+    progress: Arc<WakeDeliveryProgress>,
+    future: impl Future<Output = Response>,
+) -> Response {
+    match tokio::time::timeout(timeout_after, future).await {
+        Ok(response) => response,
+        Err(_) => {
+            let delivered_messages = progress.confirmed_messages();
+            let reactions = progress.timeout_reactions(timeout_after);
+            let delivered = delivered_messages > 0 || reactions.delivered > 0;
+            let delivery_status = if !delivered {
+                format!("{delivery_kind}_delivery_timeout")
+            } else {
+                format!("{delivery_kind}_delivery_timeout_after_partial_delivery")
+            };
+            wake_delivery_error(
+                if delivered_messages > 0 {
+                    // A confirmed message is not safe to retry: Telegram would
+                    // create another message rather than update the first one.
+                    StatusCode::OK
+                } else {
+                    StatusCode::GATEWAY_TIMEOUT
+                },
+                chat_id,
+                reply_chars,
+                &delivery_status,
+                turn_completed,
+                delivered,
+                delivered_messages,
+                None,
+                &format!(
+                    "{delivery_kind} Telegram delivery timed out after {} seconds",
+                    timeout_after.as_secs()
+                ),
+                &reactions,
+            )
+        }
+    }
+}
+
+async fn send_wake_telegram_message(
+    client: TelegramClient,
+    chat_id: i64,
+    text: String,
+    progress: Arc<WakeDeliveryProgress>,
+) -> std::result::Result<i64, String> {
+    match client.send_message(chat_id, &text).await {
+        Ok(message_id) => {
+            progress.record_message();
+            Ok(message_id)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+async fn send_wake_telegram_reaction(
+    client: TelegramClient,
+    pending: PendingReaction,
+    progress: Arc<WakeDeliveryProgress>,
+) -> std::result::Result<(), String> {
+    match client
+        .set_message_reaction(pending.chat_id, pending.message_id, &pending.emoji)
+        .await
+    {
+        Ok(true) => {
+            progress.record_reaction();
+            Ok(())
+        }
+        Ok(false) => Err(format!(
+            "Telegram did not apply reaction '{}' to message {} in chat {}",
+            pending.emoji, pending.message_id, pending.chat_id
+        )),
+        Err(error) => Err(format!(
+            "Telegram reaction '{}' for message {} in chat {} failed: {error}",
+            pending.emoji, pending.message_id, pending.chat_id
+        )),
     }
 }
 
@@ -1320,7 +1828,9 @@ fn wake_tool_runtime(
 /// `telegram_send_message` during the turn went nowhere (it returned a stub
 /// success with chat_id 0 — the silent drop). `/wake` instead installs a
 /// `TelegramToolContext`, which `message_egress()` prefers over the client
-/// egress, so the agent's `telegram_send_message` is delivered to Telegram.
+/// egress, so the agent's `telegram_send_message` is delivered to Telegram. A
+/// turn guard suppresses duplicate fallback delivery; when the model sends no
+/// Telegram message itself, the handler delivers its final non-empty reply.
 async fn wake(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1358,31 +1868,163 @@ async fn wake(
             );
         }
     };
-    let runtime = wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
+    let (runtime, delivery_guard) = wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
     let req = TurnRequest::new(&body.message).with_runtime(runtime);
 
-    match state.agent.chat_once(req).await {
-        Ok(reply) => Json(json!({
-            "success": true,
-            "chat_id": chat_id,
-            "reply_chars": reply.chars().count(),
-        }))
-        .into_response(),
+    let turn_result =
+        run_wake_turn_with_timeout(WAKE_TURN_TIMEOUT, state.agent.chat_once(req)).await;
+    let WakeGuardDelivery {
+        tool_messages_sent,
+        pending_reactions,
+    } = match take_wake_guard_delivery(&delivery_guard) {
+        Ok(delivery) => delivery,
         Err(error) => {
-            let error = anyhow::Error::new(error);
-            if let Some(message) = llm_limit_reply(&error) {
-                return match telegram_client.send_message(chat_id, message).await {
-                    Ok(_) => json_error(StatusCode::TOO_MANY_REQUESTS, message),
-                    Err(send_error) => json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("turn failed and limit reply could not be sent: {send_error}"),
-                    ),
-                };
-            }
-            json_error(
+            return wake_delivery_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("turn failed: {error}"),
+                chat_id,
+                0,
+                "delivery_state_failed",
+                false,
+                false,
+                0,
+                None,
+                &format!("Telegram delivery state unavailable: {error}"),
+                &WakeReactionDelivery::default(),
+            );
+        }
+    };
+
+    match turn_result {
+        Ok(Ok(reply)) => {
+            let reply_chars = reply.chars().count();
+            let progress = Arc::new(WakeDeliveryProgress::new(
+                tool_messages_sent,
+                pending_reactions.len(),
+            ));
+            let reaction_progress = progress.clone();
+            let reaction_client = telegram_client.clone();
+            let send_progress = progress.clone();
+            let fallback_client = telegram_client.clone();
+            let delivery = finish_wake_delivery(
+                chat_id,
+                reply,
+                tool_messages_sent,
+                pending_reactions,
+                move |pending| {
+                    let client = reaction_client.clone();
+                    let progress = reaction_progress.clone();
+                    send_wake_telegram_reaction(client, pending, progress)
+                },
+                move |text| {
+                    let client = fallback_client.clone();
+                    let progress = send_progress.clone();
+                    send_wake_telegram_message(client, chat_id, text, progress)
+                },
+            );
+            run_wake_delivery_with_timeout(
+                WAKE_DELIVERY_TIMEOUT,
+                chat_id,
+                reply_chars,
+                true,
+                "fallback",
+                progress,
+                delivery,
             )
+            .await
+        }
+        Ok(Err(error)) => {
+            let error = anyhow::Error::new(error);
+            let (status, failure_kind, user_message, error_message) = match llm_limit_reply(&error)
+            {
+                Some(message) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "limit",
+                    message,
+                    message.to_string(),
+                ),
+                None => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "turn_failed",
+                    WAKE_TURN_FAILURE_MESSAGE,
+                    format!("turn failed: {error}"),
+                ),
+            };
+            let progress = Arc::new(WakeDeliveryProgress::new(
+                tool_messages_sent,
+                pending_reactions.len(),
+            ));
+            let reaction_progress = progress.clone();
+            let reaction_client = telegram_client.clone();
+            let send_progress = progress.clone();
+            let notification_client = telegram_client.clone();
+            let delivery = finish_wake_failure(
+                chat_id,
+                tool_messages_sent,
+                pending_reactions,
+                status,
+                failure_kind,
+                user_message,
+                error_message,
+                move |pending| {
+                    let client = reaction_client.clone();
+                    let progress = reaction_progress.clone();
+                    send_wake_telegram_reaction(client, pending, progress)
+                },
+                move |text| {
+                    send_wake_telegram_message(notification_client, chat_id, text, send_progress)
+                },
+            );
+            let delivery_kind = format!("{failure_kind}_notice");
+            run_wake_delivery_with_timeout(
+                WAKE_DELIVERY_TIMEOUT,
+                chat_id,
+                0,
+                false,
+                &delivery_kind,
+                progress,
+                delivery,
+            )
+            .await
+        }
+        Err(_) => {
+            let progress = Arc::new(WakeDeliveryProgress::new(
+                tool_messages_sent,
+                pending_reactions.len(),
+            ));
+            let reaction_progress = progress.clone();
+            let reaction_client = telegram_client.clone();
+            let send_progress = progress.clone();
+            let notification_client = telegram_client.clone();
+            let delivery = finish_wake_failure(
+                chat_id,
+                tool_messages_sent,
+                pending_reactions,
+                StatusCode::GATEWAY_TIMEOUT,
+                "turn_timeout",
+                WAKE_TURN_TIMEOUT_MESSAGE,
+                format!(
+                    "turn timed out after {} seconds",
+                    WAKE_TURN_TIMEOUT.as_secs()
+                ),
+                move |pending| {
+                    let client = reaction_client.clone();
+                    let progress = reaction_progress.clone();
+                    send_wake_telegram_reaction(client, pending, progress)
+                },
+                move |text| {
+                    send_wake_telegram_message(notification_client, chat_id, text, send_progress)
+                },
+            );
+            run_wake_delivery_with_timeout(
+                WAKE_DELIVERY_TIMEOUT,
+                chat_id,
+                0,
+                false,
+                "turn_timeout_notice",
+                progress,
+                delivery,
+            )
+            .await
         }
     }
 }
@@ -1425,7 +2067,8 @@ fn resolve_workspace_path(workspace_root: &Path, raw_path: &str) -> Option<PathB
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
 
     use axum::http::HeaderValue;
@@ -1454,11 +2097,23 @@ mod tests {
 
     async fn assert_json_error(response: Response, status: StatusCode, message: &str) {
         assert_eq!(response.status(), status);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], message);
+    }
+
+    async fn response_json(response: Response) -> Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], message);
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn pending_reaction(message_id: i64, emoji: &str) -> PendingReaction {
+        PendingReaction {
+            chat_id: 42,
+            message_id,
+            emoji: emoji.to_string(),
+        }
     }
 
     #[test]
@@ -1547,14 +2202,19 @@ mod tests {
             Arc::new(|_, _| {}),
         );
 
-        let runtime = wake_tool_runtime("telegram-token".to_string(), 42, Some(hub.clone()));
+        let (runtime, delivery_guard) =
+            wake_tool_runtime("telegram-token".to_string(), 42, Some(hub.clone()));
         let telegram = runtime.telegram.as_ref().expect("telegram egress");
 
         assert_eq!(telegram.token, "telegram-token");
         assert_eq!(telegram.chat_id, 42);
         assert_eq!(telegram.user_id, Some(42));
         assert_eq!(telegram.last_message_id, None);
-        assert!(telegram.guard.is_none());
+        let runtime_guard = telegram.guard.as_ref().expect("wake delivery guard");
+        assert!(Arc::ptr_eq(runtime_guard, &delivery_guard));
+        assert_eq!(runtime_guard.lock().unwrap().visible_messages_sent(), 0);
+        runtime_guard.lock().unwrap().record_visible_message();
+        assert_eq!(delivery_guard.lock().unwrap().visible_messages_sent(), 1);
         assert!(!telegram.dry_run);
         assert!(telegram.sent_messages.is_none());
         assert!(
@@ -1569,6 +2229,570 @@ mod tests {
                 .socket_path(),
             hub.socket_path()
         );
+    }
+
+    #[test]
+    fn wake_guard_delivery_atomically_captures_and_drains_pending_reactions() {
+        let guard = Arc::new(StdMutex::new(TelegramTurnGuard::new()));
+        {
+            let mut guard = guard.lock().unwrap();
+            guard.record_visible_message();
+            guard.queue_pending_reaction(42, 70, "👍");
+            guard.queue_pending_reaction(42, 71, "🔥");
+        }
+
+        let delivery = take_wake_guard_delivery(&guard).unwrap();
+
+        assert_eq!(delivery.tool_messages_sent, 1);
+        assert_eq!(
+            delivery.pending_reactions,
+            vec![pending_reaction(70, "👍"), pending_reaction(71, "🔥")]
+        );
+        let guard = guard.lock().unwrap();
+        assert_eq!(guard.visible_messages_sent(), 1);
+        assert!(!guard.has_pending_reactions());
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_does_not_duplicate_a_tool_delivered_message() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "redundant final".to_string(),
+            2,
+            Vec::new(),
+            |_| async { Ok(()) },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(99) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["chat_id"], 42);
+        assert_eq!(body["reply_chars"], 15);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivery_status"], "tool_delivered");
+        assert_eq!(body["delivered_messages"], 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_keeps_confirmed_tool_message_duplicate_safe_when_reaction_fails() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "redundant final".to_string(),
+            1,
+            vec![pending_reaction(70, "👍"), pending_reaction(71, "🔥")],
+            |pending| async move {
+                if pending.message_id == 70 {
+                    Ok(())
+                } else {
+                    Err("reaction rejected".to_string())
+                }
+            },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(99) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivered_messages"], 1);
+        assert_eq!(body["requested_reactions"], 2);
+        assert_eq!(body["delivered_reactions"], 1);
+        assert_eq!(body["failed_reactions"], 1);
+        assert_eq!(
+            body["delivery_status"],
+            "tool_delivered_reactions_partially_delivered"
+        );
+        assert_eq!(body["reaction_errors"][0], "reaction rejected");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_sends_the_final_reply_as_a_fallback() {
+        let sent = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recorded = sent.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "  final answer  ".to_string(),
+            0,
+            Vec::new(),
+            |_| async { Ok(()) },
+            move |text| {
+                recorded.lock().unwrap().push(text);
+                async { Ok(73) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["chat_id"], 42);
+        assert_eq!(body["reply_chars"], 16);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivery_status"], "fallback_delivered");
+        assert_eq!(body["delivered_messages"], 1);
+        assert_eq!(body["message_id"], 73);
+        assert_eq!(sent.lock().unwrap().as_slice(), ["final answer"]);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_reports_reaction_failure_even_when_fallback_text_arrives() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "final answer".to_string(),
+            0,
+            vec![pending_reaction(70, "👍")],
+            |_| async { Err("reaction rejected".to_string()) },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(73) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(
+            body["delivery_status"],
+            "fallback_delivered_reactions_failed"
+        );
+        assert_eq!(body["delivered_messages"], 1);
+        assert_eq!(body["requested_reactions"], 1);
+        assert_eq!(body["delivered_reactions"], 0);
+        assert_eq!(body["failed_reactions"], 1);
+        assert_eq!(body["reaction_errors"][0], "reaction rejected");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_accepts_confirmed_reaction_only_with_empty_final_reply() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "   ".to_string(),
+            0,
+            vec![pending_reaction(70, "👍")],
+            |_| async { Ok(()) },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(73) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivery_status"], "reaction_delivered");
+        assert_eq!(body["delivered_messages"], 0);
+        assert_eq!(body["requested_reactions"], 1);
+        assert_eq!(body["delivered_reactions"], 1);
+        assert_eq!(body["failed_reactions"], 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_splits_a_long_fallback_into_confirmed_chunks() {
+        let sent = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recorded = sent.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "x".repeat(5000),
+            0,
+            Vec::new(),
+            |_| async { Ok(()) },
+            move |text| {
+                let message_id = {
+                    let mut recorded = recorded.lock().unwrap();
+                    recorded.push(text);
+                    90 + recorded.len() as i64
+                };
+                async move { Ok(message_id) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["reply_chars"], 5000);
+        assert_eq!(body["delivery_status"], "fallback_delivered");
+        assert_eq!(body["delivered_messages"], 2);
+        assert_eq!(body["message_id"], 92);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|chunk| chunk.len() <= 4096));
+        assert_eq!(sent.concat(), "x".repeat(5000));
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_rejects_an_empty_undelivered_reply() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "   ".to_string(),
+            0,
+            Vec::new(),
+            |_| async { Ok(()) },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(99) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "empty_reply");
+        assert_eq!(body["delivered_messages"], 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_reports_fallback_send_failure() {
+        let response = finish_wake_delivery(
+            42,
+            "final answer".to_string(),
+            0,
+            Vec::new(),
+            |_| async { Ok(()) },
+            |_| async { Err("telegram offline".to_string()) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "fallback_failed");
+        assert_eq!(body["delivered_messages"], 0);
+        assert!(body["error"].as_str().unwrap().contains("telegram offline"));
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_partial_fallback_is_non_retry_after_confirmed_chunk() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            "x".repeat(5000),
+            0,
+            Vec::new(),
+            |_| async { Ok(()) },
+            move |_| {
+                let call = recorded.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call == 0 {
+                        Ok(91)
+                    } else {
+                        Err("telegram offline".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivery_status"], "fallback_partially_delivered");
+        assert_eq!(body["delivered_messages"], 1);
+        assert_eq!(body["message_id"], 91);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn wake_failure_notice_is_non_retry_after_confirmed_delivery() {
+        let sent = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recorded = sent.clone();
+
+        let response = finish_wake_failure(
+            42,
+            0,
+            Vec::new(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "turn_failed",
+            WAKE_TURN_FAILURE_MESSAGE,
+            "turn failed: provider disconnected".to_string(),
+            |_| async { Ok(()) },
+            move |text| {
+                recorded.lock().unwrap().push(text);
+                async { Ok(81) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], false);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivery_status"], "turn_failed_notice_delivered");
+        assert_eq!(body["delivered_messages"], 1);
+        assert_eq!(body["message_id"], 81);
+        assert_eq!(sent.lock().unwrap().as_slice(), [WAKE_TURN_FAILURE_MESSAGE]);
+    }
+
+    #[tokio::test]
+    async fn wake_timeout_and_limit_notices_are_non_retry_after_confirmed_delivery() {
+        for (turn_status, failure_kind) in [
+            (StatusCode::GATEWAY_TIMEOUT, "turn_timeout"),
+            (StatusCode::TOO_MANY_REQUESTS, "limit"),
+        ] {
+            let response = finish_wake_failure(
+                42,
+                0,
+                Vec::new(),
+                turn_status,
+                failure_kind,
+                WAKE_TURN_FAILURE_MESSAGE,
+                format!("{failure_kind} reached"),
+                |_| async { Ok(()) },
+                |_| async { Ok(82) },
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["success"], false);
+            assert_eq!(body["turn_completed"], false);
+            assert_eq!(body["delivered"], true);
+            assert_eq!(
+                body["delivery_status"],
+                format!("{failure_kind}_notice_delivered")
+            );
+            assert_eq!(body["delivered_messages"], 1);
+            assert_eq!(body["message_id"], 82);
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_failure_does_not_duplicate_after_guard_confirmed_tool_delivery() {
+        let notification_calls = Arc::new(AtomicUsize::new(0));
+        let calls = notification_calls.clone();
+        let reaction_calls = Arc::new(AtomicUsize::new(0));
+        let reactions = reaction_calls.clone();
+        let delivery_guard = Arc::new(StdMutex::new(TelegramTurnGuard::new()));
+        {
+            let mut guard = delivery_guard.lock().unwrap();
+            guard.record_visible_message();
+            guard.queue_pending_reaction(42, 70, "👍");
+        }
+        let guard_delivery = take_wake_guard_delivery(&delivery_guard).unwrap();
+
+        let response = finish_wake_failure(
+            42,
+            guard_delivery.tool_messages_sent,
+            guard_delivery.pending_reactions,
+            StatusCode::GATEWAY_TIMEOUT,
+            "turn_timeout",
+            WAKE_TURN_TIMEOUT_MESSAGE,
+            "turn timed out after 240 seconds".to_string(),
+            move |_| {
+                reactions.fetch_add(1, Ordering::SeqCst);
+                async { Err("reaction rejected".to_string()) }
+            },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(99) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], false);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(
+            body["delivery_status"],
+            "turn_timeout_after_tool_delivery_reactions_failed"
+        );
+        assert_eq!(body["delivered_messages"], 1);
+        assert_eq!(body["requested_reactions"], 1);
+        assert_eq!(body["delivered_reactions"], 0);
+        assert_eq!(body["failed_reactions"], 1);
+        assert_eq!(reaction_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(notification_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_failure_reports_notification_send_failure() {
+        let response = finish_wake_failure(
+            42,
+            0,
+            Vec::new(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "turn_timeout",
+            WAKE_TURN_TIMEOUT_MESSAGE,
+            "turn timed out after 240 seconds".to_string(),
+            |_| async { Ok(()) },
+            |_| async { Err("telegram offline".to_string()) },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], false);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "turn_timeout_notice_failed");
+        assert_eq!(body["delivered_messages"], 0);
+        assert!(body["error"].as_str().unwrap().contains("telegram offline"));
+    }
+
+    #[tokio::test]
+    async fn wake_turn_timeout_is_bounded() {
+        let result =
+            run_wake_turn_with_timeout(Duration::from_millis(1), std::future::pending::<()>())
+                .await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wake_turn_and_delivery_budgets_finish_before_the_scheduler_deadline() {
+        assert!(
+            WAKE_TURN_TIMEOUT + WAKE_DELIVERY_TIMEOUT < Duration::from_secs(300),
+            "the endpoint needs time to serialize its response before the 300s caller deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_budget_reports_an_unconfirmed_timeout() {
+        let progress = Arc::new(WakeDeliveryProgress::new(0, 0));
+        let response = run_wake_delivery_with_timeout(
+            Duration::from_millis(1),
+            42,
+            12,
+            true,
+            "fallback",
+            progress,
+            std::future::pending::<Response>(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "fallback_delivery_timeout");
+        assert_eq!(body["delivered_messages"], 0);
+    }
+
+    #[tokio::test]
+    async fn wake_delivery_budget_preserves_confirmed_partial_progress() {
+        let progress = Arc::new(WakeDeliveryProgress::new(1, 0));
+        let response = run_wake_delivery_with_timeout(
+            Duration::from_millis(1),
+            42,
+            5000,
+            true,
+            "fallback",
+            progress,
+            std::future::pending::<Response>(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(
+            body["delivery_status"],
+            "fallback_delivery_timeout_after_partial_delivery"
+        );
+        assert_eq!(body["delivered_messages"], 1);
+    }
+
+    #[tokio::test]
+    async fn wake_reactions_and_fallback_share_one_delivery_timeout_budget() {
+        let progress = Arc::new(WakeDeliveryProgress::new(0, 1));
+        let reaction_progress = progress.clone();
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+        let delivery = finish_wake_delivery(
+            42,
+            "fallback answer".to_string(),
+            0,
+            vec![pending_reaction(70, "👍")],
+            move |_| {
+                reaction_progress.record_reaction();
+                async { Ok(()) }
+            },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<std::result::Result<i64, String>>()
+            },
+        );
+
+        let response = run_wake_delivery_with_timeout(
+            Duration::from_millis(1),
+            42,
+            15,
+            true,
+            "fallback",
+            progress,
+            delivery,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], true);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(
+            body["delivery_status"],
+            "fallback_delivery_timeout_after_partial_delivery"
+        );
+        assert_eq!(body["delivered_messages"], 0);
+        assert_eq!(body["requested_reactions"], 1);
+        assert_eq!(body["delivered_reactions"], 1);
+        assert_eq!(body["failed_reactions"], 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
