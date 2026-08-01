@@ -244,7 +244,8 @@ impl<'a> ToolRegistry<'a> {
         self.tools()
             .into_iter()
             .filter(|tool| {
-                self.is_initial_tool(tool.name.as_str()) || active_tools.contains(tool.name.as_str())
+                self.is_initial_tool(tool.name.as_str())
+                    || active_tools.contains(tool.name.as_str())
             })
             .collect()
     }

@@ -193,9 +193,12 @@ static OPEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// pid is still running. Linux-only pid probe (/proc) — on other platforms we
 /// report None and `open` behaves as before (hosted runtimes are linux).
 pub fn live_session(state_dir: &Path, name: &str) -> Option<Value> {
-    let raw =
-        std::fs::read_to_string(state_dir.join("browser-sessions").join(format!("{name}.json")))
-            .ok()?;
+    let raw = std::fs::read_to_string(
+        state_dir
+            .join("browser-sessions")
+            .join(format!("{name}.json")),
+    )
+    .ok()?;
     let info = serde_json::from_str::<Value>(&raw).ok()?;
     let pid = info.get("pid").and_then(Value::as_u64)?;
     if !cfg!(target_os = "linux") || !Path::new(&format!("/proc/{pid}")).exists() {

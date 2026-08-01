@@ -36,14 +36,14 @@ let chat_req = ChatRequest::new(vec![
 
 // Model names can even have a reasoning effort suffix, such as "-high", which will be set, and then removed from name when sent to the provider.
 let chat_res = client.exec_chat("gpt-5.4-mini-high", chat_req, None).await?;
-	
+
 println!("{}", chat_res.first_text().unwrap_or("NO ANSWER"));
-	
+
 ```
 
 [Docs for LLMs](docs/for-llm/api-reference-for-llm.md) | [CHANGELOG](CHANGELOG.md) | [BIG THANKS](BIG-THANKS.md)
 
-## v0.6.x Released 🎉 
+## v0.6.x Released 🎉
 
 New provider since v0.6.0: `minimax`
 

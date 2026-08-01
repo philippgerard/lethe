@@ -145,12 +145,7 @@ async fn fast(bin: Bin, sd: &Path, argv: &[String]) -> String {
 /// `fast` for the browser CLI, with the dead-session check applied to the result.
 /// Every page-touching verb goes through here so a profile that has been signed
 /// out is reported the first time anything notices, whichever verb noticed.
-async fn browser_fast(
-    r: &ToolRegistry<'_>,
-    sd: &Path,
-    argv: &[String],
-    profile: &str,
-) -> String {
+async fn browser_fast(r: &ToolRegistry<'_>, sd: &Path, argv: &[String], profile: &str) -> String {
     note_session_expired(fast(Bin::Browser, sd, argv).await, hub_of(r), profile)
 }
 
@@ -1021,7 +1016,10 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         name: "alien_browser_open",
         description: "Start the persistent Alien browser and optionally navigate in the same call. When MCP or API operations covering the task are available (e.g. connectors_search / connectors_execute on deployments that have them), prefer them over the browser: they call the service's API directly and are faster and more reliable than driving web pages — browse only for what no operation covers. The shared `main` profile is created automatically as an anonymous L0 profile on first use, so public pages need no login/setup. Returns once ready; use the typed form tools for forms and alien_browser_act for other actions.",
         params: &[
-            p_str("name", "Session name (default 'main'). Only 'main' auto-creates; any other name must match a profile sealed by alien_browser_login/auto_login, else open fails with NO_PROFILE. For public browsing omit this."),
+            p_str(
+                "name",
+                "Session name (default 'main'). Only 'main' auto-creates; any other name must match a profile sealed by alien_browser_login/auto_login, else open fails with NO_PROFILE. For public browsing omit this.",
+            ),
             p_str("url", "Optional http(s) URL to open immediately."),
             p_bool("headed", "Show the window (requires a GUI session)."),
         ],
@@ -1032,9 +1030,18 @@ pub const TOOL_DEFS: &[ToolDef] = &[
         name: "alien_browser_request_viewport",
         description: "Ask the OWNER to take over the browser on their own device, and stop. Call this — and nothing else — whenever a result carries `action: \"owner_must_drive\"`: a bot challenge, or a sign-in the provider will not let an agent complete (Google/Microsoft SSO). Those cannot be solved by any stored credential, so do NOT retry the login, do NOT call alien_browser_login, and do NOT ask for a password (an account created via 'Sign in with Google' has none). Raises a card on the owner's client; they finish the sign-in there and tell you when done.",
         params: &[
-            p_str("name", "Session name whose browser the owner should drive (default 'main')."),
-            p_str("reason", "Why a human is needed: bot_challenge, idp_refuses_automation, no_display, or device_approval."),
-            p_str("what_to_do", "One sentence telling the owner exactly what to do in the browser view, e.g. 'Sign in to Google, then close the view.'"),
+            p_str(
+                "name",
+                "Session name whose browser the owner should drive (default 'main').",
+            ),
+            p_str(
+                "reason",
+                "Why a human is needed: bot_challenge, idp_refuses_automation, no_display, or device_approval.",
+            ),
+            p_str(
+                "what_to_do",
+                "One sentence telling the owner exactly what to do in the browser view, e.g. 'Sign in to Google, then close the view.'",
+            ),
         ],
         category: ToolCategory::AgentIdBrowser,
         execute: ToolExecutor::Async(exec_browser_request_viewport),
@@ -1363,7 +1370,11 @@ mod browser_reauth_tests {
         .await;
 
         let reauth: Vec<_> = events.iter().filter(|(e, _)| e == REAUTH_EVENT).collect();
-        assert_eq!(reauth.len(), 1, "expected one {REAUTH_EVENT}, got {events:?}");
+        assert_eq!(
+            reauth.len(),
+            1,
+            "expected one {REAUTH_EVENT}, got {events:?}"
+        );
         let data = &reauth[0].1;
         // The client needs to know WHICH login to redo.
         assert_eq!(data.get("profile").and_then(Value::as_str), Some("google"));

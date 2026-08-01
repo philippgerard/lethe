@@ -18,8 +18,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify source
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install mold
+        run: curl -fsSL https://github.com/rui314/mold/releases/download/v2.41.0/mold-2.41.0-x86_64-linux.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-on-failure: "true"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check release scripts
+        run: bash -n install.sh update.sh scripts/package-release
+
+      - name: Test Lethe
+        env:
+          LETHE_HOME: ${{ runner.temp }}/lethe-home
+        run: cargo test --locked --no-default-features
+
+      - name: Test vendored genai library
+        run: cargo test --locked --manifest-path vendor/genai/Cargo.toml --lib
+
   build:
     name: Build ${{ matrix.name }}
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -62,9 +96,18 @@ jobs:
         with:
           workspaces: .
           cache-on-failure: "true"
+          cache-directories: |
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/ort.pyke.io
 
       - name: Install native dependencies
         run: ${{ matrix.deps }}
+
+      # ort-sys stores its downloaded static library outside target/. A restored
+      # Cargo build-script result can otherwise keep a stale -L path after that
+      # external cache was evicted.
+      - name: Refresh ONNX Runtime link metadata
+        run: cargo clean -p ort-sys
 
       - name: Build lethe
         run: cargo build --release --locked --bin lethe

@@ -148,12 +148,17 @@ fn hosted_tools_replace_local_defs_and_join_requestable_groups() {
 
     let all = registry.tools();
     assert_eq!(
-        all.iter().filter(|tool| tool.name.as_str() == "todo_list").count(),
+        all.iter()
+            .filter(|tool| tool.name.as_str() == "todo_list")
+            .count(),
         1,
         "remote todo_list must replace, not duplicate, the local schema"
     );
     assert!(all.iter().any(|tool| tool.name.as_str() == "todo_reopen"));
-    assert!(!all.iter().any(|tool| tool.name.as_str() == "todo_remind_check"));
+    assert!(
+        !all.iter()
+            .any(|tool| tool.name.as_str() == "todo_remind_check")
+    );
     assert_eq!(
         registry.group_siblings("todo_list"),
         vec!["todo_reopen".to_string()]

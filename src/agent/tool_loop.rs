@@ -157,9 +157,7 @@ fn clamp_chat_request_to_budget(
         let exchange_end = request.messages[exchange_start + 1..]
             .iter()
             .position(|message| message.role == ChatRole::Assistant)
-            .map_or(request.messages.len(), |offset| {
-                exchange_start + 1 + offset
-            });
+            .map_or(request.messages.len(), |offset| exchange_start + 1 + offset);
         dropped += exchange_end - exchange_start;
         request.messages.drain(exchange_start..exchange_end);
     }
@@ -787,10 +785,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 .router
                 .read()
                 .map_err(|error| AgentError::Llm(anyhow!("router lock poisoned: {error}")))?;
-            if router.config().has_tool_model()
-                && !tool_model_disabled
-                && !using_deep_model
-            {
+            if router.config().has_tool_model() && !tool_model_disabled && !using_deep_model {
                 tracing::info!(
                     tool_model = %router.config().tool_model(),
                     "tool call detected — switching to the tool model for the rest of the chain"

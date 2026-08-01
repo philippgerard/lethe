@@ -2775,7 +2775,11 @@ mod tests {
         let request = crate::llm::build_chat_request(messages);
         for (index, message) in request.messages.iter().enumerate() {
             assert!(
-                message.options.as_ref().and_then(|o| o.cache_control.as_ref()).is_none(),
+                message
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.cache_control.as_ref())
+                    .is_none(),
                 "message {index} must stay unmarked — Moonshot caches automatically"
             );
         }

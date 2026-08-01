@@ -112,7 +112,9 @@ pub fn dialect_for_model(model_id: &str) -> Box<dyn PromptDialect> {
         // OpenRouter is a relay, and it forwards cache_control to the upstream
         // provider rather than dropping it — so the dialect is decided by the
         // vendor actually serving the model, not by OpenRouter itself.
-        Some("openrouter") => openrouter_dialect(model_id).unwrap_or_else(|| Box::new(DefaultDialect)),
+        Some("openrouter") => {
+            openrouter_dialect(model_id).unwrap_or_else(|| Box::new(DefaultDialect))
+        }
         _ => Box::new(DefaultDialect),
     }
 }
@@ -174,7 +176,10 @@ mod tests {
                 Some(CacheHint::Ephemeral),
                 "{model} needs an explicit breakpoint"
             );
-            assert_eq!(dialect.cache_marker_for_volatile(), Some(CacheHint::Ephemeral));
+            assert_eq!(
+                dialect.cache_marker_for_volatile(),
+                Some(CacheHint::Ephemeral)
+            );
         }
     }
 

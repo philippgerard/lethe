@@ -12,7 +12,7 @@
 //! - Models: `glm-4.6`, `glm-4.5`, etc.
 //! - Usage: Standard API calls billed per token
 //!
-//! ### Coding Plan (Subscription-based only with the `zai_coding::` namepace)  
+//! ### Coding Plan (Subscription-based only with the `zai_coding::` namepace)
 //! - Endpoint: `<https://api.z.ai/api/coding/paas/v4/>`
 //! - Models: `zai_coding::glm-4.6`, `zai_coding::glm-4.5`, etc.
 //! - Usage: Fixed monthly subscription for coding tasks

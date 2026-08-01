@@ -1792,15 +1792,14 @@ mod tests {
         // Passes ONLY via the suppression branch: with no queued reactions the
         // function must return before any Telegram API call — an attempted
         // send would dial api.telegram.org with a bogus token and error out.
-        let delivered = send_guarded_telegram_final_response(
-            &client,
-            99,
-            "reworded wrap-up",
-            guard,
-        )
-            .await
-            .expect("final text suppressed without dialing");
-        assert!(!delivered, "suppressed text must not be broadcast as delivered");
+        let delivered =
+            send_guarded_telegram_final_response(&client, 99, "reworded wrap-up", guard)
+                .await
+                .expect("final text suppressed without dialing");
+        assert!(
+            !delivered,
+            "suppressed text must not be broadcast as delivered"
+        );
     }
 
     fn test_settings(root: &std::path::Path) -> Settings {

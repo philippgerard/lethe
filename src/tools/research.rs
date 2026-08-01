@@ -711,10 +711,7 @@ mod tests {
             true,
         );
         let runtime = ActorRuntime::new(actors);
-        let observed = Arc::new(Mutex::new(Vec::<(
-            String,
-            ActorCompletionDelivery,
-        )>::new()));
+        let observed = Arc::new(Mutex::new(Vec::<(String, ActorCompletionDelivery)>::new()));
         let observed_by_executor = observed.clone();
         runtime
             .install_turn_executor(Arc::new(move |spec, runtime| {

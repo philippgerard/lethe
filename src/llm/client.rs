@@ -1594,7 +1594,10 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
                 // apply_cache_markers in agent.rs survive the OAuth path.
                 // Without this every heartbeat re-pays the full system
                 // prompt as fresh input.
-                let cache = message.options.as_ref().and_then(|o| o.cache_control.as_ref());
+                let cache = message
+                    .options
+                    .as_ref()
+                    .and_then(|o| o.cache_control.as_ref());
                 let prev_len = system_blocks.len();
                 for text in message.content.texts() {
                     if !text.trim().is_empty() {
@@ -1864,9 +1867,7 @@ fn drop_leading_non_user_messages(messages: &mut Vec<Value>) {
                 if index > 0 {
                     messages.drain(0..index);
                 }
-                if let Some(content) = messages[0]
-                    .get_mut("content")
-                    .and_then(Value::as_array_mut)
+                if let Some(content) = messages[0].get_mut("content").and_then(Value::as_array_mut)
                     && content.iter().any(|block| {
                         block.get("type").and_then(Value::as_str) == Some("tool_result")
                     })
@@ -2891,9 +2892,13 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"][0]["text"], "real user message");
-        assert!(messages[0]["content"].as_array().unwrap().iter().all(
-            |block| block["type"] != "tool_result"
-        ));
+        assert!(
+            messages[0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "tool_result")
+        );
     }
 
     #[test]
@@ -2934,7 +2939,11 @@ mod tests {
     fn direct_openai_gpt5_routes_to_the_responses_adapter() {
         // gpt-5 reasoning models reject function tools on /v1/chat/completions
         // and must go to /v1/responses, which supports tools + reasoning.
-        for model in ["openai/gpt-5.6-terra", "openai/gpt-5.5", "openai/gpt-5.4-mini"] {
+        for model in [
+            "openai/gpt-5.6-terra",
+            "openai/gpt-5.5",
+            "openai/gpt-5.4-mini",
+        ] {
             let config = config_for(model, "");
             let target = router_target_for_model(model, &config).unwrap();
             assert_eq!(
@@ -2952,7 +2961,11 @@ mod tests {
         for model in ["openai/gpt-5-chat-latest", "openai/gpt-4o"] {
             let config = config_for(model, "");
             let target = router_target_for_model(model, &config).unwrap();
-            assert_eq!(target.adapter, AdapterKind::OpenAI, "{model} must stay on chat completions");
+            assert_eq!(
+                target.adapter,
+                AdapterKind::OpenAI,
+                "{model} must stay on chat completions"
+            );
         }
     }
 

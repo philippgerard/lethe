@@ -851,10 +851,7 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
                 .await;
             // Durable mirror of the final reply so a reloaded/second tab
             // renders it live (reuses the UI's existing `message` handler).
-            state.broadcast_events(
-                "message",
-                json!({"role": "assistant", "content": message}),
-            );
+            state.broadcast_events("message", json!({"role": "assistant", "content": message}));
         }
         Ok(_) => {}
         Err(error) if !context.interrupt.is_interrupted() => {
@@ -1560,7 +1557,10 @@ mod tests {
         assert!(telegram.guard.is_none());
         assert!(!telegram.dry_run);
         assert!(telegram.sent_messages.is_none());
-        assert!(runtime.observer.is_some(), "deep-model notice/typing observer");
+        assert!(
+            runtime.observer.is_some(),
+            "deep-model notice/typing observer"
+        );
         assert_eq!(
             runtime
                 .secure_prompt

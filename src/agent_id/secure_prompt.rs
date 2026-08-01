@@ -290,7 +290,10 @@ async fn handle_conn(hub: SecurePromptHub, stream: UnixStream) -> std::io::Resul
     // own app, so the browser child needs to tell the owner and keep waiting,
     // not ask them to type anything here.
     if spec.get("kind").and_then(Value::as_str) == Some("notice") {
-        let event = spec.get("event").and_then(Value::as_str).unwrap_or_default();
+        let event = spec
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         // Scope what a child may raise to its own namespace, so a compromised
         // CLI cannot forge identity or secure-input lifecycle events.
         if !event.starts_with("browser.") {

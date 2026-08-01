@@ -41,15 +41,15 @@ _If I forgot your PR, feel free to submit a PR_
   - [#161](https://github.com/jeremychone/rust-genai/pull/161) Gemini usage-only stream tail fix
   - [#160](https://github.com/jeremychone/rust-genai/pull/160) expose provider stop_reason in chat responses
   - [#159](https://github.com/jeremychone/rust-genai/pull/159) OpenAI SSE error payload surfacing in streaming
-- [xiao-e-yun](https://github.com/xiao-e-yun) 
+- [xiao-e-yun](https://github.com/xiao-e-yun)
   - [#230](https://github.com/jeremychone/rust-genai/pull/230) add OpenRouter adapter support
   - [#219](https://github.com/jeremychone/rust-genai/pull/219) refactor gemini adapter reasoning effort support
-- [RouHim](https://github.com/RouHim) 
+- [RouHim](https://github.com/RouHim)
   - [#228](https://github.com/jeremychone/rust-genai/pull/228) add AIHubMix adapter support
   - [#214](https://github.com/jeremychone/rust-genai/pull/214) add OpenCodeGo adapter support
   - [#204](https://github.com/jeremychone/rust-genai/pull/204) refactor(ollama) extract shared functions
   - [#198](https://github.com/jeremychone/rust-genai/pull/198) add GitHub Copilot (GitHub Models API) adapter
-- [fortunto2](https://github.com/fortunto2) 
+- [fortunto2](https://github.com/fortunto2)
   - [#177](https://github.com/jeremychone/rust-genai/pull/177) HTTP optimizations, gzip, TCP_NODELAY, and HTTP/2 tuning
   - [#168](https://github.com/jeremychone/rust-genai/pull/168) stateful sessions support
   - [#169](https://github.com/jeremychone/rust-genai/pull/169) OpenAIResp `instructions` system prompt support
@@ -58,30 +58,30 @@ _If I forgot your PR, feel free to submit a PR_
 - [clayrosenthal](https://github.com/clayrosenthal) - [#215](https://github.com/jeremychone/rust-genai/pull/215) add support for bedrock inference
 - [narcilee7](https://github.com/narcilee7) - [#221](https://github.com/jeremychone/rust-genai/pull/221) add Moonshot AI adapter
 - [zhangzhenhu](https://github.com/zhangzhenhu) - [#216](https://github.com/jeremychone/rust-genai/pull/216) add chat extra_body passthrough
-- [BinaryMuse](https://github.com/BinaryMuse) 
+- [BinaryMuse](https://github.com/BinaryMuse)
   - [#156](https://github.com/jeremychone/rust-genai/pull/156) thread auth resolver through `all_model_names()`
   - [#154](https://github.com/jeremychone/rust-genai/pull/154) add `reasoning_content` content part
-- [aldiyen](https://github.com/aldiyen) 
+- [aldiyen](https://github.com/aldiyen)
   - [#194](https://github.com/jeremychone/rust-genai/pull/194) add JSON schema support in Anthropic adapter
   - [#184](https://github.com/jeremychone/rust-genai/pull/184) add Google Vertex adapter with Gemini and Anthropic support
-- [Borber](https://github.com/Borber) 
+- [Borber](https://github.com/Borber)
   - [#166](https://github.com/jeremychone/rust-genai/pull/166) OpenAI prompt cache options in ChatOptions
   - [#165](https://github.com/jeremychone/rust-genai/pull/165) add xhigh reasoning effort mapping
   - [#164](https://github.com/jeremychone/rust-genai/pull/164) keep delta content co-located with finish_reason in openai-streamer
-- [vagmi](https://github.com/vagmi) 
+- [vagmi](https://github.com/vagmi)
   - [#232](https://github.com/jeremychone/rust-genai/pull/232) use Gemini returned `call_id` for function calling
   - [#218](https://github.com/jeremychone/rust-genai/pull/218) simplify Gemini streamer
   - [#141](https://github.com/jeremychone/rust-genai/pull/141) add streaming support for the OpenAI Responses API
   - [#125](https://github.com/jeremychone/rust-genai/pull/125) add separate reasoning content and thought signature for Anthropic messages API
   - [#121](https://github.com/jeremychone/rust-genai/pull/121) include thoughts and capture thoughts as reasoning content
-- [vintcessun](https://github.com/vintcessun) 
+- [vintcessun](https://github.com/vintcessun)
   -  [#146](https://github.com/jeremychone/rust-genai/pull/146) Gemini image generation and binary response parsing
   - [#144](https://github.com/jeremychone/rust-genai/pull/144) Ollama native API support
   - [#142](https://github.com/jeremychone/rust-genai/pull/142) Gemini tool serialization camelCase fix
-- [Himmelschmidt](https://github.com/Himmelschmidt) 
+- [Himmelschmidt](https://github.com/Himmelschmidt)
   - [#111](https://github.com/jeremychone/rust-genai/pull/111) Gemini `responseJsonSchema` support
   - [#103](https://github.com/jeremychone/rust-genai/pull/103) capture response body in ResponseFailedNotJson error
-- [wangxuwei](https://github.com/wangxuwei) 
+- [wangxuwei](https://github.com/wangxuwei)
   - [#222](https://github.com/jeremychone/rust-genai/pull/222) add support for baidu provider
   - [#143](https://github.com/jeremychone/rust-genai/pull/143) add aliyun provider
 - [Dridus](https://github.com/Dridus) - [#136](https://github.com/jeremychone/rust-genai/pull/136) fix `MessageContent::joined_texts` for multiple text parts
