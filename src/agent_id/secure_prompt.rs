@@ -817,14 +817,36 @@ mod tests {
     async fn unauthorized_peer_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("sp.sock");
-        let (hub, _events) = test_hub(socket.clone());
+        let (hub, events) = test_hub(socket.clone());
         let listener = hub.bind().unwrap();
         tokio::spawn(serve(hub.clone(), listener));
 
-        // Do NOT authorize our PID: a forged prompt (agent's own `curl`) is
-        // rejected before any card is surfaced.
-        let (status, _body) = cli_post(&socket, "{\"title\":\"forged\"}").await;
-        assert_eq!(status, 403);
+        // Do NOT authorize our PID. Authorization happens before request bytes
+        // are read, so merely connecting must produce a complete forbidden
+        // response. Sending a body here would make Linux legitimately reset the
+        // socket when the server closes with those bytes still unread.
+        let mut client = UnixStream::connect(&socket).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            AUTHORIZE_WAIT + Duration::from_secs(1),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("unauthorized peer was not refused before request bytes")
+        .expect("failed to read forbidden response");
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .expect("complete HTTP response");
+        assert!(
+            head.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "response: {response}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"error": "forbidden"})
+        );
+        assert!(events.lock().unwrap().is_empty());
         assert!(hub.list_pending().is_empty());
     }
 
