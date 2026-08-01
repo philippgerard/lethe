@@ -1146,6 +1146,33 @@ struct WakeRequest {
     chat_id: Option<i64>,
 }
 
+fn resolve_wake_chat_id(settings: &Settings, requested: Option<i64>) -> Option<i64> {
+    requested
+        .or_else(|| settings.telegram.allowed_user_ids.first().copied())
+        .filter(|chat_id| *chat_id != 0)
+}
+
+fn wake_tool_runtime(
+    token: String,
+    chat_id: i64,
+    secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
+) -> ToolRuntime {
+    ToolRuntime {
+        telegram: Some(TelegramToolContext {
+            token: token.clone(),
+            chat_id,
+            user_id: Some(chat_id),
+            last_message_id: None,
+            guard: None,
+            dry_run: false,
+            sent_messages: None,
+        }),
+        observer: Some(Arc::new(TelegramTypingObserver::new(token, chat_id))),
+        secure_prompt,
+        ..ToolRuntime::default()
+    }
+}
+
 /// Proactive wake: run ONE agent turn bound to the real Telegram egress, so an
 /// external scheduler (cron-mcp) can trigger a brief that actually reaches the
 /// user.
@@ -1175,11 +1202,7 @@ async fn wake(
             "Telegram bot token is not configured",
         );
     }
-    let chat_id = body
-        .chat_id
-        .or_else(|| state.settings.telegram.allowed_user_ids.first().copied())
-        .unwrap_or(0);
-    if chat_id == 0 {
+    let Some(chat_id) = resolve_wake_chat_id(&state.settings, body.chat_id) else {
         return json_error(
             StatusCode::BAD_REQUEST,
             "no chat_id given and no allowed user configured to deliver to",
@@ -1198,20 +1221,7 @@ async fn wake(
             );
         }
     };
-    let runtime = ToolRuntime {
-        telegram: Some(TelegramToolContext {
-            token: token.clone(),
-            chat_id,
-            user_id: Some(chat_id),
-            last_message_id: None,
-            guard: None,
-            dry_run: false,
-            sent_messages: None,
-        }),
-        observer: Some(Arc::new(TelegramTypingObserver::new(token, chat_id))),
-        secure_prompt: state.secure_prompt.clone(),
-        ..ToolRuntime::default()
-    };
+    let runtime = wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
     let req = TurnRequest::new(&body.message).with_runtime(runtime);
 
     match state.agent.chat_once(req).await {
@@ -1296,6 +1306,24 @@ mod tests {
         settings
     }
 
+    fn authenticated_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        headers
+    }
+
+    async fn assert_json_error(response: Response, status: StatusCode, message: &str) {
+        assert_eq!(response.status(), status);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], message);
+    }
+
     #[test]
     fn presented_token_prefers_bearer_then_custom_header() {
         let mut headers = HeaderMap::new();
@@ -1332,6 +1360,119 @@ mod tests {
         let event = ApiEvent::new("text", json!({"content": "hello"}));
         assert_eq!(event.event, "text");
         assert_eq!(event.data["content"], "hello");
+    }
+
+    #[test]
+    fn wake_target_prefers_explicit_chat_then_configured_user() {
+        let tmp = tempdir().unwrap();
+        let mut settings = test_settings(tmp.path());
+        settings.telegram.allowed_user_ids = vec![42];
+
+        assert_eq!(resolve_wake_chat_id(&settings, Some(99)), Some(99));
+        assert_eq!(resolve_wake_chat_id(&settings, None), Some(42));
+        assert_eq!(resolve_wake_chat_id(&settings, Some(0)), None);
+
+        settings.telegram.allowed_user_ids.clear();
+        assert_eq!(resolve_wake_chat_id(&settings, None), None);
+    }
+
+    #[test]
+    fn wake_runtime_binds_telegram_observer_and_secure_prompt() {
+        let tmp = tempdir().unwrap();
+        let hub = crate::agent_id::secure_prompt::SecurePromptHub::new(
+            tmp.path().join("secure-prompt.sock"),
+            Arc::new(|_, _| {}),
+        );
+
+        let runtime = wake_tool_runtime("telegram-token".to_string(), 42, Some(hub.clone()));
+        let telegram = runtime.telegram.as_ref().expect("telegram egress");
+
+        assert_eq!(telegram.token, "telegram-token");
+        assert_eq!(telegram.chat_id, 42);
+        assert_eq!(telegram.user_id, Some(42));
+        assert_eq!(telegram.last_message_id, None);
+        assert!(telegram.guard.is_none());
+        assert!(!telegram.dry_run);
+        assert!(telegram.sent_messages.is_none());
+        assert!(runtime.observer.is_some(), "deep-model notice/typing observer");
+        assert_eq!(
+            runtime
+                .secure_prompt
+                .as_ref()
+                .expect("secure-prompt hub")
+                .socket_path(),
+            hub.socket_path()
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_rejects_invalid_requests_before_starting_a_turn() {
+        let tmp = tempdir().unwrap();
+        let state = ApiState::from_settings(test_settings(tmp.path())).unwrap();
+
+        assert_json_error(
+            wake(
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(WakeRequest {
+                    message: "morning brief".to_string(),
+                    chat_id: Some(42),
+                }),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        )
+        .await;
+
+        assert_json_error(
+            wake(
+                State(state.clone()),
+                authenticated_headers(),
+                Json(WakeRequest {
+                    message: "   ".to_string(),
+                    chat_id: Some(42),
+                }),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "message is required",
+        )
+        .await;
+
+        assert_json_error(
+            wake(
+                State(state),
+                authenticated_headers(),
+                Json(WakeRequest {
+                    message: "morning brief".to_string(),
+                    chat_id: Some(42),
+                }),
+            )
+            .await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Telegram bot token is not configured",
+        )
+        .await;
+
+        let mut settings = test_settings(tmp.path());
+        settings.telegram.bot_token = "telegram-token".to_string();
+        settings.telegram.allowed_user_ids.clear();
+        let state = ApiState::from_settings(settings).unwrap();
+        assert_json_error(
+            wake(
+                State(state),
+                authenticated_headers(),
+                Json(WakeRequest {
+                    message: "morning brief".to_string(),
+                    chat_id: None,
+                }),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "no chat_id given and no allowed user configured to deliver to",
+        )
+        .await;
     }
 
     #[tokio::test]

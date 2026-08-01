@@ -1758,9 +1758,12 @@ fn drop_leading_non_user_messages(messages: &mut Vec<Value>) {
     // `tool_use` blocks whose `tool_result`s are the *next* (user-role) message;
     // dropping that assistant orphans those results, and Anthropic 400s on a
     // leading `tool_result` with no preceding `tool_use`. So after draining to
-    // the first user message, drop it too if it still carries a tool_result (its
-    // producing assistant is gone), then re-scan. Each step removes at least one
-    // message, so this terminates. (Without the loop, the second call site —
+    // the first user message, strip any tool_result blocks whose producing
+    // assistant is now gone. Consecutive user-role messages are merged before
+    // this pass, so the same content array may also carry the next real user
+    // question; preserve those non-tool blocks rather than dropping the whole
+    // message. If no content remains, remove the message and re-scan. (Without
+    // the loop, the second call site —
     // after clean_orphaned_tool_pairs has shifted an assistant_tool_use to the
     // front — would re-orphan a tool_result with nothing left to clean it up.)
     loop {
@@ -1776,25 +1779,25 @@ fn drop_leading_non_user_messages(messages: &mut Vec<Value>) {
                 if index > 0 {
                     messages.drain(0..index);
                 }
-                if message_contains_tool_result(&messages[0]) {
-                    messages.remove(0);
-                    continue;
+                if let Some(content) = messages[0]
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)
+                    && content.iter().any(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                {
+                    content.retain(|block| {
+                        block.get("type").and_then(Value::as_str) != Some("tool_result")
+                    });
+                    if content.is_empty() {
+                        messages.remove(0);
+                        continue;
+                    }
                 }
                 return;
             }
         }
     }
-}
-
-fn message_contains_tool_result(message: &Value) -> bool {
-    message
-        .get("content")
-        .and_then(Value::as_array)
-        .is_some_and(|content| {
-            content
-                .iter()
-                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
-        })
 }
 
 fn merge_message_content(previous: &mut Value, next: &Value) {
@@ -2748,6 +2751,37 @@ mod tests {
                 .unwrap()
                 .contains("[Continue]")
         );
+    }
+
+    #[test]
+    fn anthropic_body_keeps_real_user_text_after_dropping_a_leading_tool_pair() {
+        let request = build_chat_request(vec![
+            LlmMessage::assistant_with_tool_calls(
+                "",
+                vec![HistoricalToolCall {
+                    call_id: "call_1".to_string(),
+                    fn_name: "calculator".to_string(),
+                    fn_arguments: serde_json::json!({"expression": "2+2"}),
+                    thought_signatures: None,
+                }],
+            ),
+            LlmMessage::tool_results(vec![HistoricalToolResponse {
+                call_id: "call_1".to_string(),
+                content: "4".to_string(),
+                source_message_id: None,
+            }]),
+            LlmMessage::user("real user message"),
+        ]);
+
+        let body = anthropic_request_body("claude-opus-4-6", request, &ChatOptions::default());
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "real user message");
+        assert!(messages[0]["content"].as_array().unwrap().iter().all(
+            |block| block["type"] != "tool_result"
+        ));
     }
 
     #[test]

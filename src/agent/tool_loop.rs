@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::actor::{ActorError, ActorRunSpec, ActorRuntime, ActorTurnExecutor, ModelTier};
 use crate::config::Settings;
-use crate::llm::{LlmAttachment, LlmMessage, LlmRouter, build_chat_request};
+use crate::llm::{LlmAttachment, LlmMessage, LlmRouter, LlmRouterConfig, build_chat_request};
 use crate::memory::MemoryStore;
 use crate::memory::MessageRole;
 use crate::tools::registry::{
@@ -366,7 +366,7 @@ pub(super) fn actor_turn_executor(
                 requested_tools: spec.requested_tools.clone(),
                 // A subagent spawned on the `deep` tier starts already escalated,
                 // so its whole turn runs on the powerful model.
-                start_escalated: spec.model == ModelTier::Deep,
+                start_escalated: actor_starts_escalated(spec.model),
                 ..ToolRuntime::default()
             };
             let messages = vec![
@@ -395,6 +395,28 @@ pub(super) fn actor_turn_executor(
             .map_err(|error| ActorError::Runtime(error.to_string()))
         })
     })
+}
+
+fn actor_starts_escalated(model: ModelTier) -> bool {
+    model == ModelTier::Deep
+}
+
+/// Select the model for the next call in a turn. Deep escalation has highest
+/// priority, followed by the dedicated tool-chain model, then the turn's base
+/// (main or auxiliary) model.
+fn select_turn_model(
+    config: &LlmRouterConfig,
+    use_aux: bool,
+    entered_tool_chain: bool,
+    escalated: bool,
+) -> (&str, bool) {
+    if escalated && config.has_deep_model() {
+        (config.deep_model(), true)
+    } else if entered_tool_chain && config.has_tool_model() {
+        (config.tool_model(), false)
+    } else {
+        (config.model_for(use_aux), false)
+    }
 }
 
 /// Run the LLM/tool loop end to end. Iterates up to [`MAX_TOOL_ITERATIONS`]
@@ -467,14 +489,9 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         // Model for this call, in priority order: an active deep-thinking
         // escalation wins; else the dedicated tool model once inside a tool
         // chain; else the base model selected by `use_aux` for this turn.
-        let using_deep_model = escalated && router.config().has_deep_model();
-        let model_id = if using_deep_model {
-            router.config().deep_model().to_string()
-        } else if entered_tool_chain && router.config().has_tool_model() {
-            router.config().tool_model().to_string()
-        } else {
-            router.config().model_for(use_aux).to_string()
-        };
+        let (model_id, using_deep_model) =
+            select_turn_model(router.config(), use_aux, entered_tool_chain, escalated);
+        let model_id = model_id.to_string();
         notify_power_mode_once(
             registry.turn_observer(),
             &model_id,
@@ -830,14 +847,9 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // The wrap-up reply is the user-facing answer, so honor the same priority as
     // the loop: a live escalation writes the final answer on the deep model; else
     // the tool model when we entered a tool chain; else the base model.
-    let wrap_uses_deep_model = escalated && router.config().has_deep_model();
-    let wrap_model = if wrap_uses_deep_model {
-        router.config().deep_model().to_string()
-    } else if entered_tool_chain && router.config().has_tool_model() {
-        router.config().tool_model().to_string()
-    } else {
-        router.config().model_for(use_aux).to_string()
-    };
+    let (wrap_model, wrap_uses_deep_model) =
+        select_turn_model(router.config(), use_aux, entered_tool_chain, escalated);
+    let wrap_model = wrap_model.to_string();
     notify_power_mode_once(
         registry.turn_observer(),
         &wrap_model,
@@ -1115,6 +1127,51 @@ pub(super) fn image_view_message(image: ImageView) -> ChatMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_routing_config() -> LlmRouterConfig {
+        LlmRouterConfig {
+            model: "main-model".to_string(),
+            aux_model: "aux-model".to_string(),
+            tool_model: "tool-model".to_string(),
+            deep_model: "deep-model".to_string(),
+            provider: String::new(),
+            api_base: String::new(),
+            max_output_tokens: 100,
+            temperature_millidegrees: 500,
+        }
+    }
+
+    #[test]
+    fn turn_model_selection_prioritizes_main_then_tool_then_deep() {
+        let config = model_routing_config();
+
+        assert_eq!(
+            select_turn_model(&config, false, false, false),
+            ("main-model", false)
+        );
+        assert_eq!(
+            select_turn_model(&config, false, true, false),
+            ("tool-model", false)
+        );
+        assert_eq!(
+            select_turn_model(&config, false, true, true),
+            ("deep-model", true)
+        );
+    }
+
+    #[test]
+    fn deep_tier_actor_starts_on_the_deep_model() {
+        let config = model_routing_config();
+        let start_escalated = actor_starts_escalated(ModelTier::Deep);
+
+        assert!(start_escalated);
+        assert!(!actor_starts_escalated(ModelTier::Main));
+        assert!(!actor_starts_escalated(ModelTier::Aux));
+        assert_eq!(
+            select_turn_model(&config, false, false, start_escalated),
+            ("deep-model", true)
+        );
+    }
 
     #[derive(Default)]
     struct RecordingObserver {

@@ -316,7 +316,16 @@ pub const TOOL_DEFS: &[ToolDef] = &[ToolDef {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
     use super::*;
+    use crate::actor::{ActorConfig, ActorRegistry, ActorRuntime, ActorToolCommand};
+    use crate::memory::MemoryStore;
+    use crate::tools::registry::ToolRuntime;
+    use crate::tools::shell::ShellTools;
 
     #[test]
     fn research_actors_use_poll_only_completion_delivery() {
@@ -332,6 +341,127 @@ mod tests {
         assert_eq!(
             request.completion_delivery,
             ActorCompletionDelivery::PollOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn research_orchestrator_keeps_every_internal_actor_poll_only() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let memory = MemoryStore::open(
+            &workspace,
+            tmp.path().join("data/lethe.db"),
+            workspace.join("notes"),
+        )
+        .unwrap();
+        let shell = ShellTools::new(&workspace);
+
+        let mut actors = ActorRegistry::new();
+        let principal = actors.spawn(
+            ActorConfig::new("cortex", "Serve the user").in_group("main"),
+            None,
+            true,
+        );
+        let runtime = ActorRuntime::new(actors);
+        let observed = Arc::new(Mutex::new(Vec::<(
+            String,
+            ActorCompletionDelivery,
+        )>::new()));
+        let observed_by_executor = observed.clone();
+        runtime
+            .install_turn_executor(Arc::new(move |spec, runtime| {
+                let observed = observed_by_executor.clone();
+                Box::pin(async move {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((spec.name.clone(), spec.completion_delivery));
+                    let result = if spec.name.starts_with("research-framer-") {
+                        r#"{"hypotheses":["first","second"]}"#.to_string()
+                    } else if spec.name.starts_with("research-judge-") {
+                        r#"{"verdict":"integrated"}"#.to_string()
+                    } else {
+                        format!("finding from {}", spec.name)
+                    };
+                    let _ = runtime
+                        .execute_actor_tool(ActorToolCommand::Terminate {
+                            actor_id: spec.actor_id,
+                            result: result.clone(),
+                            outcome: "success".to_string(),
+                            files_touched: String::new(),
+                            follow_up: String::new(),
+                        })
+                        .await;
+                    Ok(result)
+                })
+            }))
+            .unwrap();
+
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            &workspace,
+            tmp.path().join("cache"),
+            &shell,
+            ToolRuntime {
+                actor: Some(ActorToolContext {
+                    runtime: runtime.clone(),
+                    actor_id: principal.clone(),
+                    is_subagent: false,
+                }),
+                ..ToolRuntime::default()
+            },
+        );
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_research(
+                &registry,
+                &json!({
+                    "question": "Which hypothesis survives?",
+                    "n": 2,
+                    "depth": "shallow"
+                }),
+            ),
+        )
+        .await
+        .expect("research orchestration completed");
+
+        assert_eq!(output, r#"{"verdict":"integrated"}"#);
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.len(), 4, "framer + two hypotheses + judge");
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(name, _)| name.starts_with("research-framer-"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(name, _)| name.starts_with("research-hyp-"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(name, _)| name.starts_with("research-judge-"))
+                .count(),
+            1
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|(_, delivery)| *delivery == ActorCompletionDelivery::PollOnly)
+        );
+        drop(observed);
+        assert!(runtime.pop_inbox(&principal).await.is_none());
+        assert!(
+            runtime
+                .principal_task_update_events(&principal, 10)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }

@@ -196,7 +196,15 @@ pub async fn spawn_daemon_ready(
     // drops.
     cmd.kill_on_drop(false);
     cmd.args(args);
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    wait_daemon_ready(child, log_path, Duration::from_secs(90)).await
+}
+
+async fn wait_daemon_ready(
+    mut child: tokio::process::Child,
+    log_path: PathBuf,
+    ready_timeout: Duration,
+) -> Result<Value, String> {
     let stdout = child
         .stdout
         .take()
@@ -211,7 +219,7 @@ pub async fn spawn_daemon_ready(
     // Terminal outcome from the daemon's first meaningful stdout line: Ok(ready
     // value), or Err(the daemon's own {ok:false,...} message). None = stdout
     // closed with no verdict (the daemon died); we then read stderr for why.
-    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+    let outcome = tokio::time::timeout(ready_timeout, async {
         while let Ok(Some(line)) = reader.next_line().await {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -287,5 +295,58 @@ pub async fn spawn_daemon_ready(
                 Err(format!("browser daemon closed before ready: {tail}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_hub(path: PathBuf) -> SecurePromptHub {
+        SecurePromptHub::new(path, Arc::new(|_, _| {}))
+    }
+
+    #[test]
+    fn deauthorize_guard_removes_pid_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = test_hub(dir.path().join("secure-prompt.sock"));
+        let pid = 42_424;
+        hub.authorize(pid);
+        assert!(hub.is_authorized_for_test(pid));
+
+        {
+            let _guard = DeauthorizeGuard { hub: &hub, pid };
+        }
+
+        assert!(!hub.is_authorized_for_test(pid));
+    }
+
+    #[tokio::test]
+    async fn daemon_ready_timeout_kills_and_reaps_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false);
+        let child = cmd.spawn().unwrap();
+        let pid = child.id().unwrap();
+
+        let error = wait_daemon_ready(
+            child,
+            dir.path().join("daemon.log"),
+            Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "browser daemon did not report ready in time");
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(result, -1, "timed-out daemon process is still alive");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }
