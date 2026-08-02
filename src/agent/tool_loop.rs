@@ -251,6 +251,34 @@ fn is_transient_error(result: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PreparedToolResult {
+    displayed_result: String,
+    is_error: bool,
+    is_transient: bool,
+}
+
+fn prepare_tool_result(result: String, repeated_tool_call_streak: usize) -> PreparedToolResult {
+    // Classify the raw payload before adding model-facing prose. Appending a
+    // repeat warning makes structured JSON errors invalid JSON and must not
+    // turn a repeated failure into a success for observers or circuit breakers.
+    let is_error = is_error_result(&result);
+    let is_transient = is_error && is_transient_error(&result);
+    let displayed_result = if repeated_tool_call_streak >= 2 {
+        format!(
+            "{result}\n\n[You have made this exact call {repeated_tool_call_streak} times — \
+             the result does not change. Do not repeat it; continue with what you have.]"
+        )
+    } else {
+        result
+    };
+    PreparedToolResult {
+        displayed_result,
+        is_error,
+        is_transient,
+    }
+}
+
 /// Tracks call-level degeneration: the same tool and arguments returning the
 /// same result. It annotates repeated results and classifies fresh successful
 /// information; the breaker itself uses complete-round fingerprints below.
@@ -383,6 +411,35 @@ fn truncate_chars(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     value.chars().take(limit).collect()
+}
+
+fn log_tool_call_started(iteration: usize, tool: &str, call_id: &str, args: &str) {
+    tracing::info!(
+        iteration,
+        tool = %tool,
+        call_id = %call_id,
+        args_chars = args.chars().count(),
+        "tool call started"
+    );
+}
+
+fn log_tool_call_completed(
+    iteration: usize,
+    tool: &str,
+    call_id: &str,
+    result: &str,
+    success: bool,
+    duration_ms: u128,
+) {
+    tracing::info!(
+        iteration,
+        tool = %tool,
+        call_id = %call_id,
+        result_chars = result.chars().count(),
+        success,
+        duration_ms = %duration_ms,
+        "tool call completed"
+    );
 }
 
 fn gemma_tool_call_regex() -> &'static Regex {
@@ -937,13 +994,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             let call_id = call.call_id.clone();
             let tool_name = call.fn_name.clone();
             let args_string = call.fn_arguments.to_string();
-            tracing::info!(
-                iteration,
-                tool = %tool_name,
-                call_id = %call_id,
-                args = %truncate_log_text(&args_string, 1200),
-                "tool call started"
-            );
+            log_tool_call_started(iteration, &tool_name, &call_id, &args_string);
 
             let observer_for_tool = registry.turn_observer().cloned();
             if let Some(observer) = observer_for_tool.as_ref() {
@@ -984,7 +1035,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 } else {
                     escalated = true;
                     tracing::info!(
-                        reason = %reason,
+                        reason_chars = reason.chars().count(),
                         "think_deeply — escalating to the deep model for the rest of the turn"
                     );
                     "Escalated to the deep-thinking model for the rest of this turn. \
@@ -1011,11 +1062,6 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             };
             let raw_result_fingerprint = fingerprint_str(&raw_result);
             let (result, views) = extract_image_views(raw_result);
-            // Classify the raw tool payload before adding the model-facing
-            // repeat warning below. Appending prose makes JSON error payloads
-            // invalid JSON and must not turn a repeated failure into a success.
-            let is_error = is_error_result(&result);
-            let is_transient = is_error && is_transient_error(&result);
             // Identical-call degeneration: small models re-issue the same call
             // (observed: 5x the same web_search) until the circuit breaker cuts
             // the whole turn. The streak only grows when call AND result are
@@ -1023,27 +1069,24 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             // degeneration. Tell the model in the result itself, where it
             // actually looks, before the breaker has to fire.
             let repeated_tool_call_streak = repeat_tracker.observe(&signature, &result);
+            let prepared_result = prepare_tool_result(result, repeated_tool_call_streak);
             round_progress.observe(
                 &signature,
                 raw_result_fingerprint,
-                is_error,
+                prepared_result.is_error,
                 repeated_tool_call_streak,
             );
-            let result = if repeated_tool_call_streak >= 2 {
-                format!(
-                    "{result}\n\n[You have made this exact call {repeated_tool_call_streak} times — \
-                     the result does not change. Do not repeat it; continue with what you have.]"
-                )
-            } else {
-                result
-            };
-            tracing::info!(
+            let result = prepared_result.displayed_result;
+            let is_error = prepared_result.is_error;
+            let is_transient = prepared_result.is_transient;
+            let duration_ms = tool_started_at.elapsed().as_millis();
+            log_tool_call_completed(
                 iteration,
-                tool = %tool_name,
-                call_id = %call_id,
-                result_chars = result.chars().count(),
-                result = %truncate_log_text(&result, 1200),
-                "tool call completed"
+                &tool_name,
+                &call_id,
+                &result,
+                !is_error,
+                duration_ms,
             );
             image_views.extend(views);
 
@@ -1053,7 +1096,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                     &call_id,
                     !is_error,
                     &truncate_chars(&result, TOOL_PREVIEW_CHARS),
-                    tool_started_at.elapsed().as_millis(),
+                    duration_ms,
                 );
             }
             if is_error {
@@ -1367,14 +1410,6 @@ fn request_tool_for_turn(
     )
 }
 
-fn truncate_log_text(value: &str, limit: usize) -> String {
-    let mut truncated = value.chars().take(limit).collect::<String>();
-    if value.chars().count() > limit {
-        truncated.push_str("...[truncated]");
-    }
-    truncated
-}
-
 fn assistant_tool_message(text: String, tool_calls: Vec<ToolCall>) -> ChatMessage {
     let mut parts = Vec::new();
     if !text.trim().is_empty() {
@@ -1563,6 +1598,42 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct LogCapture {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    struct CaptureWriter {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogCapture {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CaptureWriter {
+                bytes: self.bytes.clone(),
+            }
+        }
+    }
+
+    impl LogCapture {
+        fn output(&self) -> String {
+            String::from_utf8(self.bytes.lock().unwrap().clone()).unwrap()
+        }
+    }
+
     #[derive(Default)]
     struct RecordingObserver {
         escalations: std::sync::Mutex<Vec<String>>,
@@ -1585,6 +1656,44 @@ mod tests {
                 self.escalations.lock().unwrap().push(model_id.to_string());
             })
         }
+    }
+
+    #[test]
+    fn tool_logs_keep_metadata_without_payload_secrets() {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_tool_call_started(
+                3,
+                "vault_tool",
+                "call-123",
+                r#"{"token":"secret-argument-canary"}"#,
+            );
+            log_tool_call_completed(
+                3,
+                "vault_tool",
+                "call-123",
+                "private result secret-result-canary",
+                true,
+                17,
+            );
+        });
+
+        let output = capture.output();
+        assert!(!output.contains("secret-argument-canary"));
+        assert!(!output.contains("secret-result-canary"));
+        assert!(output.contains("vault_tool"));
+        assert!(output.contains("call-123"));
+        assert!(output.contains("args_chars"));
+        assert!(output.contains("result_chars"));
+        assert!(output.contains("success=true"));
+        assert!(output.contains("duration_ms=17"));
     }
 
     #[tokio::test]
@@ -1715,6 +1824,16 @@ mod tests {
         assert!(!is_error_result(r#"{"status":"OK","message":"opened"}"#));
         assert!(!is_error_result("Successfully wrote 12 bytes"));
         assert!(!is_error_result(""));
+    }
+
+    #[test]
+    fn repeated_json_error_keeps_raw_classification_after_annotation() {
+        let prepared = prepare_tool_result(r#"{"error":"browser failed"}"#.to_string(), 2);
+
+        assert!(prepared.is_error);
+        assert!(!prepared.is_transient);
+        assert!(prepared.displayed_result.contains("exact call 2 times"));
+        assert!(serde_json::from_str::<Value>(&prepared.displayed_result).is_err());
     }
 
     #[test]

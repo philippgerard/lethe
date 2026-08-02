@@ -5,7 +5,9 @@ applied via `[patch.crates-io]` in the workspace `Cargo.toml`.
 
 ## Why fork
 
-Exactly one reason: **per-message `cache_control` on the OpenAI adapter.**
+### Prompt caching
+
+The first reason is **per-message `cache_control` on the OpenAI adapter.**
 
 Upstream reads `cache_control` at the *request* level and maps it to OpenAI's
 native `prompt_cache_retention` field. It never emits a per-message marker on
@@ -21,9 +23,28 @@ operationally catastrophic on input-token cost.
 
 See <https://openrouter.ai/docs/features/prompt-caching>.
 
+### Provider response resource bounds
+
+Provider-controlled response bodies and streaming frames must not be able to
+grow process memory without a fixed upper bound. This fork therefore rejects,
+rather than truncates, oversized non-streaming bodies, streaming HTTP error
+bodies, raw chunks, framed events, event fan-out, captured stream data, and
+OpenAI-compatible tool-call indexes.
+
+The limits are intentionally internal and require no new configuration;
+breaches surface through explicit error variants:
+
+- non-streaming success bodies: 16 MiB;
+- HTTP error bodies: 64 KiB;
+- raw streaming chunks: 16 MiB;
+- individual framed events: 1 MiB;
+- raw and captured stream events: 65,536 each;
+- captured stream data: 16 MiB;
+- captured tool calls and OpenAI-compatible tool-call indexes: 128.
+
 ## Patch surface (vs upstream 0.6.5)
 
-Four files, one behaviour change:
+Prompt-caching changes:
 
 - `src/adapter/adapters/openai/adapter_shared.rs`: in
   `into_openai_request_parts()`, capture `cache_control` off each message and,
@@ -46,7 +67,42 @@ Four files, one behaviour change:
   declarations are removed — the `examples/` and `tests/` directories are not
   vendored, and the phantom targets break `cargo test` inside the fork.
 
-Everything else is byte-identical to upstream 0.6.5. To audit the divergence:
+Resource-bound changes:
+
+- `src/error.rs` and `src/webc/error.rs`: add explicit resource-limit and
+  invalid-index errors.
+- `src/webc/web_client.rs`: collect non-streaming success and error bodies
+  incrementally under separate byte limits.
+- `src/webc/web_stream.rs`: bound streaming error bodies, raw chunks,
+  delimiter/SSE partial frames, parsed events, and queued event fan-out; expose
+  those internal limits crate-wide so Bedrock's custom parser reuses them.
+- `src/adapter/adapters/support.rs`: centralize byte/event accounting for
+  provider stream capture, cap captured tool-call counts, and keep growable
+  capture fields private so adapters cannot append around those controls.
+- `src/adapter/adapters/anthropic/streamer.rs`: route text, reasoning, and tool
+  input capture through the shared budget.
+- `src/adapter/adapters/cohere/streamer.rs`: route captured text through the
+  shared budget; Cohere framing is bounded in `web_stream.rs`.
+- `src/adapter/adapters/gemini/streamer.rs`: route text, reasoning, tool calls,
+  and thought signatures through the shared budget; Gemini pretty-JSON framing
+  is bounded in `web_stream.rs`.
+- `src/adapter/adapters/openai/streamer.rs`: route captured content and tool
+  fragments through the shared budget, require dense tool-call indexes, and
+  reject indexes at or above the fixed cap instead of resizing a vector.
+- `src/adapter/adapters/openai_resp/streamer.rs`: apply the same shared budget
+  to Responses text, reasoning, encrypted signatures, and incremental tool
+  arguments, and reject tool output indexes at or above the fixed cap.
+- `src/adapter/adapters/ollama/streamer.rs`: route text, reasoning, and tool
+  capture through the shared byte/event and tool-count limits.
+- `src/adapter/adapters/bedrock/shared.rs`: collect streaming HTTP error
+  bodies under the shared 64 KiB limit while preserving bounded error details.
+- `src/adapter/adapters/bedrock/streamer.rs`: bound AWS event-stream chunks,
+  frame buffering, frame sizes, and event counts; reject impossible header
+  lengths before slicing; and route text, reasoning, and tool capture through
+  the shared byte/event and tool-count limits.
+
+Files not listed above remain byte-identical to upstream 0.6.5. To audit the
+divergence:
 
 ```sh
 cargo package --list  # or diff src/ against a pristine 0.6.5 extract
@@ -79,9 +135,11 @@ recorded so nobody re-applies them:
 
 ## Tracking upstream
 
-The remaining patch is a genuine upstream gap, not a workaround — worth filing
-as a feature request (per-message `cache_control` passthrough on the OpenAI
-adapter, for OpenRouter-style relays). If upstream takes it, drop this fork and
+The remaining patches are genuine upstream gaps, not workarounds. The
+per-message `cache_control` passthrough on the OpenAI adapter is worth filing
+as a feature request for OpenRouter-style relays. Equivalent provider-response
+resource bounds would also be useful upstream. If upstream takes either
+change, drop the corresponding patch; if it takes both, drop this fork and
 depend on the released crate.
 
 Note that upstream's `AdapterKind::from_model` already routes `gpt-5*` to

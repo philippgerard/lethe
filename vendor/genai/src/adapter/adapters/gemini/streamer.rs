@@ -41,10 +41,10 @@ impl GeminiStreamer {
 		let inter_stream_end = InterStreamEnd {
 			captured_usage: self.captured_data.usage.take(),
 			captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-			captured_text_content: self.captured_data.content.take(),
-			captured_reasoning_content: self.captured_data.reasoning_content.take(),
-			captured_tool_calls: self.captured_data.tool_calls.take(),
-			captured_thought_signatures: self.captured_data.thought_signatures.take(),
+			captured_text_content: self.captured_data.take_content(),
+			captured_reasoning_content: self.captured_data.take_reasoning_content(),
+			captured_tool_calls: self.captured_data.take_tool_calls(),
+			captured_thought_signatures: self.captured_data.take_thought_signatures(),
 			captured_response_id: None,
 		};
 		self.pending_events.push_back(InterStreamEvent::End(inter_stream_end));
@@ -142,19 +142,13 @@ impl futures::Stream for GeminiStreamer {
 					// -- Queue Events. Priority: Thought -> Reasoning -> Text -> ToolCall
 
 					if let Some(thought) = stream_thought {
-						match self.captured_data.thought_signatures {
-							Some(ref mut thoughts) => thoughts.push(thought.clone()),
-							None => self.captured_data.thought_signatures = Some(vec![thought.clone()]),
-						}
+						self.captured_data.push_thought_signature(thought.clone())?;
 						self.pending_events.push_back(InterStreamEvent::ThoughtSignatureChunk(thought));
 					}
 
 					if let Some(reasoning_content) = stream_reasoning_content {
 						if self.options.capture_content {
-							match self.captured_data.reasoning_content {
-								Some(ref mut rc) => rc.push_str(&reasoning_content),
-								None => self.captured_data.reasoning_content = Some(reasoning_content.clone()),
-							}
+							self.captured_data.append_reasoning_content(&reasoning_content)?;
 						}
 						self.pending_events
 							.push_back(InterStreamEvent::ReasoningChunk(reasoning_content));
@@ -162,20 +156,14 @@ impl futures::Stream for GeminiStreamer {
 
 					if !stream_text_content.is_empty() {
 						if self.options.capture_content {
-							match self.captured_data.content {
-								Some(ref mut c) => c.push_str(&stream_text_content),
-								None => self.captured_data.content = Some(stream_text_content.clone()),
-							}
+							self.captured_data.append_content(&stream_text_content)?;
 						}
 						self.pending_events.push_back(InterStreamEvent::Chunk(stream_text_content));
 					}
 
 					for tool_call in stream_tool_calls {
 						if self.options.capture_tool_calls {
-							match self.captured_data.tool_calls {
-								Some(ref mut tool_calls) => tool_calls.push(tool_call.clone()),
-								None => self.captured_data.tool_calls = Some(vec![tool_call.clone()]),
-							}
+							self.captured_data.push_tool_call(tool_call.clone())?;
 						}
 						self.pending_events.push_back(InterStreamEvent::ToolCallChunk(tool_call));
 					}

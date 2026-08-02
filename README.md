@@ -203,8 +203,13 @@ target/release/lethe --version
 ```
 
 Release archives and their SHA-256 files are published for Linux x86_64, Linux
-ARM64, and Apple-silicon macOS. See the fork-aware installer invocation in
-[Quickstart](#quickstart); `lethe.gg` tracks upstream, not this release line.
+ARM64, and Apple-silicon macOS. Before extracting a downloaded binary, the
+installer verifies its GitHub artifact attestation with `gh`. A missing
+verifier, missing or invalid attestation, or unavailable release asset fails
+the binary path closed and falls back to a local Cargo build. See the
+fork-aware installer invocation in [Quickstart](#quickstart); `lethe.gg` tracks
+upstream, not this release line. Force source builds with
+`LETHE_INSTALL_FROM_SOURCE=1`.
 
 Run tests:
 
@@ -247,6 +252,8 @@ lethe uninstall                # remove the service/container (add --purge to al
 ```
 
 Share extra host directories with the container via `lethe container up --mount host[:container]` (repeatable; persisted).
+
+When a container build needs a published binary for a different host architecture, Lethe verifies that archive with `gh attestation verify` before copying it into the image. Install the GitHub CLI or use `lethe container up --from-source` from a checkout.
 
 **Reach Lethe**
 
@@ -451,6 +458,12 @@ Restore prompts before overwriting an existing **workspace** and again before ov
 ## Logging
 
 Lethe writes structured runtime logs to `$LOGS_DIR/lethe.log` and mirrors them to stderr. The default level is `info`; override it with `RUST_LOG`, for example:
+
+The foreground helper reads optional overrides from the host-only
+`~/.config/lethe/foreground.env`, never from the container-writable
+`~/.lethe/config/.env`. On first use it creates an empty `foreground.env` with
+`0600` permissions; add only literal `KEY=VALUE` entries when overrides are
+needed.
 
 ```bash
 RUST_LOG=debug scripts/lethe-telegram-foreground
@@ -673,9 +686,10 @@ Tagged pushes (`v*`) build GitHub release assets on a three-runner matrix —
 `lethe-<target>.tar.gz` plus its `.sha256` checksum (`install.sh` and
 `update.sh` consume these assets from the latest release). The separate
 `release-migrator.yml` workflow produces the optional legacy
-`lethe-migrate-<target>.tar.gz` assets and checksums. Linux GNU binaries are
-built on Ubuntu 24.04 for a glibc 2.39 floor; macOS binaries link only against
-system frameworks.
+`lethe-migrate-<target>.tar.gz` assets and checksums. Both workflows attest
+archives before upload and verify that provenance again before publication.
+Linux GNU binaries are built on Ubuntu 24.04 for a glibc 2.39 floor; macOS
+binaries link only against system frameworks.
 
 Useful smoke checks:
 

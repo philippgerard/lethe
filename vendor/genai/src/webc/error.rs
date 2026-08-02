@@ -8,6 +8,12 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[allow(missing_docs)]
 #[derive(Debug, From, Display)]
 pub enum Error {
+	#[display("Response body exceeded the configured limit of {limit} bytes")]
+	ResponseBodyTooLarge { limit: usize },
+
+	#[display("Stream {resource} exceeded the configured limit of {limit}")]
+	StreamLimitExceeded { resource: &'static str, limit: usize },
+
 	#[display("Response content type '{content_type}' is not JSON as expected. Response body:\n{body}")]
 	ResponseFailedNotJson { content_type: String, body: String },
 

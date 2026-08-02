@@ -59,8 +59,10 @@ struct TelegramRuntime {
     locked_user_id: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Desired {
     token: String,
+    allowed_user_ids: Vec<i64>,
     lock_to_first_user: bool,
 }
 
@@ -94,26 +96,54 @@ fn save_state(dir: &Path, state: &RuntimeState) {
     }
 }
 
+fn locked_user_id(dir: &Path) -> Option<i64> {
+    load_state(dir)
+        .telegram
+        .and_then(|state| state.locked_user_id)
+}
+
+fn authorization_ready(dir: &Path, desired: &Desired) -> bool {
+    !desired.allowed_user_ids.is_empty()
+        || desired.lock_to_first_user
+        || locked_user_id(dir).is_some()
+}
+
 /// Resolve the Telegram config to apply: the control-plane file is authoritative
 /// when present; otherwise fall back to static env/.env settings.
 fn resolve_desired(dir: &Path, settings: &Settings) -> Option<Desired> {
     if dir.join(DESIRED_FILE).exists() {
-        return match load_desired(dir).telegram {
+        let desired = match load_desired(dir).telegram {
             Some(tg) if tg.enabled && !tg.bot_token.trim().is_empty() => Some(Desired {
                 token: tg.bot_token.trim().to_string(),
+                allowed_user_ids: Vec::new(),
                 lock_to_first_user: tg.lock_to_first_user,
             }),
             _ => None,
         };
+        return desired.filter(|desired| authorization_ready(dir, desired));
     }
     if settings.telegram.enabled && !settings.telegram.bot_token.trim().is_empty() {
-        Some(Desired {
+        let desired = Desired {
             token: settings.telegram.bot_token.trim().to_string(),
+            allowed_user_ids: settings.telegram.allowed_user_ids.clone(),
             lock_to_first_user: false,
-        })
+        };
+        authorization_ready(dir, &desired).then_some(desired)
     } else {
         None
     }
+}
+
+fn effective_allowed_user_ids(configured: Vec<i64>, locked: Option<i64>) -> Vec<i64> {
+    if configured.is_empty() {
+        locked.into_iter().collect()
+    } else {
+        configured
+    }
+}
+
+fn desired_matches_running(running: Option<&Desired>, desired: &Desired) -> bool {
+    running.is_some_and(|running| running == desired)
 }
 
 fn spawn_telegram(
@@ -122,13 +152,14 @@ fn spawn_telegram(
     brainstem: BrainstemHandle,
     dir: PathBuf,
     token: String,
+    allowed_user_ids: Vec<i64>,
     lock_to_first_user: bool,
 ) -> JoinHandle<()> {
-    let locked = load_state(&dir).telegram.and_then(|t| t.locked_user_id);
+    let locked = locked_user_id(&dir);
 
     settings.telegram.bot_token = token;
     settings.telegram.enabled = true;
-    settings.telegram.allowed_user_ids = locked.map(|id| vec![id]).unwrap_or_default();
+    settings.telegram.allowed_user_ids = effective_allowed_user_ids(allowed_user_ids, locked);
 
     // Lock to the first user only when asked and not already bound. The callback
     // persists the binding so a later restart reuses the same owner.
@@ -168,8 +199,8 @@ fn spawn_telegram(
 /// desired config, polling for changes. Spawned once by `api_command`.
 pub async fn run(agent: Arc<Agent>, settings: Settings, brainstem: BrainstemHandle) {
     let dir = config_dir(&settings);
-    // (token currently running, its task handle)
-    let mut running: Option<(String, JoinHandle<()>)> = None;
+    // (full desired config currently running, its task handle)
+    let mut running: Option<(Desired, JoinHandle<()>)> = None;
 
     loop {
         // If the transport task died on its own (e.g. a fatal poll error), drop
@@ -180,9 +211,8 @@ pub async fn run(agent: Arc<Agent>, settings: Settings, brainstem: BrainstemHand
 
         match resolve_desired(&dir, &settings) {
             Some(desired) => {
-                let same = running
-                    .as_ref()
-                    .is_some_and(|(token, _)| *token == desired.token);
+                let same =
+                    desired_matches_running(running.as_ref().map(|(running, _)| running), &desired);
                 if !same {
                     if let Some((_, task)) = running.take() {
                         task.abort();
@@ -193,9 +223,10 @@ pub async fn run(agent: Arc<Agent>, settings: Settings, brainstem: BrainstemHand
                         brainstem.clone(),
                         dir.clone(),
                         desired.token.clone(),
+                        desired.allowed_user_ids.clone(),
                         desired.lock_to_first_user,
                     );
-                    running = Some((desired.token, task));
+                    running = Some((desired, task));
                 }
             }
             None => {
@@ -206,5 +237,116 @@ pub async fn run(agent: Arc<Agent>, settings: Settings, brainstem: BrainstemHand
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lethe::interfaces::telegram::TelegramClient;
+
+    #[test]
+    fn static_supervisor_preserves_the_configured_user_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = lethe::config::test_settings(tmp.path());
+        settings.telegram.enabled = true;
+        settings.telegram.bot_token = "test-token".to_string();
+        settings.telegram.allowed_user_ids = vec![42];
+
+        let desired = resolve_desired(&config_dir(&settings), &settings).unwrap();
+        assert_eq!(desired.allowed_user_ids, vec![42]);
+
+        let effective = effective_allowed_user_ids(desired.allowed_user_ids, None);
+        let client = TelegramClient::new("test-token", effective).unwrap();
+        assert!(client.user_allowed(42));
+        assert!(!client.user_allowed(7));
+    }
+
+    #[test]
+    fn explicit_static_allowlist_takes_precedence_over_stale_lock_state() {
+        assert_eq!(effective_allowed_user_ids(vec![42], Some(7)), vec![42]);
+    }
+
+    #[test]
+    fn same_token_authorization_changes_require_reconciliation() {
+        let running = Desired {
+            token: "same-token".to_string(),
+            allowed_user_ids: vec![42],
+            lock_to_first_user: false,
+        };
+        let changed_allowlist = Desired {
+            token: "same-token".to_string(),
+            allowed_user_ids: vec![7],
+            lock_to_first_user: false,
+        };
+        let changed_lock_mode = Desired {
+            token: "same-token".to_string(),
+            allowed_user_ids: Vec::new(),
+            lock_to_first_user: true,
+        };
+
+        assert!(desired_matches_running(Some(&running), &running));
+        assert!(!desired_matches_running(Some(&running), &changed_allowlist));
+        assert!(!desired_matches_running(Some(&running), &changed_lock_mode));
+    }
+
+    #[test]
+    fn empty_unlocked_configuration_refuses_to_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = lethe::config::test_settings(tmp.path());
+        settings.telegram.enabled = true;
+        settings.telegram.bot_token = "test-token".to_string();
+
+        assert!(resolve_desired(&config_dir(&settings), &settings).is_none());
+
+        let dir = config_dir(&settings);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(DESIRED_FILE),
+            r#"{"telegram":{"bot_token":"test-token","enabled":true,"lock_to_first_user":false}}"#,
+        )
+        .unwrap();
+        assert!(resolve_desired(&dir, &settings).is_none());
+    }
+
+    #[test]
+    fn persisted_owner_allows_an_empty_static_allowlist_to_restart_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut settings = lethe::config::test_settings(tmp.path());
+        settings.telegram.enabled = true;
+        settings.telegram.bot_token = "test-token".to_string();
+        let dir = config_dir(&settings);
+        save_state(
+            &dir,
+            &RuntimeState {
+                telegram: Some(TelegramRuntime {
+                    locked_user_id: Some(99),
+                }),
+            },
+        );
+
+        let desired = resolve_desired(&dir, &settings).unwrap();
+        assert_eq!(
+            effective_allowed_user_ids(desired.allowed_user_ids, locked_user_id(&dir)),
+            vec![99]
+        );
+    }
+
+    #[test]
+    fn control_plane_first_user_lock_keeps_persisted_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = lethe::config::test_settings(tmp.path());
+        let dir = config_dir(&settings);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(DESIRED_FILE),
+            r#"{"telegram":{"bot_token":"test-token","enabled":true,"lock_to_first_user":true}}"#,
+        )
+        .unwrap();
+
+        let desired = resolve_desired(&dir, &settings).unwrap();
+        assert!(desired.lock_to_first_user);
+        assert!(desired.allowed_user_ids.is_empty());
+        assert_eq!(effective_allowed_user_ids(Vec::new(), Some(99)), vec![99]);
     }
 }

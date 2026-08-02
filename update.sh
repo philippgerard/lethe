@@ -54,8 +54,103 @@ detect_release_target() {
     esac
 }
 
+# Verify that GitHub produced this exact archive for the configured repository.
+# A checksum uploaded beside the archive would share the same compromise
+# boundary, so release binaries require GitHub's signed artifact attestation.
+verify_release_attestation() {
+    local archive="$1"
+    local release_tag="$2"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        warn "GitHub CLI (gh) is required to verify binary release provenance."
+        return 1
+    fi
+
+    if ! gh attestation verify "$archive" \
+        --repo "$REPO_OWNER/$REPO_NAME" \
+        --signer-workflow "$REPO_OWNER/$REPO_NAME/.github/workflows/release.yml" \
+        --source-ref "refs/tags/$release_tag" \
+        --deny-self-hosted-runners >/dev/null 2>&1; then
+        warn "Release provenance verification failed for $(basename "$archive")."
+        return 1
+    fi
+}
+
+release_tag_from_url() {
+    local remainder tag asset
+    remainder="${1#*/releases/download/}"
+    if [ "$remainder" = "$1" ]; then
+        return 1
+    fi
+    tag="${remainder%%/*}"
+    asset="${remainder#*/}"
+    if [[ "$asset" == "$remainder" || -z "$asset" \
+        || -z "$tag" || "$tag" == *[!A-Za-z0-9._-]* ]]; then
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
+resolve_tagged_release_url() {
+    local url="$1"
+    local redirect_url
+
+    if release_tag_from_url "$url" >/dev/null; then
+        printf '%s\n' "$url"
+        return 0
+    fi
+
+    # Do not follow this request: GitHub's first redirect names the immutable
+    # tag, while the next redirect lands on release-assets without that tag.
+    if ! redirect_url="$(curl -fsS -o /dev/null -w '%{redirect_url}' "$url")"; then
+        return 1
+    fi
+    release_tag_from_url "$redirect_url" >/dev/null || return 1
+    printf '%s\n' "$redirect_url"
+}
+
+install_binary_atomically() {
+    local source="$1"
+    local name="$2"
+    local staged destination
+
+    mkdir -p "$BIN_DIR"
+    destination="$BIN_DIR/$name"
+    if [ -d "$destination" ] && [ ! -L "$destination" ]; then
+        warn "Refusing to replace directory $destination with a binary"
+        return 1
+    fi
+    if ! staged="$(mktemp "$BIN_DIR/.${name}.tmp.XXXXXX")"; then
+        warn "Could not create a staging file in $BIN_DIR"
+        return 1
+    fi
+    if ! cp "$source" "$staged" || ! chmod 0755 "$staged"; then
+        warn "Could not stage $name in $BIN_DIR"
+        rm -f "$staged"
+        return 1
+    fi
+    if [ -d "$destination" ] && [ ! -L "$destination" ]; then
+        warn "Refusing to replace directory $destination with a binary"
+        rm -f "$staged"
+        return 1
+    fi
+    case "$(uname -s)" in
+        Linux)  mv -fT "$staged" "$destination" ;;
+        Darwin) mv -fh "$staged" "$destination" ;;
+        *)
+            warn "Atomic no-follow installation is unsupported on this platform"
+            rm -f "$staged"
+            return 1
+            ;;
+    esac || {
+        warn "Could not atomically install $destination"
+        rm -f "$staged"
+        return 1
+    }
+}
+
 install_release_binary() {
-    local target url tmp archive binary
+    local target url tmp archive binary package tagged_url release_tag
 
     if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
         warn "curl and tar are required for binary update."
@@ -72,60 +167,79 @@ install_release_binary() {
     archive="$tmp/lethe.tar.gz"
 
     info "Downloading binary release: $url"
-    if ! curl -fsSL "$url" -o "$archive"; then
-        warn "Binary release download failed."
+    if ! tagged_url="$(resolve_tagged_release_url "$url")"; then
+        warn "Could not resolve $url to an immutable tagged release URL"
         rm -rf "$tmp"
         return 1
     fi
 
-    if ! tar -xzf "$archive" -C "$tmp"; then
-        warn "Binary release archive could not be unpacked."
+    if ! release_tag="$(release_tag_from_url "$tagged_url")"; then
+        warn "Could not determine the release tag from $tagged_url"
         rm -rf "$tmp"
         return 1
     fi
 
-    binary="$(find "$tmp" -type f -name lethe -perm -111 | head -n 1)"
-    if [ -z "$binary" ]; then
-        warn "Binary release archive did not contain an executable lethe binary."
+    if ! curl -fsSL "$tagged_url" -o "$archive"; then
+        warn "Binary release download failed: $tagged_url"
         rm -rf "$tmp"
         return 1
     fi
 
-    mkdir -p "$BIN_DIR"
-    cp "$binary" "$BIN_DIR/lethe"
-    chmod +x "$BIN_DIR/lethe"
+    if ! verify_release_attestation "$archive" "$release_tag"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    package="lethe-$target"
+    binary="$tmp/lethe"
+    if ! tar -xOzf "$archive" "$package/lethe" > "$binary" || [ ! -s "$binary" ]; then
+        warn "Binary release archive did not contain $package/lethe."
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    chmod +x "$binary"
+    if ! install_binary_atomically "$binary" lethe; then
+        rm -rf "$tmp"
+        return 1
+    fi
     rm -rf "$tmp"
     success "Updated $BIN_DIR/lethe from binary release"
 }
 
-if [ "${LETHE_UPDATE_FROM_SOURCE:-0}" != "1" ] && install_release_binary; then
+main() {
+    if [ "${LETHE_UPDATE_FROM_SOURCE:-0}" != "1" ] && install_release_binary; then
+        post_update_notice
+        return 0
+    fi
+
+    warn "Falling back to source update."
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        error "Cargo is required for source update. Install Rust from https://rustup.rs."
+    fi
+
+    if ! command -v protoc >/dev/null 2>&1; then
+        error "protoc is required by LanceDB source builds. Install protobuf-compiler/libprotobuf-dev (Debian/Ubuntu), protobuf-compiler/protobuf-devel (Fedora), or protobuf (Homebrew)."
+    fi
+
+    if [ ! -d "$INSTALL_DIR/.git" ]; then
+        error "No Lethe checkout found at $INSTALL_DIR. Set LETHE_INSTALL_DIR or rerun install.sh."
+    fi
+
+    info "Updating checkout: $INSTALL_DIR"
+    git -C "$INSTALL_DIR" pull --ff-only
+
+    info "Building release binary..."
+    cargo build --release --manifest-path "$INSTALL_DIR/Cargo.toml"
+
+    install_binary_atomically "$INSTALL_DIR/target/release/lethe" lethe \
+        || error "Could not install the built lethe binary."
+
+    success "Updated $BIN_DIR/lethe"
     post_update_notice
-    exit 0
+}
+
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-
-warn "Falling back to source update."
-
-if ! command -v cargo >/dev/null 2>&1; then
-    error "Cargo is required for source update. Install Rust from https://rustup.rs."
-fi
-
-if ! command -v protoc >/dev/null 2>&1; then
-    error "protoc is required by LanceDB source builds. Install protobuf-compiler/libprotobuf-dev (Debian/Ubuntu), protobuf-compiler/protobuf-devel (Fedora), or protobuf (Homebrew)."
-fi
-
-if [ ! -d "$INSTALL_DIR/.git" ]; then
-    error "No Lethe checkout found at $INSTALL_DIR. Set LETHE_INSTALL_DIR or rerun install.sh."
-fi
-
-info "Updating checkout: $INSTALL_DIR"
-git -C "$INSTALL_DIR" pull --ff-only
-
-info "Building release binary..."
-cargo build --release --manifest-path "$INSTALL_DIR/Cargo.toml"
-
-mkdir -p "$BIN_DIR"
-cp "$INSTALL_DIR/target/release/lethe" "$BIN_DIR/lethe"
-chmod +x "$BIN_DIR/lethe"
-
-success "Updated $BIN_DIR/lethe"
-post_update_notice

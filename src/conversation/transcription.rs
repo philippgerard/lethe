@@ -144,20 +144,27 @@ pub fn infer_audio_format(filename: &str, mime_type: Option<&str>) -> String {
 }
 
 pub fn filename_for_upload(filename: &str, audio_format: &str) -> String {
-    let base = Path::new(filename)
+    // Telegram controls this display name. Treat both Unix and Windows path
+    // separators as boundaries even when Lethe is running on the other OS.
+    let basename = filename.rsplit(['/', '\\']).next().unwrap_or_default();
+    let base = Path::new(basename)
         .file_stem()
         .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
         .unwrap_or("telegram_audio");
-    let suffix = Path::new(filename)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if suffix == audio_format {
-        filename.to_string()
+    format!("{base}.{}", safe_audio_format(audio_format))
+}
+
+fn safe_audio_format(audio_format: &str) -> &str {
+    let audio_format = audio_format.trim().trim_start_matches('.');
+    if !audio_format.is_empty()
+        && audio_format
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        audio_format
     } else {
-        format!("{base}.{audio_format}")
+        "ogg"
     }
 }
 
@@ -337,7 +344,7 @@ fn transcribe_multipart(
 
 fn transcribe_local_whisper(
     audio_bytes: &[u8],
-    filename: &str,
+    _untrusted_filename: &str,
     audio_format: &str,
     model: &str,
     language: Option<&str>,
@@ -350,8 +357,12 @@ fn transcribe_local_whisper(
 
     let tmpdir = std::env::temp_dir().join(format!("lethe-stt-{}", Uuid::new_v4()));
     fs::create_dir_all(&tmpdir)?;
-    let upload_name = filename_for_upload(filename, audio_format);
-    let audio_path = tmpdir.join(upload_name);
+    // Local filesystem paths are server-owned. The remote display name is
+    // intentionally ignored rather than reused as a path component.
+    let audio_path = tmpdir.join(format!(
+        "telegram_audio.{}",
+        safe_audio_format(audio_format)
+    ));
     fs::write(&audio_path, audio_bytes)?;
 
     let result = run_local_whisper_command(&command_parts, &audio_path, &tmpdir, model, language);
@@ -696,6 +707,59 @@ mod tests {
         assert_eq!(filename_for_upload("voice.oga", "ogg"), "voice.ogg");
         assert_eq!(filename_for_upload("voice.ogg", "ogg"), "voice.ogg");
         assert_eq!(filename_for_upload("", "ogg"), "telegram_audio.ogg");
+    }
+
+    #[test]
+    fn upload_filename_strips_path_components_and_unsafe_formats() {
+        assert_eq!(
+            filename_for_upload("../../outside.ogg", "ogg"),
+            "outside.ogg"
+        );
+        assert_eq!(
+            filename_for_upload("/tmp/outside.ogg", "ogg"),
+            "outside.ogg"
+        );
+        assert_eq!(
+            filename_for_upload(r"..\..\outside.ogg", "ogg"),
+            "outside.ogg"
+        );
+        assert_eq!(filename_for_upload("voice.ogg", "../../wav"), "voice.ogg");
+    }
+
+    #[test]
+    fn local_transcription_never_writes_to_the_remote_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside.ogg");
+
+        let result = transcribe_local_whisper(
+            b"audio",
+            outside.to_str().unwrap(),
+            "ogg",
+            "base",
+            None,
+            "true",
+        );
+
+        assert!(matches!(
+            result,
+            Err(TranscriptionError::EmptyLocalTranscript)
+        ));
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn local_transcription_preserves_normal_voice_processing() {
+        let result = transcribe_local_whisper(
+            b"audio",
+            "telegram_voice_123.ogg",
+            "ogg",
+            "base",
+            None,
+            "echo transcript",
+        )
+        .unwrap();
+
+        assert!(result.starts_with("transcript "));
     }
 
     #[test]

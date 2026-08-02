@@ -4,7 +4,7 @@ use lethe::config::{RuntimeMode, Settings};
 use lethe::tools::shell::DEFAULT_TIMEOUT_SECONDS;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 
@@ -993,6 +993,19 @@ impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogWriter {
     }
 }
 
+fn open_log_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // `mode` applies only when the file is created, so existing operator-
+        // managed permissions are preserved.
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn init_logging(settings: &Settings) -> Option<PathBuf> {
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if let Err(error) = std::fs::create_dir_all(&settings.paths.logs_dir) {
@@ -1008,7 +1021,7 @@ fn init_logging(settings: &Settings) -> Option<PathBuf> {
         return None;
     }
     let log_path = settings.paths.logs_dir.join("lethe.log");
-    let file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+    let file = match open_log_file(&log_path) {
         Ok(file) => file,
         Err(error) => {
             eprintln!(
@@ -1136,6 +1149,33 @@ fn default_command_for_mode(mode: &RuntimeMode) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn log_file_creation_is_private_without_changing_existing_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let new_log = tmp.path().join("new.log");
+        drop(open_log_file(&new_log).unwrap());
+        assert_eq!(
+            std::fs::metadata(&new_log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let existing_log = tmp.path().join("existing.log");
+        std::fs::write(&existing_log, "existing").unwrap();
+        std::fs::set_permissions(&existing_log, std::fs::Permissions::from_mode(0o640)).unwrap();
+        drop(open_log_file(&existing_log).unwrap());
+        assert_eq!(
+            std::fs::metadata(&existing_log)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
 
     #[test]
     fn default_command_honors_runtime_mode() {

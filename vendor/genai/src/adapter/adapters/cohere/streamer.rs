@@ -74,10 +74,7 @@ impl futures::Stream for CohereStreamer {
 									if let Some(content) = cohere_message.text {
 										// Add to the captured content if chat options allow it
 										if self.options.capture_content {
-											match self.captured_data.content {
-												Some(ref mut c) => c.push_str(&content),
-												None => self.captured_data.content = Some(content.clone()),
-											}
+											self.captured_data.append_content(&content)?;
 										}
 										InterStreamEvent::Chunk(content)
 									} else {
@@ -114,9 +111,9 @@ impl futures::Stream for CohereStreamer {
 											.stop_reason
 											.take()
 											.map(StopReason::from),
-										captured_text_content: self.captured_data.content.take(),
-										captured_reasoning_content: self.captured_data.reasoning_content.take(),
-										captured_tool_calls: self.captured_data.tool_calls.take(),
+										captured_text_content: self.captured_data.take_content(),
+										captured_reasoning_content: self.captured_data.take_reasoning_content(),
+										captured_tool_calls: self.captured_data.take_tool_calls(),
 										captured_thought_signatures: None,
 										captured_response_id: None,
 									};

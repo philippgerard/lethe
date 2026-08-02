@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+fail() {
+    printf 'release security regression: %s\n' "$1" >&2
+    exit 1
+}
+
+assert_action_refs_are_immutable() {
+    local workflow="$1"
+    command -v ruby >/dev/null 2>&1 \
+        || fail 'Ruby is required for semantic workflow policy checks'
+    ruby - "$workflow" <<'RUBY'
+require "yaml"
+
+workflow = ARGV.fetch(0)
+document = YAML.safe_load(File.read(workflow), aliases: true, filename: workflow)
+
+fail_policy = lambda do |action|
+  warn "release security regression: #{workflow} contains a mutable or malformed action ref: #{action.inspect}"
+  exit 1
+end
+
+visit = nil
+visit = lambda do |node|
+  case node
+  when Hash
+    node.each do |key, value|
+      if key == "uses"
+        fail_policy.call(value) unless value.is_a?(String)
+        local_action = value.match?(%r{\A\./[A-Za-z0-9._/-]+\z}) &&
+          !value.split("/").include?("..")
+        pinned_container = value.match?(%r{\Adocker://[^@\s]+@sha256:[0-9a-f]{64}\z})
+        pinned_repository = value.match?(%r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z})
+        fail_policy.call(value) unless local_action || pinned_container || pinned_repository
+      end
+      visit.call(value)
+    end
+  when Array
+    node.each { |value| visit.call(value) }
+  end
+end
+
+visit.call(document)
+RUBY
+}
+
+assert_parser_rejects() {
+    local label="$1"
+    local fixture="$2"
+    if (assert_action_refs_are_immutable <(printf '%s\n' "$fixture")) 2>/dev/null; then
+        fail "action parser accepted $label"
+    fi
+}
+
+assert_parser_rejects 'a named-step mutable ref' $'steps:\n  - name: Checkout\n    uses: actions/checkout@v6'
+assert_parser_rejects 'a mutable reusable workflow' $'jobs:\n  call:\n    uses: owner/repository/.github/workflows/reuse.yml@main'
+assert_parser_rejects 'a flow-mapping mutable ref' $'steps:\n  - { uses: actions/checkout@v6 }'
+assert_parser_rejects 'alternate uses-key spacing' $'steps:\n  - uses : actions/checkout@v6'
+assert_parser_rejects 'a quoted uses key' $'steps:\n  - "uses": actions/checkout@v6'
+assert_parser_rejects 'an escaped quoted uses key' $'steps:\n  - "u\\u0073es": actions/checkout@v6'
+assert_parser_rejects 'an explicit mutable uses key' $'steps:\n  - ? uses\n    : actions/checkout@v6'
+assert_parser_rejects 'an aliased action ref' $'x-action: &action actions/checkout@v6\nsteps:\n  - uses: *action'
+assert_parser_rejects 'an alias used as the uses key' $'x-key: &key uses\nsteps:\n  - *key: actions/checkout@v6'
+assert_parser_rejects 'a mutable container action' $'steps:\n  - uses: docker://alpine:latest'
+
+for workflow in \
+    "$ROOT_DIR/.github/workflows/release.yml" \
+    "$ROOT_DIR/.github/workflows/release-migrator.yml"
+do
+    assert_action_refs_are_immutable "$workflow"
+    grep -q 'actions/attest-build-provenance@' "$workflow" \
+        || fail "$workflow does not attest release archives"
+    grep -q 'gh attestation verify' "$workflow" \
+        || fail "$workflow does not verify provenance before publication"
+    grep -q -- '--signer-workflow' "$workflow" \
+        || fail "$workflow does not bind verification to its signer workflow"
+    grep -q -- '--source-ref' "$workflow" \
+        || fail "$workflow does not bind verification to the release ref"
+    grep -q -- '--deny-self-hosted-runners' "$workflow" \
+        || fail "$workflow permits an unexpected self-hosted attestation signer"
+    grep -q 'attestations: write' "$workflow" \
+        || fail "$workflow build job cannot publish attestations"
+    grep -q 'attestations: read' "$workflow" \
+        || fail "$workflow publish job cannot verify attestations"
+done
+
+grep -Fq 'run: bash scripts/test-binary-attestation' "$ROOT_DIR/.github/workflows/release.yml" \
+    || fail 'release workflow does not run binary attestation regressions'
+grep -Fq 'run: bash scripts/tests/security-policy-regression.sh' "$ROOT_DIR/.github/workflows/release.yml" \
+    || fail 'release workflow does not run shell security policy regressions'
+
+grep -Eq '^FROM rust:1\.96-slim@sha256:[0-9a-f]{64} AS builder$' "$ROOT_DIR/Containerfile" \
+    || fail 'builder image is not pinned to an immutable digest'
+grep -Eq '^FROM debian:trixie-slim@sha256:[0-9a-f]{64}$' "$ROOT_DIR/Containerfile" \
+    || fail 'runtime image is not pinned to an immutable digest'
+
+printf 'release security regressions passed\n'

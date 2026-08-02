@@ -1,4 +1,4 @@
-use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
+use crate::adapter::adapters::support::{MAX_CAPTURED_TOOL_CALLS, StreamerCapturedData, StreamerOptions};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::adapter::openai_resp::resp_types::RespResponse;
 use crate::chat::{ChatOptionsSet, StopReason, ToolCall};
@@ -119,6 +119,167 @@ impl OpenAIRespStreamer {
 			in_progress_tool_calls: BTreeMap::new(),
 		}
 	}
+
+	fn start_tool_call(&mut self, output_index: usize, call_id: String, fn_name: String) -> Result<()> {
+		if output_index >= MAX_CAPTURED_TOOL_CALLS {
+			return Err(Error::InvalidToolCallIndex {
+				index: output_index,
+				limit: MAX_CAPTURED_TOOL_CALLS,
+			});
+		}
+		self.captured_data.record_capture(call_id.len() + fn_name.len())?;
+		self.in_progress_tool_calls.insert(
+			output_index,
+			ToolCall {
+				call_id,
+				fn_name,
+				fn_arguments: Value::String(String::new()),
+				thought_signatures: None,
+			},
+		);
+		Ok(())
+	}
+
+	fn append_tool_arguments(&mut self, output_index: usize, delta: &str) -> Result<Option<ToolCall>> {
+		if !self.in_progress_tool_calls.contains_key(&output_index) {
+			return Ok(None);
+		}
+		self.captured_data.record_capture(delta.len())?;
+		let tool_call = self
+			.in_progress_tool_calls
+			.get_mut(&output_index)
+			.expect("tool-call presence checked above");
+		if let Value::String(arguments) = &mut tool_call.fn_arguments {
+			arguments.push_str(delta);
+		}
+		Ok(Some(tool_call.clone()))
+	}
+}
+
+#[cfg(test)]
+mod security_tests {
+	use super::*;
+	use crate::adapter::AdapterKind;
+	use crate::adapter::adapters::support::MAX_CAPTURED_STREAM_BYTES;
+	use crate::chat::ChatOptions;
+
+	fn streamer() -> OpenAIRespStreamer {
+		let request = reqwest::Client::new().get("http://localhost");
+		let options = ChatOptions::default().with_capture_tool_calls(true);
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&options));
+		OpenAIRespStreamer::new(
+			EventSourceStream::new(request),
+			ModelIden::new(AdapterKind::OpenAIResp, "security-test"),
+			options_set,
+		)
+	}
+
+	#[test]
+	fn tool_argument_fragments_preserve_responses_semantics() {
+		let mut streamer = streamer();
+		streamer
+			.start_tool_call(0, "call-0".to_string(), "lookup".to_string())
+			.expect("ordinary tool call should start");
+		streamer
+			.append_tool_arguments(0, "{\"id\":")
+			.expect("first fragment should fit");
+		let tool_call = streamer
+			.append_tool_arguments(0, "1}")
+			.expect("second fragment should fit")
+			.expect("tool call should exist");
+
+		assert_eq!(tool_call.fn_arguments, Value::String("{\"id\":1}".to_string()));
+	}
+
+	#[test]
+	fn tool_call_output_index_is_bounded_before_map_growth() {
+		let mut streamer = streamer();
+
+		let error = streamer
+			.start_tool_call(MAX_CAPTURED_TOOL_CALLS, "call".to_string(), "lookup".to_string())
+			.expect_err("index at the exclusive limit should fail");
+
+		assert!(matches!(
+			error,
+			Error::InvalidToolCallIndex {
+				index: MAX_CAPTURED_TOOL_CALLS,
+				limit: MAX_CAPTURED_TOOL_CALLS
+			}
+		));
+		assert!(streamer.in_progress_tool_calls.is_empty());
+	}
+
+	#[test]
+	fn sparse_in_range_responses_output_index_remains_supported() {
+		let mut streamer = streamer();
+
+		streamer
+			.start_tool_call(MAX_CAPTURED_TOOL_CALLS - 1, "call".to_string(), "lookup".to_string())
+			.expect("Responses output indexes need not be dense");
+
+		assert_eq!(streamer.in_progress_tool_calls.len(), 1);
+	}
+
+	#[test]
+	fn tool_argument_fragments_share_the_capture_byte_budget() {
+		let mut streamer = streamer();
+		streamer
+			.start_tool_call(0, String::new(), String::new())
+			.expect("ordinary tool call should start");
+		streamer
+			.captured_data
+			.record_capture(MAX_CAPTURED_STREAM_BYTES)
+			.expect("exact byte limit should fit");
+
+		let error = streamer
+			.append_tool_arguments(0, "x")
+			.expect_err("next argument byte should exceed the shared limit");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "capture bytes",
+				limit: MAX_CAPTURED_STREAM_BYTES
+			}
+		));
+		assert_eq!(
+			streamer.in_progress_tool_calls[&0].fn_arguments,
+			Value::String(String::new())
+		);
+	}
+
+	#[test]
+	fn responses_capture_channels_share_one_byte_budget() {
+		let mut streamer = streamer();
+		streamer
+			.captured_data
+			.record_capture(MAX_CAPTURED_STREAM_BYTES - 2)
+			.expect("bytes below the limit should fit");
+		streamer
+			.captured_data
+			.append_content("a")
+			.expect("content byte at the boundary should fit");
+		streamer
+			.captured_data
+			.append_reasoning_content("b")
+			.expect("reasoning byte at the boundary should fit");
+
+		let error = streamer
+			.captured_data
+			.push_thought_signature("c".to_string())
+			.expect_err("signature must share the exhausted capture budget");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "capture bytes",
+				limit: MAX_CAPTURED_STREAM_BYTES
+			}
+		));
+		assert_eq!(streamer.captured_data.take_content().as_deref(), Some("a"));
+		assert_eq!(streamer.captured_data.take_reasoning_content().as_deref(), Some("b"));
+		assert!(!streamer.captured_data.has_thought_signatures());
+	}
 }
 
 impl futures::Stream for OpenAIRespStreamer {
@@ -155,15 +316,7 @@ impl futures::Stream for OpenAIRespStreamer {
 							if item.x_get_str("type").ok() == Some("function_call") {
 								let call_id = item.x_get_str("call_id").unwrap_or_default().to_string();
 								let fn_name = item.x_get_str("name").unwrap_or_default().to_string();
-
-								let tool_call = ToolCall {
-									call_id,
-									fn_name,
-									fn_arguments: Value::String(String::new()),
-									thought_signatures: None,
-								};
-
-								self.in_progress_tool_calls.insert(output_index, tool_call);
+								self.start_tool_call(output_index, call_id, fn_name)?;
 							}
 							continue;
 						}
@@ -181,10 +334,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								&& let Ok(encrypted) = item.x_get_str("encrypted_content")
 								&& !encrypted.is_empty()
 							{
-								self.captured_data
-									.thought_signatures
-									.get_or_insert_with(Vec::new)
-									.push(encrypted.to_string());
+								self.captured_data.push_thought_signature(encrypted.to_string())?;
 							}
 							continue;
 						}
@@ -196,42 +346,27 @@ impl futures::Stream for OpenAIRespStreamer {
 
 						RespStreamEvent::OutputTextDelta { delta, .. } => {
 							if self.options.capture_content {
-								match self.captured_data.content {
-									Some(ref mut c) => c.push_str(&delta),
-									None => self.captured_data.content = Some(delta.clone()),
-								}
+								self.captured_data.append_content(&delta)?;
 							}
 							return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(delta))));
 						}
 
 						RespStreamEvent::ReasoningTextDelta { delta, .. } => {
 							if self.options.capture_reasoning_content {
-								match self.captured_data.reasoning_content {
-									Some(ref mut c) => c.push_str(&delta),
-									None => self.captured_data.reasoning_content = Some(delta.clone()),
-								}
+								self.captured_data.append_reasoning_content(&delta)?;
 							}
 							return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(delta))));
 						}
 
 						RespStreamEvent::ReasoningSummaryTextDelta { delta, .. } => {
 							if self.options.capture_reasoning_content {
-								match self.captured_data.reasoning_content {
-									Some(ref mut c) => c.push_str(&delta),
-									None => self.captured_data.reasoning_content = Some(delta.clone()),
-								}
+								self.captured_data.append_reasoning_content(&delta)?;
 							}
 							return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(delta))));
 						}
 
 						RespStreamEvent::FunctionCallArgumentsDelta { output_index, delta } => {
-							if let Some(tool_call) = self.in_progress_tool_calls.get_mut(&output_index) {
-								if let Some(args) = tool_call.fn_arguments.as_str() {
-									let new_args = format!("{}{}", args, delta);
-									tool_call.fn_arguments = Value::String(new_args);
-								}
-
-								let tool_call_to_send = tool_call.clone();
+							if let Some(tool_call_to_send) = self.append_tool_arguments(output_index, &delta)? {
 								return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tool_call_to_send))));
 							}
 							continue;
@@ -245,6 +380,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								self.captured_data.usage = response.usage.map(Into::into);
 							}
 
+							let had_incremental_tool_calls = !self.in_progress_tool_calls.is_empty();
 							let mut tool_calls = Vec::new();
 							for (_, mut tc) in std::mem::take(&mut self.in_progress_tool_calls) {
 								// Parse arguments if they are strings
@@ -279,8 +415,14 @@ impl futures::Stream for OpenAIRespStreamer {
 								}
 							}
 
-							if self.options.capture_tool_calls && !tool_calls.is_empty() {
-								self.captured_data.tool_calls = Some(tool_calls.clone());
+							if self.options.capture_tool_calls {
+								for tool_call in tool_calls {
+									if had_incremental_tool_calls {
+										self.captured_data.push_accounted_tool_call(tool_call)?;
+									} else {
+										self.captured_data.push_tool_call(tool_call)?;
+									}
+								}
 							}
 
 							// Extract encrypted reasoning content from output items
@@ -289,28 +431,23 @@ impl futures::Stream for OpenAIRespStreamer {
 							// primary source. Some backends don't echo `output` in
 							// `response.completed` (it comes back empty), but for
 							// backends that do, this picks up anything missed.
-							if self.options.capture_reasoning_content && self.captured_data.thought_signatures.is_none()
-							{
-								let mut thought_sigs: Vec<String> = Vec::new();
+							if self.options.capture_reasoning_content && !self.captured_data.has_thought_signatures() {
 								for item in &response.output {
 									if item.x_get_str("type").ok() == Some("reasoning")
 										&& let Ok(encrypted) = item.x_get_str("encrypted_content")
 									{
-										thought_sigs.push(encrypted.to_string());
+										self.captured_data.push_thought_signature(encrypted.to_string())?;
 									}
-								}
-								if !thought_sigs.is_empty() {
-									self.captured_data.thought_signatures = Some(thought_sigs);
 								}
 							}
 
 							let inter_stream_end = InterStreamEnd {
 								captured_usage: self.captured_data.usage.take(),
 								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-								captured_text_content: self.captured_data.content.take(),
-								captured_reasoning_content: self.captured_data.reasoning_content.take(),
-								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: self.captured_data.thought_signatures.take(),
+								captured_text_content: self.captured_data.take_content(),
+								captured_reasoning_content: self.captured_data.take_reasoning_content(),
+								captured_tool_calls: self.captured_data.take_tool_calls(),
+								captured_thought_signatures: self.captured_data.take_thought_signatures(),
 								captured_response_id: Some(response.id),
 							};
 
@@ -340,9 +477,9 @@ impl futures::Stream for OpenAIRespStreamer {
 							let inter_stream_end = InterStreamEnd {
 								captured_usage: response.usage.map(Into::into),
 								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-								captured_text_content: self.captured_data.content.take(),
-								captured_reasoning_content: self.captured_data.reasoning_content.take(),
-								captured_tool_calls: self.captured_data.tool_calls.take(),
+								captured_text_content: self.captured_data.take_content(),
+								captured_reasoning_content: self.captured_data.take_reasoning_content(),
+								captured_tool_calls: self.captured_data.take_tool_calls(),
 								captured_thought_signatures: None,
 								captured_response_id: Some(resp_id),
 							};
@@ -369,9 +506,9 @@ impl futures::Stream for OpenAIRespStreamer {
 						let inter_stream_end = InterStreamEnd {
 							captured_usage: self.captured_data.usage.take(),
 							captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-							captured_text_content: self.captured_data.content.take(),
-							captured_reasoning_content: self.captured_data.reasoning_content.take(),
-							captured_tool_calls: self.captured_data.tool_calls.take(),
+							captured_text_content: self.captured_data.take_content(),
+							captured_reasoning_content: self.captured_data.take_reasoning_content(),
+							captured_tool_calls: self.captured_data.take_tool_calls(),
 							captured_thought_signatures: None,
 							captured_response_id: None,
 						};

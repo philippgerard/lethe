@@ -1,4 +1,4 @@
-FROM rust:1.96-slim AS builder
+FROM rust:1.96-slim@sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523 AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -19,7 +19,7 @@ COPY vendor/ vendor/
 
 RUN cargo build --release
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd
 
 # Lean base: just what the binary needs to boot (TLS), fetch installers, and
 # the single most-common agent dependency (git). Everything heavier the agent
