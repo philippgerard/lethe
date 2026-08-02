@@ -2,6 +2,7 @@
 
 use crate::adapter::{AdapterKind, ServiceType};
 use crate::resolver::Endpoint;
+use crate::webc::{Error as WebError, MAX_ERROR_BODY_BYTES, response_text_limited};
 use crate::{Error, ModelIden, Result};
 use reqwest::RequestBuilder;
 
@@ -93,7 +94,13 @@ fn async_stream_once(
 			.map_err(|e| Box::new(e) as crate::error::BoxError)?;
 		let status = resp.status();
 		if !status.is_success() {
-			let body = resp.text().await.unwrap_or_default();
+			let body = match response_text_limited(resp, MAX_ERROR_BODY_BYTES).await {
+				Ok(body) => body,
+				Err(error @ WebError::ResponseBodyTooLarge { .. }) => {
+					return Err(Box::new(error) as crate::error::BoxError);
+				}
+				Err(error) => format!("Failed to read error body: {error}"),
+			};
 			let err = crate::Error::HttpError {
 				status,
 				canonical_reason: status.canonical_reason().unwrap_or("Unknown").to_string(),
@@ -107,4 +114,74 @@ fn async_stream_once(
 				.boxed();
 		Ok(bytes)
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use futures::StreamExt;
+	use std::io::{Read, Write};
+	use std::net::TcpListener;
+	use std::thread::JoinHandle;
+
+	fn local_response_request(
+		status: &str,
+		declared_content_length: usize,
+		body: &'static [u8],
+	) -> (RequestBuilder, JoinHandle<()>) {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
+		let address = listener.local_addr().expect("listener should have an address");
+		let status = status.to_string();
+		let server = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().expect("test client should connect");
+			let mut request = [0_u8; 4096];
+			let _ = socket.read(&mut request);
+			let headers =
+				format!("HTTP/1.1 {status}\r\nContent-Length: {declared_content_length}\r\nConnection: close\r\n\r\n");
+			let _ = socket.write_all(headers.as_bytes());
+			let _ = socket.write_all(body);
+		});
+		let client = reqwest::Client::builder().no_proxy().build().expect("test client should build");
+		(client.get(format!("http://{address}/converse-stream")), server)
+	}
+
+	#[tokio::test]
+	async fn ordinary_http_error_preserves_status_and_body() {
+		let (request, server) = local_response_request("400 Bad Request", 4, b"nope");
+		let mut stream = Box::pin(async_stream_bytes(request));
+		let error = stream
+			.next()
+			.await
+			.expect("error response should produce one stream item")
+			.expect_err("HTTP error should fail the byte stream");
+		server.join().expect("test server should exit");
+
+		let error = error
+			.downcast_ref::<crate::Error>()
+			.expect("ordinary HTTP errors should retain the genai error type");
+		assert!(matches!(
+			error,
+			crate::Error::HttpError { status, body, .. }
+				if *status == reqwest::StatusCode::BAD_REQUEST && body == "nope"
+		));
+	}
+
+	#[tokio::test]
+	async fn oversized_http_error_body_is_rejected_before_collection() {
+		let (request, server) = local_response_request("500 Internal Server Error", MAX_ERROR_BODY_BYTES + 1, b"");
+		let mut stream = Box::pin(async_stream_bytes(request));
+		let error = stream
+			.next()
+			.await
+			.expect("error response should produce one stream item")
+			.expect_err("oversized error body should fail the byte stream");
+		server.join().expect("test server should exit");
+
+		assert!(matches!(
+			error.downcast_ref::<WebError>(),
+			Some(WebError::ResponseBodyTooLarge {
+				limit: MAX_ERROR_BODY_BYTES
+			})
+		));
+	}
 }

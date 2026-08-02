@@ -31,14 +31,18 @@ prompt_read() {
     printf "%s" "$prompt" > /dev/tty
     IFS= read -r value < /dev/tty
     value="$(printf '%s' "$value" | tr -d '\r' | sed 's/[^[:print:]]//g' | xargs)"
-    eval "$var_name=\$value"
+    printf -v "$var_name" '%s' "$value"
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 LETHE_HOME="${LETHE_HOME:-$HOME/.lethe}"
 CONTAINER_NAME="lethe"
-MOUNTS_CONF="$LETHE_HOME/config/mounts.conf"
+# Mount policy is host-owned and intentionally outside the broad writable
+# LETHE_HOME container mount. A legacy config below LETHE_HOME must be reviewed
+# and re-created here rather than silently trusted after container compromise.
+HOST_CONTROL_DIR="${LETHE_HOST_CONTROL_DIR:-$HOME/.config/lethe}"
+MOUNTS_CONF="${LETHE_MOUNTS_CONF:-$HOST_CONTROL_DIR/container-mounts.conf}"
 REBUILD=0
 
 for arg in "$@"; do
@@ -82,7 +86,67 @@ PLATFORM="linux/${ARCH}"
 # ---------------------------------------------------------------------------
 # Directory mount configuration
 # ---------------------------------------------------------------------------
+canonical_directory() {
+    local directory="$1"
+    [[ -d "$directory" ]] || return 1
+    CDPATH= cd -- "$directory" 2>/dev/null && pwd -P
+}
+
+path_is_at_or_below() {
+    local path="${1%/}"
+    local root="${2%/}"
+    [[ -n "$path" ]] || path="/"
+    [[ -n "$root" ]] || root="/"
+    if [[ "$root" == "/" ]]; then
+        [[ "$path" == /* ]]
+    else
+        [[ "$path" == "$root" || "$path" == "$root/"* ]]
+    fi
+}
+
+paths_overlap() {
+    path_is_at_or_below "$1" "$2" || path_is_at_or_below "$2" "$1"
+}
+
+# The mount policy and generated launchers are trusted host control data. They
+# must never live below LETHE_HOME, which is writable from the container.
+host_control_boundary_is_safe() {
+    local mounts_parent lethe_real control_real mounts_parent_real
+
+    case "$LETHE_HOME$HOST_CONTROL_DIR$MOUNTS_CONF" in
+        *$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    [[ ! -L "$MOUNTS_CONF" ]] || return 1
+    [[ ! -e "$MOUNTS_CONF" || -f "$MOUNTS_CONF" ]] || return 1
+
+    mounts_parent="$(dirname -- "$MOUNTS_CONF")"
+    lethe_real="$(canonical_directory "$LETHE_HOME")" || return 1
+    control_real="$(canonical_directory "$HOST_CONTROL_DIR")" || return 1
+    mounts_parent_real="$(canonical_directory "$mounts_parent")" || return 1
+
+    [[ "$lethe_real" != "/" ]] || return 1
+    path_is_at_or_below "$control_real" "$lethe_real" && return 1
+    path_is_at_or_below "$mounts_parent_real" "$lethe_real" && return 1
+    return 0
+}
+
+host_control_path_is_safe() {
+    local path="$1"
+    local parent_real control_real
+
+    host_control_boundary_is_safe || return 1
+    parent_real="$(canonical_directory "$(dirname -- "$path")")" || return 1
+    control_real="$(canonical_directory "$HOST_CONTROL_DIR")" || return 1
+    path_is_at_or_below "$parent_real" "$control_real"
+}
+
 prompt_mounts() {
+    host_control_boundary_is_safe || {
+        printf 'Mount policy must be host-owned and outside LETHE_HOME: %s\n' \
+            "$MOUNTS_CONF" >&2
+        return 1
+    }
+
     echo ""
     echo -e "${YELLOW}Directory access${NC}"
     echo ""
@@ -138,13 +202,21 @@ prompt_mounts() {
             warn "  $abs_path does not exist, skipping"
             continue
         fi
+        if ! resolve_mount "$custom" >/dev/null; then
+            warn "  Unsafe or unsupported mount path, skipping"
+            continue
+        fi
 
         SELECTED_MOUNTS+=("$custom")
         success "  $abs_path"
     done
 
     # Save mount config
-    mkdir -p "$(dirname "$MOUNTS_CONF")"
+    local mounts_dir
+    mounts_dir="$(dirname "$MOUNTS_CONF")"
+    mkdir -p "$mounts_dir"
+    chmod 700 "$mounts_dir" 2>/dev/null || true
+    local mounts_tmp="${MOUNTS_CONF}.tmp.$$"
     {
         echo "# Lethe container mount configuration"
         echo "# Format: directory_name (relative to \$HOME, or absolute path)"
@@ -152,7 +224,9 @@ prompt_mounts() {
         for mount in "${SELECTED_MOUNTS[@]}"; do
             echo "$mount"
         done
-    } > "$MOUNTS_CONF"
+    } > "$mounts_tmp"
+    chmod 600 "$mounts_tmp"
+    mv "$mounts_tmp" "$MOUNTS_CONF"
 
     if [[ ${#SELECTED_MOUNTS[@]} -eq 0 ]]; then
         info "No additional directories mounted (Lethe can only access ~/.lethe)"
@@ -164,28 +238,70 @@ prompt_mounts() {
 
 load_mounts() {
     SELECTED_MOUNTS=()
+    host_control_boundary_is_safe || {
+        printf 'Mount policy must be host-owned and outside LETHE_HOME: %s\n' \
+            "$MOUNTS_CONF" >&2
+        return 1
+    }
     if [[ -f "$MOUNTS_CONF" ]]; then
         while IFS= read -r line; do
             [[ -z "$line" || "$line" = \#* ]] && continue
+            if ! resolve_mount "$line" >/dev/null; then
+                printf 'Unsafe mount entry in %s: %q\n' "$MOUNTS_CONF" "$line" >&2
+                return 1
+            fi
             SELECTED_MOUNTS+=("$line")
         done < "$MOUNTS_CONF"
     fi
 }
 
+mount_entry_is_valid() {
+    local entry="$1"
+    [[ -n "$entry" ]] || return 1
+    [[ "$entry" != " "* && "$entry" != *" " ]] || return 1
+    [[ "$entry" != -* ]] || return 1
+    [[ "$entry" != "/" ]] || return 1
+    [[ "$entry" =~ ^[[:alnum:]\ _./,@%+=~-]+$ ]] || return 1
+
+    local path_body="${entry#/}"
+    case "/$path_body/" in
+        */../*|*/./*) return 1 ;;
+    esac
+}
+
 # Resolve a mount entry to host_path:container_path
 resolve_mount() {
     local entry="$1"
-    local host_path container_path
+    local host_candidate host_path container_path
+
+    mount_entry_is_valid "$entry" || return 1
+    entry="${entry%/}"
 
     if [[ "$entry" = /* ]]; then
-        host_path="$entry"
+        host_candidate="$entry"
         container_path="/home/lethe${entry}"
     else
-        host_path="$HOME/$entry"
+        host_candidate="$HOME/$entry"
         container_path="/home/lethe/$entry"
     fi
 
-    echo "$host_path:$container_path"
+    [[ -d "$host_candidate" ]] || return 1
+    host_path="$(CDPATH= cd -- "$host_candidate" 2>/dev/null && pwd -P)" || return 1
+    host_control_boundary_is_safe || return 1
+
+    local control_real mounts_parent_real
+    control_real="$(canonical_directory "$HOST_CONTROL_DIR")" || return 1
+    mounts_parent_real="$(canonical_directory "$(dirname -- "$MOUNTS_CONF")")" \
+        || return 1
+    # Do not grant the container access to any ancestor or descendant of the
+    # trusted policy/launcher directories.
+    paths_overlap "$host_path" "$control_real" && return 1
+    paths_overlap "$host_path" "$mounts_parent_real" && return 1
+
+    # A colon is the runtime volume-field separator and remains ambiguous even
+    # when the complete argument is shell-quoted.
+    [[ "$host_path" != *:* && "$container_path" != *:* ]] || return 1
+    printf '%s:%s\n' "$host_path" "$container_path"
 }
 
 # ---------------------------------------------------------------------------
@@ -312,6 +428,170 @@ build_image_apple() {
     success "Container image built"
 }
 
+volume_pair() {
+    local host_path="$1"
+    local container_path="$2"
+    local mode="${3:-}"
+    case "$host_path$container_path$mode" in
+        *:*)
+            # Colons are added structurally below; accepting one in a field
+            # would change the runtime's volume grammar.
+            return 1
+            ;;
+        *$'\n'*|*$'\r'*) return 1 ;;
+    esac
+    if [[ -n "$mode" ]]; then
+        printf '%s:%s:%s\n' "$host_path" "$container_path" "$mode"
+    else
+        printf '%s:%s\n' "$host_path" "$container_path"
+    fi
+}
+
+write_bash_array_arg() {
+    printf '    %q\n' "$1"
+}
+
+# Render a host-owned launcher using a Bash argv array. Every path/value is one
+# `%q`-encoded array element, so mount data can never become shell source or an
+# additional runtime option.
+render_container_launcher() {
+    local runtime_kind="$1"
+    local runtime_bin="$2"
+    local launch_script="$3"
+    local mount mount_pair
+    local mount_pairs=()
+
+    case "$runtime_kind" in
+        apple|podman-linux|podman-mac) ;;
+        *) return 1 ;;
+    esac
+
+    host_control_boundary_is_safe || return 1
+
+    for mount in "${SELECTED_MOUNTS[@]}"; do
+        mount_pair="$(resolve_mount "$mount")" || return 1
+        mount_pairs+=("$mount_pair")
+    done
+
+    local home_pair env_pair
+    home_pair="$(volume_pair "$LETHE_HOME" "/home/lethe/.lethe")" || return 1
+    env_pair="$(volume_pair "$LETHE_HOME/config/.env" "/opt/lethe/.env" "ro")" \
+        || return 1
+
+    mkdir -p "$(dirname "$launch_script")"
+    host_control_path_is_safe "$launch_script" || return 1
+    local launch_tmp="${launch_script}.tmp.$$"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -euo pipefail'
+        printf 'runtime=%q\n' "$runtime_bin"
+        case "$runtime_kind" in
+            apple)
+                echo '"$runtime" system status &>/dev/null || "$runtime" system start'
+                ;;
+            podman-mac)
+                echo '"$runtime" machine inspect --format '\''{{.State}}'\'' 2>/dev/null | grep -qi running || "$runtime" machine start'
+                ;;
+            podman-linux)
+                printf '"$runtime" rm -f %q >/dev/null 2>&1 || true\n' "$CONTAINER_NAME"
+                ;;
+        esac
+        echo 'args=('
+        write_bash_array_arg "run"
+        case "$runtime_kind" in
+            apple)
+                write_bash_array_arg "--arch"
+                write_bash_array_arg "$ARCH"
+                write_bash_array_arg "--memory"
+                write_bash_array_arg "4G"
+                ;;
+            podman-linux|podman-mac)
+                write_bash_array_arg "--rm"
+                write_bash_array_arg "--name"
+                write_bash_array_arg "$CONTAINER_NAME"
+                write_bash_array_arg "--userns=keep-id"
+                if [[ "$runtime_kind" == "podman-linux" ]]; then
+                    write_bash_array_arg "--security-opt"
+                    write_bash_array_arg "label=disable"
+                fi
+                ;;
+        esac
+        write_bash_array_arg "--env"
+        write_bash_array_arg "LETHE_HOME=/home/lethe/.lethe"
+        if [[ "$runtime_kind" == "apple" ]]; then
+            write_bash_array_arg "--volume"
+            write_bash_array_arg "$home_pair"
+            write_bash_array_arg "--volume"
+            write_bash_array_arg "$env_pair"
+            for mount_pair in "${mount_pairs[@]}"; do
+                write_bash_array_arg "--volume"
+                write_bash_array_arg "$mount_pair"
+            done
+        else
+            write_bash_array_arg "-v"
+            write_bash_array_arg "$home_pair"
+            write_bash_array_arg "-v"
+            write_bash_array_arg "$env_pair"
+            for mount_pair in "${mount_pairs[@]}"; do
+                write_bash_array_arg "-v"
+                write_bash_array_arg "$mount_pair"
+            done
+        fi
+        write_bash_array_arg "lethe:latest"
+        echo ')'
+        echo 'exec "$runtime" "${args[@]}"'
+    } > "$launch_tmp" || {
+        rm -f "$launch_tmp"
+        return 1
+    }
+    chmod 700 "$launch_tmp"
+    mv "$launch_tmp" "$launch_script"
+}
+
+systemd_quote_arg() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    value="${value//\$/\$\$}"
+    printf '"%s"' "$value"
+}
+
+render_podman_systemd_service() {
+    local podman_bin="$1"
+    local launch_script="$2"
+    local service_file="$3"
+    local service_tmp="${service_file}.tmp.$$"
+
+    host_control_path_is_safe "$launch_script" || return 1
+    [[ -f "$launch_script" && -x "$launch_script" && ! -L "$launch_script" ]] \
+        || return 1
+
+    mkdir -p "$(dirname "$service_file")"
+    {
+        echo "[Unit]"
+        echo "Description=Lethe Autonomous AI Agent (podman)"
+        echo "After=network-online.target"
+        echo ""
+        echo "[Service]"
+        echo "Type=simple"
+        printf 'ExecStart=%s\n' "$(systemd_quote_arg "$launch_script")"
+        printf 'ExecStop=%s stop %s\n' \
+            "$(systemd_quote_arg "$podman_bin")" \
+            "$(systemd_quote_arg "$CONTAINER_NAME")"
+        echo "Restart=always"
+        echo "RestartSec=10"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=default.target"
+    } > "$service_tmp" || {
+        rm -f "$service_tmp"
+        return 1
+    }
+    chmod 600 "$service_tmp"
+    mv "$service_tmp" "$service_file"
+}
+
 # ---------------------------------------------------------------------------
 # Linux: podman (rootless)
 # ---------------------------------------------------------------------------
@@ -338,34 +618,13 @@ setup_podman() {
     podman_bin="$(command -v podman)"
     mkdir -p "$HOME/.config/systemd/user"
 
+    local launch_script="$HOST_CONTROL_DIR/run-container.sh"
+    render_container_launcher "podman-linux" "$podman_bin" "$launch_script" \
+        || error "Could not render a safe Podman launcher"
+
     local svc="$HOME/.config/systemd/user/lethe-container.service"
-    {
-        echo "[Unit]"
-        echo "Description=Lethe Autonomous AI Agent (podman)"
-        echo "After=network-online.target"
-        echo ""
-        echo "[Service]"
-        echo "Type=simple"
-        echo "ExecStartPre=-$podman_bin rm -f $CONTAINER_NAME"
-        printf "ExecStart=$podman_bin run --rm --name $CONTAINER_NAME"
-        printf " \\\\\n    --userns=keep-id"
-        printf " \\\\\n    --security-opt label=disable"
-        printf " \\\\\n    --env LETHE_HOME=/home/lethe/.lethe"
-        printf " \\\\\n    -v $LETHE_HOME:/home/lethe/.lethe"
-        printf " \\\\\n    -v $LETHE_HOME/config/.env:/opt/lethe/.env:ro"
-        for mount in "${SELECTED_MOUNTS[@]}"; do
-            local pair
-            pair=$(resolve_mount "$mount")
-            printf " \\\\\n    -v $pair"
-        done
-        printf " \\\\\n    lethe:latest\n"
-        echo "ExecStop=$podman_bin stop $CONTAINER_NAME"
-        echo "Restart=always"
-        echo "RestartSec=10"
-        echo ""
-        echo "[Install]"
-        echo "WantedBy=default.target"
-    } > "$svc"
+    render_podman_systemd_service "$podman_bin" "$launch_script" "$svc" \
+        || error "Could not render the Podman systemd service"
 
     systemctl --user daemon-reload
     systemctl --user enable lethe-container
@@ -374,6 +633,7 @@ setup_podman() {
     echo ""
     echo "  Image:     lethe:latest"
     echo "  Container: $CONTAINER_NAME"
+    echo "  Launcher:  $launch_script"
     echo "  Service:   ~/.config/systemd/user/lethe-container.service"
     echo ""
     echo "  Commands:"
@@ -397,25 +657,10 @@ setup_apple_container() {
         build_image_apple
     fi
 
-    # Create launch script
-    local launch_script="$LETHE_HOME/run-container.sh"
-    {
-        echo '#!/usr/bin/env bash'
-        printf '"%s" system status &>/dev/null || "%s" system start\n' "$container_bin" "$container_bin"
-        printf 'exec "%s" run \\\n' "$container_bin"
-        printf '    --arch %s \\\n' "$ARCH"
-        printf '    --memory 4G \\\n'
-        printf '    --env LETHE_HOME=/home/lethe/.lethe \\\n'
-        printf '    --volume "%s:/home/lethe/.lethe" \\\n' "$LETHE_HOME"
-        printf '    --volume "%s/config/.env:/opt/lethe/.env:ro" \\\n' "$LETHE_HOME"
-        for mount in "${SELECTED_MOUNTS[@]}"; do
-            local pair
-            pair=$(resolve_mount "$mount")
-            printf '    --volume "%s" \\\n' "$pair"
-        done
-        echo '    lethe:latest'
-    } > "$launch_script"
-    chmod +x "$launch_script"
+    # Create a host-owned argv-safe launch script.
+    local launch_script="$HOST_CONTROL_DIR/run-container.sh"
+    render_container_launcher "apple" "$container_bin" "$launch_script" \
+        || error "Could not render a safe Apple Container launcher"
 
     _write_launchd_plist "$launch_script" "$(dirname "$container_bin")"
 
@@ -459,24 +704,10 @@ setup_podman_mac() {
         success "Container image built"
     fi
 
-    # Create launch script
-    local launch_script="$LETHE_HOME/run-container.sh"
-    {
-        echo '#!/usr/bin/env bash'
-        printf '"%s" machine inspect --format '\''{{.State}}'\'' 2>/dev/null | grep -qi running || "%s" machine start\n' "$podman_bin" "$podman_bin"
-        printf 'exec "%s" run --rm --name lethe \\\n' "$podman_bin"
-        printf '    --userns=keep-id \\\n'
-        printf '    --env LETHE_HOME=/home/lethe/.lethe \\\n'
-        printf '    -v "%s:/home/lethe/.lethe" \\\n' "$LETHE_HOME"
-        printf '    -v "%s/config/.env:/opt/lethe/.env:ro" \\\n' "$LETHE_HOME"
-        for mount in "${SELECTED_MOUNTS[@]}"; do
-            local pair
-            pair=$(resolve_mount "$mount")
-            printf '    -v "%s" \\\n' "$pair"
-        done
-        echo '    lethe:latest'
-    } > "$launch_script"
-    chmod +x "$launch_script"
+    # Create a host-owned argv-safe launch script.
+    local launch_script="$HOST_CONTROL_DIR/run-container.sh"
+    render_container_launcher "podman-mac" "$podman_bin" "$launch_script" \
+        || error "Could not render a safe Podman launcher"
 
     _write_launchd_plist "$launch_script" "$(dirname "$podman_bin")"
 
@@ -539,13 +770,20 @@ main() {
     echo -e "${BLUE}Lethe Container Setup${NC}"
     echo ""
 
+    # Establish and validate the host/container trust boundary before writing
+    # policy or executable launchers.
+    mkdir -p "$LETHE_HOME" "$HOST_CONTROL_DIR" "$(dirname -- "$MOUNTS_CONF")"
+    host_control_boundary_is_safe \
+        || error "Mount policy and launcher directory must be outside LETHE_HOME"
+    chmod 700 "$HOST_CONTROL_DIR" "$(dirname -- "$MOUNTS_CONF")" 2>/dev/null || true
+
     # Ensure lethe home and dirs exist
     mkdir -p "$LETHE_HOME"/{config,data,logs,workspace,cache,credentials}
 
     # Mount configuration
     if [[ -f "$MOUNTS_CONF" && "$REBUILD" == "0" ]]; then
         info "Using existing mount config: $MOUNTS_CONF"
-        load_mounts
+        load_mounts || error "Mount policy contains an unsafe or invalid path"
         if [[ ${#SELECTED_MOUNTS[@]} -gt 0 ]]; then
             echo "  Mounted directories:"
             for mount in "${SELECTED_MOUNTS[@]}"; do
@@ -606,4 +844,6 @@ main() {
     echo "  Host filesystem is isolated except for the directories above."
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

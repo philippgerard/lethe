@@ -231,6 +231,18 @@ mod tests {
     }
 
     #[test]
+    fn embedded_auth_prompt_keeps_secrets_out_of_chat() {
+        let prompt = embedded_prompt("agent_instructions").unwrap();
+
+        assert!(prompt.contains("NEVER ask the principal to paste a token"));
+        assert!(prompt.contains("`vault_add` secure-input flow"));
+        assert!(!prompt.contains("ask the principal for the token"));
+
+        // Device authorization remains a valid non-secret control path.
+        assert!(prompt.contains("device URL + one-time code"));
+    }
+
+    #[test]
     fn render_replaces_brace_format_tokens() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().join("workspace");

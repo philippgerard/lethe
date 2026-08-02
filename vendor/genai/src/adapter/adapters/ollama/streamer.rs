@@ -31,6 +31,73 @@ impl OllamaStreamer {
 			captured_data: Default::default(),
 		}
 	}
+
+	fn capture_tool_calls(&mut self, tool_calls: &[ToolCall]) -> Result<()> {
+		if self.options.capture_tool_calls {
+			for tool_call in tool_calls {
+				self.captured_data.push_tool_call(tool_call.clone())?;
+			}
+		}
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod security_tests {
+	use super::*;
+	use crate::adapter::AdapterKind;
+	use crate::adapter::adapters::support::MAX_CAPTURED_TOOL_CALLS;
+	use crate::chat::ChatOptions;
+
+	fn streamer() -> OllamaStreamer {
+		let request = reqwest::Client::new().get("http://localhost");
+		let options = ChatOptions::default().with_capture_tool_calls(true);
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&options));
+		OllamaStreamer::new(
+			WebStream::new_with_delimiter(request, "\n"),
+			ModelIden::new(AdapterKind::Ollama, "security-test"),
+			options_set,
+		)
+	}
+
+	fn tool_call(index: usize) -> ToolCall {
+		ToolCall {
+			call_id: format!("call-{index}"),
+			fn_name: "lookup".to_string(),
+			fn_arguments: serde_json::json!({}),
+			thought_signatures: None,
+		}
+	}
+
+	#[test]
+	fn ordinary_ollama_tool_calls_remain_captured() {
+		let mut streamer = streamer();
+
+		streamer
+			.capture_tool_calls(&[tool_call(0), tool_call(1)])
+			.expect("ordinary tool calls should fit");
+
+		assert_eq!(streamer.captured_data.tool_call_count(), 2);
+	}
+
+	#[test]
+	fn ollama_tool_call_batches_stop_at_the_shared_limit() {
+		let mut streamer = streamer();
+		let tool_calls: Vec<_> = (0..=MAX_CAPTURED_TOOL_CALLS).map(tool_call).collect();
+
+		let error = streamer
+			.capture_tool_calls(&tool_calls)
+			.expect_err("tool call above the configured count should fail");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "captured tool calls",
+				limit: MAX_CAPTURED_TOOL_CALLS
+			}
+		));
+		assert_eq!(streamer.captured_data.tool_call_count(), MAX_CAPTURED_TOOL_CALLS);
+	}
 }
 
 impl futures::Stream for OllamaStreamer {
@@ -72,10 +139,7 @@ impl futures::Stream for OllamaStreamer {
 							if !reasoning.is_empty() {
 								// Add to the captured_reasoning_content if chat options say so
 								if self.options.capture_reasoning_content {
-									match self.captured_data.reasoning_content {
-										Some(ref mut r) => r.push_str(&reasoning),
-										None => self.captured_data.reasoning_content = Some(reasoning.clone()),
-									}
+									self.captured_data.append_reasoning_content(&reasoning)?;
 								}
 								return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(reasoning))));
 							}
@@ -87,10 +151,7 @@ impl futures::Stream for OllamaStreamer {
 							if !content.is_empty() {
 								// Add to the captured_content if chat options say so
 								if self.options.capture_content {
-									match self.captured_data.content {
-										Some(ref mut c) => c.push_str(&content),
-										None => self.captured_data.content = Some(content.clone()),
-									}
+									self.captured_data.append_content(&content)?;
 								}
 								return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(content))));
 							}
@@ -119,12 +180,7 @@ impl futures::Stream for OllamaStreamer {
 							}
 
 							if !tcs.is_empty() {
-								if self.options.capture_tool_calls {
-									match self.captured_data.tool_calls {
-										Some(ref mut existing) => existing.extend(tcs.clone()),
-										None => self.captured_data.tool_calls = Some(tcs.clone()),
-									}
-								}
+								self.capture_tool_calls(&tcs)?;
 								// Return the tool call as a chunk
 								if let Some(tc) = tcs.into_iter().next() {
 									return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tc))));
@@ -159,9 +215,9 @@ impl futures::Stream for OllamaStreamer {
 							let inter_stream_end = InterStreamEnd {
 								captured_usage: self.captured_data.usage.take(),
 								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-								captured_text_content: self.captured_data.content.take(),
-								captured_reasoning_content: self.captured_data.reasoning_content.take(),
-								captured_tool_calls: self.captured_data.tool_calls.take(),
+								captured_text_content: self.captured_data.take_content(),
+								captured_reasoning_content: self.captured_data.take_reasoning_content(),
+								captured_tool_calls: self.captured_data.take_tool_calls(),
 								captured_thought_signatures: None,
 								captured_response_id: None,
 							};
@@ -183,9 +239,9 @@ impl futures::Stream for OllamaStreamer {
 						let inter_stream_end = InterStreamEnd {
 							captured_usage: self.captured_data.usage.take(),
 							captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-							captured_text_content: self.captured_data.content.take(),
-							captured_reasoning_content: self.captured_data.reasoning_content.take(),
-							captured_tool_calls: self.captured_data.tool_calls.take(),
+							captured_text_content: self.captured_data.take_content(),
+							captured_reasoning_content: self.captured_data.take_reasoning_content(),
+							captured_tool_calls: self.captured_data.take_tool_calls(),
 							captured_thought_signatures: None,
 							captured_response_id: None,
 						};

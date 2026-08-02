@@ -28,16 +28,16 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt
 
       - name: Install mold
         run: curl -fsSL https://github.com/rui314/mold/releases/download/v2.41.0/mold-2.41.0-x86_64-linux.tar.gz | sudo tar -xz --strip-components=1 -C /usr/local
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: .
           cache-on-failure: "true"
@@ -46,7 +46,19 @@ jobs:
         run: cargo fmt --check
 
       - name: Check release scripts
-        run: bash -n install.sh update.sh scripts/package-release
+        run: >-
+          bash -n install.sh update.sh scripts/package-release
+          scripts/test-binary-attestation scripts/test-release-security
+          scripts/tests/security-policy-regression.sh
+
+      - name: Test release security policy
+        run: bash scripts/test-release-security
+
+      - name: Test binary attestation behavior
+        run: bash scripts/test-binary-attestation
+
+      - name: Test shell security policy
+        run: bash scripts/tests/security-policy-regression.sh
 
       - name: Test Lethe
         env:
@@ -60,6 +72,10 @@ jobs:
     name: Build ${{ matrix.name }}
     needs: verify
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -90,14 +106,17 @@ jobs:
             deps: "true"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Enforce release security policy
+        run: bash scripts/test-release-security
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       # Only the `lethe` workspace — the migrator (LanceDB/Arrow/DataFusion)
       # builds in its own workflow so its multi-GB target tree never evicts
       # this cache. See .github/workflows/release-migrator.yml.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: .
           cache-on-failure: "true"
@@ -122,7 +141,13 @@ jobs:
           LETHE_RELEASE_TARGET: ${{ matrix.target }}
         run: scripts/package-release
 
-      - uses: actions/upload-artifact@v7
+      - name: Attest release archive
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: lethe-${{ matrix.name }}
           path: |
@@ -136,13 +161,26 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
+      attestations: read
 
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v3
+      - name: Verify release provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for archive in dist/*.tar.gz; do
+            gh attestation verify "$archive" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --deny-self-hosted-runners
+          done
+
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           files: dist/*

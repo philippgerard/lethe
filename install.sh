@@ -89,40 +89,163 @@ detect_release_target() {
     esac
 }
 
+# Verify that GitHub produced this exact archive for the configured repository.
+# A checksum uploaded beside the archive would share the same compromise
+# boundary, so release binaries require GitHub's signed artifact attestation.
+verify_release_attestation() {
+    local archive="$1"
+    local signer_workflow="$2"
+    local release_tag="$3"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        warn "GitHub CLI (gh) is required to verify binary release provenance."
+        return 1
+    fi
+
+    if ! gh attestation verify "$archive" \
+        --repo "$REPO_OWNER/$REPO_NAME" \
+        --signer-workflow "$REPO_OWNER/$REPO_NAME/.github/workflows/$signer_workflow" \
+        --source-ref "refs/tags/$release_tag" \
+        --deny-self-hosted-runners >/dev/null 2>&1; then
+        warn "Release provenance verification failed for $(basename "$archive")."
+        return 1
+    fi
+}
+
+release_tag_from_url() {
+    local remainder tag asset
+    remainder="${1#*/releases/download/}"
+    if [ "$remainder" = "$1" ]; then
+        return 1
+    fi
+    tag="${remainder%%/*}"
+    asset="${remainder#*/}"
+    if [[ "$asset" == "$remainder" || -z "$asset" \
+        || -z "$tag" || "$tag" == *[!A-Za-z0-9._-]* ]]; then
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
+resolve_tagged_release_url() {
+    local url="$1"
+    local redirect_url
+
+    if release_tag_from_url "$url" >/dev/null; then
+        printf '%s\n' "$url"
+        return 0
+    fi
+
+    # Do not follow this request: GitHub's first redirect names the immutable
+    # tag, while the next redirect lands on release-assets without that tag.
+    if ! redirect_url="$(curl -fsS -o /dev/null -w '%{redirect_url}' "$url")"; then
+        return 1
+    fi
+    release_tag_from_url "$redirect_url" >/dev/null || return 1
+    printf '%s\n' "$redirect_url"
+}
+
+install_binary_atomically() {
+    local source="$1"
+    local name="$2"
+    local staged destination
+
+    mkdir -p "$BIN_DIR"
+    destination="$BIN_DIR/$name"
+    if [ -d "$destination" ] && [ ! -L "$destination" ]; then
+        warn "Refusing to replace directory $destination with a binary"
+        return 1
+    fi
+    if ! staged="$(mktemp "$BIN_DIR/.${name}.tmp.XXXXXX")"; then
+        warn "Could not create a staging file in $BIN_DIR"
+        return 1
+    fi
+    if ! cp "$source" "$staged" || ! chmod 0755 "$staged"; then
+        warn "Could not stage $name in $BIN_DIR"
+        rm -f "$staged"
+        return 1
+    fi
+    if [ -d "$destination" ] && [ ! -L "$destination" ]; then
+        warn "Refusing to replace directory $destination with a binary"
+        rm -f "$staged"
+        return 1
+    fi
+    # GNU `mv -T` and BSD/macOS `mv -h` both force the destination to be
+    # treated as a path entry, not as a directory after following a symlink.
+    # The final operation is therefore one same-directory rename.
+    case "$(uname -s)" in
+        Linux)  mv -fT "$staged" "$destination" ;;
+        Darwin) mv -fh "$staged" "$destination" ;;
+        *)
+            warn "Atomic no-follow installation is unsupported on this platform"
+            rm -f "$staged"
+            return 1
+            ;;
+    esac || {
+        warn "Could not atomically install $destination"
+        rm -f "$staged"
+        return 1
+    }
+}
+
 # Download $1 (binary name: "lethe" or "lethe-migrate") for $2 (target
 # triple) into $BIN_DIR. Returns non-zero on any failure so callers
 # can treat optional binaries gracefully.
 download_binary() {
     local name="$1"
     local target="$2"
-    local url tmp archive binary
+    local url tmp archive binary package tagged_url release_tag signer_workflow
     url="$RELEASE_BASE_URL/${name}-${target}.tar.gz"
     tmp="$(mktemp -d)"
     archive="$tmp/${name}.tar.gz"
 
     info "Downloading $name: $url"
-    if ! curl -fsSL "$url" -o "$archive"; then
-        warn "Download failed: $url"
+    if ! tagged_url="$(resolve_tagged_release_url "$url")"; then
+        warn "Could not resolve $url to an immutable tagged release URL"
         rm -rf "$tmp"
         return 1
     fi
 
-    if ! tar -xzf "$archive" -C "$tmp"; then
-        warn "Could not unpack $url"
+    if ! release_tag="$(release_tag_from_url "$tagged_url")"; then
+        warn "Could not determine the release tag from $tagged_url"
         rm -rf "$tmp"
         return 1
     fi
 
-    binary="$(find "$tmp" -type f -name "$name" -perm -111 | head -n 1)"
-    if [ -z "$binary" ]; then
-        warn "Archive did not contain an executable $name"
+    if ! curl -fsSL "$tagged_url" -o "$archive"; then
+        warn "Download failed: $tagged_url"
         rm -rf "$tmp"
         return 1
     fi
 
-    mkdir -p "$BIN_DIR"
-    cp "$binary" "$BIN_DIR/$name"
-    chmod +x "$BIN_DIR/$name"
+    case "$name" in
+        lethe) signer_workflow="release.yml" ;;
+        lethe-migrate) signer_workflow="release-migrator.yml" ;;
+        *)
+            warn "No trusted release workflow configured for $name"
+            rm -rf "$tmp"
+            return 1
+            ;;
+    esac
+
+    if ! verify_release_attestation "$archive" "$signer_workflow" "$release_tag"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    package="${name}-${target}"
+    binary="$tmp/$name"
+    if ! tar -xOzf "$archive" "$package/$name" > "$binary" || [ ! -s "$binary" ]; then
+        warn "Archive did not contain $package/$name"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    chmod +x "$binary"
+    if ! install_binary_atomically "$binary" "$name"; then
+        rm -rf "$tmp"
+        return 1
+    fi
     rm -rf "$tmp"
     success "Installed $BIN_DIR/$name"
     return 0
@@ -179,9 +302,8 @@ build_from_source() {
 
     info "Building lethe with Cargo..."
     cargo build --release --manifest-path "$INSTALL_DIR/Cargo.toml"
-    mkdir -p "$BIN_DIR"
-    cp "$INSTALL_DIR/target/release/lethe" "$BIN_DIR/lethe"
-    chmod +x "$BIN_DIR/lethe"
+    install_binary_atomically "$INSTALL_DIR/target/release/lethe" lethe \
+        || error "Could not install the built lethe binary."
     success "Installed $BIN_DIR/lethe"
 
     # The migrator is one-shot; only build it if explicitly requested.
@@ -189,8 +311,9 @@ build_from_source() {
         ensure_protoc
         info "Building lethe-migrate with Cargo..."
         cargo build --release --manifest-path "$INSTALL_DIR/migrator/Cargo.toml"
-        cp "$INSTALL_DIR/migrator/target/release/lethe-migrate" "$BIN_DIR/lethe-migrate"
-        chmod +x "$BIN_DIR/lethe-migrate"
+        install_binary_atomically \
+            "$INSTALL_DIR/migrator/target/release/lethe-migrate" lethe-migrate \
+            || error "Could not install the built lethe-migrate binary."
         success "Installed $BIN_DIR/lethe-migrate"
     fi
 }
@@ -300,4 +423,6 @@ main() {
     echo "Next:  $BIN_DIR/lethe status   ·   $BIN_DIR/lethe check"
 }
 
-main "$@"
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

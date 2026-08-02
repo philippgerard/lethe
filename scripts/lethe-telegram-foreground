@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Run Lethe Telegram polling in the foreground with the configured Lethe
-# environment loaded from ~/.lethe/config/.env.
+# Run Lethe Telegram polling in the foreground with a host-only environment
+# file. The container-writable ~/.lethe/config/.env is never consumed here.
 
 set -euo pipefail
 
@@ -10,23 +10,126 @@ die() {
     exit 1
 }
 
+load_strict_env_file() {
+    local env_file="$1"
+    local line line_number=0 key value
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_number=$((line_number + 1))
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" == "export "* ]]; then
+            line="${line#"export "}"
+        fi
+        if [[ "$line" != *=* ]]; then
+            printf 'invalid dotenv line %d: expected KEY=VALUE\n' "$line_number" >&2
+            return 1
+        fi
+
+        key="${line%%=*}"
+        value="${line#*=}"
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            printf 'invalid dotenv key on line %d\n' "$line_number" >&2
+            return 1
+        fi
+        case "$key" in
+            BASH_ENV|BASHOPTS|CDPATH|ENV|GLOBIGNORE|IFS|PATH|SHELLOPTS|\
+            LETHE_BIN|LETHE_ENV_FILE|LD_*|DYLD_*)
+                printf 'process-control dotenv key on line %d: %s\n' \
+                    "$line_number" "$key" >&2
+                return 1
+                ;;
+        esac
+
+        case "$value" in
+            \'*)
+                [[ "$value" == *\' && ${#value} -ge 2 ]] || {
+                    printf 'unterminated quoted dotenv value on line %d\n' "$line_number" >&2
+                    return 1
+                }
+                value="${value#\'}"
+                value="${value%\'}"
+                ;;
+            \"*)
+                [[ "$value" == *\" && ${#value} -ge 2 ]] || {
+                    printf 'unterminated quoted dotenv value on line %d\n' "$line_number" >&2
+                    return 1
+                }
+                value="${value#\"}"
+                value="${value%\"}"
+                ;;
+        esac
+
+        if [[ "$value" =~ [[:cntrl:]] ]]; then
+            printf 'control character in dotenv value on line %d\n' "$line_number" >&2
+            return 1
+        fi
+        case "$value" in
+            *'$('*|*'${'*|*'`'*|*';'*|*'&&'*|*'||'*|*'<('*|*'>('* )
+                printf 'shell construct in dotenv value on line %d\n' "$line_number" >&2
+                return 1
+                ;;
+        esac
+
+        # `export name=value` receives one already-separated argument. The
+        # value is never parsed, expanded, or evaluated as shell source.
+        export "$key=$value"
+    done < "$env_file"
+}
+
+canonical_directory() {
+    local directory="$1"
+    [[ -d "$directory" ]] || return 1
+    CDPATH= cd -- "$directory" 2>/dev/null && pwd -P
+}
+
+env_file_is_outside_lethe_home() {
+    local env_file="$1"
+    local env_parent lethe_real control_real env_parent_real
+
+    [[ -f "$env_file" && ! -L "$env_file" ]] || return 1
+    env_parent="$(dirname -- "$env_file")"
+    lethe_real="$(canonical_directory "$LETHE_HOME")" || return 1
+    control_real="$(canonical_directory "$HOST_CONTROL_DIR")" || return 1
+    env_parent_real="$(canonical_directory "$env_parent")" || return 1
+    [[ "$lethe_real" != "/" ]] || return 1
+    [[ "$control_real" != "$lethe_real" \
+        && "$control_real" != "$lethe_real/"* ]] || return 1
+    [[ "$env_parent_real" == "$control_real" \
+        || "$env_parent_real" == "$control_real/"* ]]
+}
+
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
 export LETHE_HOME="${LETHE_HOME:-$HOME/.lethe}"
+HOST_CONTROL_DIR="${LETHE_HOST_CONTROL_DIR:-$HOME/.config/lethe}"
 
-ENV_FILE="${LETHE_ENV_FILE:-$LETHE_HOME/config/.env}"
-if [ ! -f "$ENV_FILE" ]; then
-    die "Lethe env file not found: $ENV_FILE"
+DEFAULT_ENV_FILE="$HOST_CONTROL_DIR/foreground.env"
+ENV_FILE="${LETHE_ENV_FILE:-$DEFAULT_ENV_FILE}"
+if [[ "$ENV_FILE" == "$DEFAULT_ENV_FILE" && ! -e "$ENV_FILE" && ! -L "$ENV_FILE" ]]; then
+    (umask 077 && mkdir -p -- "$HOST_CONTROL_DIR") \
+        || die "Could not create host control directory: $HOST_CONTROL_DIR"
+    lethe_real="$(canonical_directory "$LETHE_HOME")" \
+        || die "Lethe home is not a directory: $LETHE_HOME"
+    control_real="$(canonical_directory "$HOST_CONTROL_DIR")" \
+        || die "Host control directory is not a directory: $HOST_CONTROL_DIR"
+    [[ "$control_real" != "$lethe_real" \
+        && "$control_real" != "$lethe_real/"* ]] \
+        || die "Host control directory must be outside LETHE_HOME: $HOST_CONTROL_DIR"
+    (set -o noclobber; umask 077; : > "$ENV_FILE") 2>/dev/null \
+        || die "Could not safely create host-only foreground env file: $ENV_FILE"
+    chmod 600 "$ENV_FILE" \
+        || die "Could not protect host-only foreground env file: $ENV_FILE"
 fi
+if [ ! -f "$ENV_FILE" ]; then
+    die "Host-only Lethe foreground env file not found: $ENV_FILE"
+fi
+env_file_is_outside_lethe_home "$ENV_FILE" \
+    || die "Foreground env file must be a regular non-symlink below the host control directory: $ENV_FILE"
 
-set -a
-set +u
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
-set -u
+load_strict_env_file "$ENV_FILE" || die "Invalid Lethe dotenv file: $ENV_FILE"
 
 export LETHE_HOME="${LETHE_HOME:-$HOME/.lethe}"
 export LOGS_DIR="${LOGS_DIR:-$LETHE_HOME/logs}"

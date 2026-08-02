@@ -92,7 +92,13 @@ impl OpenAIStreamer {
 
 	/// Captures a single tool call into `captured_data.tool_calls`, merging with existing if needed.
 	/// Returns the (possibly merged) tool call for use in events.
-	fn capture_tool_call(&mut self, index: usize, call_id: String, fn_name: String, arguments: String) -> ToolCall {
+	fn capture_tool_call(
+		&mut self,
+		index: usize,
+		call_id: String,
+		fn_name: String,
+		arguments: String,
+	) -> Result<ToolCall> {
 		let tool_call = ToolCall {
 			call_id: call_id.clone(),
 			fn_name: fn_name.clone(),
@@ -101,28 +107,77 @@ impl OpenAIStreamer {
 		};
 
 		if !self.options.capture_tool_calls {
-			return tool_call;
+			return Ok(tool_call);
 		}
+		self.captured_data.merge_tool_call_fragment(index, call_id, fn_name, arguments)
+	}
+}
 
-		let calls = self.captured_data.tool_calls.get_or_insert_with(Vec::new);
+#[cfg(test)]
+mod security_tests {
+	use super::*;
+	use crate::adapter::adapters::support::MAX_CAPTURED_TOOL_CALLS;
+	use crate::chat::ChatOptions;
 
-		if let Some(existing_call) = calls.get_mut(index) {
-			// Merge with existing: accumulate arguments as strings
-			if let Some(existing_args) = existing_call.fn_arguments.as_str() {
-				let accumulated = format!("{existing_args}{arguments}");
-				existing_call.fn_arguments = Value::String(accumulated);
+	fn capturing_streamer() -> OpenAIStreamer {
+		let request = reqwest::Client::new().get("http://localhost");
+		let inner = EventSourceStream::new(request);
+		let options = ChatOptions::default().with_capture_tool_calls(true);
+		let options_set = ChatOptionsSet::default().with_chat_options(Some(&options));
+		OpenAIStreamer::new(inner, ModelIden::new(AdapterKind::OpenAI, "security-test"), options_set)
+	}
+
+	#[test]
+	fn tool_call_capture_preserves_dense_legitimate_indexes_and_argument_merging() {
+		let mut streamer = capturing_streamer();
+
+		streamer
+			.capture_tool_call(0, "call-0".to_string(), "lookup".to_string(), "{\"id\":".to_string())
+			.expect("first dense index should be accepted");
+		let merged = streamer
+			.capture_tool_call(0, String::new(), String::new(), "1}".to_string())
+			.expect("existing index should merge arguments");
+		streamer
+			.capture_tool_call(1, "call-1".to_string(), "next".to_string(), "{}".to_string())
+			.expect("next dense index should be accepted");
+
+		assert_eq!(merged.fn_arguments, Value::String("{\"id\":1}".to_string()));
+		assert_eq!(streamer.captured_data.tool_call_count(), 2);
+	}
+
+	#[test]
+	fn tool_call_capture_rejects_the_configured_index_limit_without_allocating() {
+		let mut streamer = capturing_streamer();
+
+		let error = streamer
+			.capture_tool_call(
+				MAX_CAPTURED_TOOL_CALLS,
+				"call".to_string(),
+				"lookup".to_string(),
+				"{}".to_string(),
+			)
+			.expect_err("index at the exclusive limit should fail");
+
+		assert!(matches!(
+			error,
+			Error::InvalidToolCallIndex {
+				index: MAX_CAPTURED_TOOL_CALLS,
+				limit: MAX_CAPTURED_TOOL_CALLS
 			}
-			// Update call_id and fn_name on first chunk that has them
-			if !fn_name.is_empty() {
-				existing_call.call_id = call_id;
-				existing_call.fn_name = fn_name;
-			}
-			existing_call.clone()
-		} else {
-			// New tool call - resize to handle potential gaps (though unlikely in streaming)
-			calls.resize(index + 1, tool_call.clone());
-			tool_call
-		}
+		));
+		assert_eq!(streamer.captured_data.tool_call_count(), 0);
+	}
+
+	#[test]
+	fn tool_call_capture_rejects_sparse_indexes_without_resizing() {
+		let mut streamer = capturing_streamer();
+
+		let error = streamer
+			.capture_tool_call(1, "call".to_string(), "lookup".to_string(), "{}".to_string())
+			.expect_err("first tool call must use index zero");
+
+		assert!(matches!(error, Error::InvalidToolCallIndex { index: 1, .. }));
+		assert_eq!(streamer.captured_data.tool_call_count(), 0);
 	}
 }
 
@@ -154,7 +209,7 @@ impl futures::Stream for OpenAIStreamer {
 
 						// -- Process the captured_tool_calls
 						// NOTE: here we attempt to parse the `fn_arguments` if it is string, because it means that it was accumulated
-						let captured_tool_calls = if let Some(tools_calls) = self.captured_data.tool_calls.take() {
+						let captured_tool_calls = if let Some(tools_calls) = self.captured_data.take_tool_calls() {
 							let tools_calls: Vec<ToolCall> = tools_calls
 								.into_iter()
 								.map(|tool_call| {
@@ -194,8 +249,8 @@ impl futures::Stream for OpenAIStreamer {
 						let inter_stream_end = InterStreamEnd {
 							captured_usage,
 							captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-							captured_text_content: self.captured_data.content.take(),
-							captured_reasoning_content: self.captured_data.reasoning_content.take(),
+							captured_text_content: self.captured_data.take_content(),
+							captured_reasoning_content: self.captured_data.take_reasoning_content(),
 							captured_tool_calls,
 							captured_thought_signatures: None,
 							captured_response_id: None,
@@ -251,7 +306,7 @@ impl futures::Stream for OpenAIStreamer {
 										let fn_name = function.x_take::<String>("name").unwrap_or_default();
 										let arguments = function.x_take::<String>("arguments").unwrap_or_default();
 
-										let tc = self.capture_tool_call(index as usize, call_id, fn_name, arguments);
+										let tc = self.capture_tool_call(index as usize, call_id, fn_name, arguments)?;
 										if first_tool_call_event.is_none() {
 											first_tool_call_event = Some(tc);
 										}
@@ -279,20 +334,14 @@ impl futures::Stream for OpenAIStreamer {
 								&& !content.is_empty()
 							{
 								if self.options.capture_content {
-									match self.captured_data.content {
-										Some(ref mut c) => c.push_str(&content),
-										None => self.captured_data.content = Some(content.clone()),
-									}
+									self.captured_data.append_content(&content)?;
 								}
 								return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(content))));
 							} else if let Some(reasoning_content) = reasoning_content
 								&& !reasoning_content.is_empty()
 							{
 								if self.options.capture_reasoning_content {
-									match self.captured_data.reasoning_content {
-										Some(ref mut c) => c.push_str(&reasoning_content),
-										None => self.captured_data.reasoning_content = Some(reasoning_content.clone()),
-									}
+									self.captured_data.append_reasoning_content(&reasoning_content)?;
 								}
 								return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(reasoning_content))));
 							}
@@ -327,7 +376,8 @@ impl futures::Stream for OpenAIStreamer {
 									let fn_name = function.x_take::<String>("name").unwrap_or_default();
 									let arguments = function.x_take::<String>("arguments").unwrap_or_default();
 
-									let tool_call = self.capture_tool_call(index as usize, call_id, fn_name, arguments);
+									let tool_call =
+										self.capture_tool_call(index as usize, call_id, fn_name, arguments)?;
 
 									// Return the ToolCallChunk event
 									return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tool_call))));
@@ -351,10 +401,7 @@ impl futures::Stream for OpenAIStreamer {
 							{
 								// Add to the captured_content if chat options allow it
 								if self.options.capture_content {
-									match self.captured_data.content {
-										Some(ref mut c) => c.push_str(&content),
-										None => self.captured_data.content = Some(content.clone()),
-									}
+									self.captured_data.append_content(&content)?;
 								}
 
 								// Return the Event
@@ -364,10 +411,7 @@ impl futures::Stream for OpenAIStreamer {
 							{
 								// Add to the captured_content if chat options allow it
 								if self.options.capture_reasoning_content {
-									match self.captured_data.reasoning_content {
-										Some(ref mut c) => c.push_str(&reasoning_content),
-										None => self.captured_data.reasoning_content = Some(reasoning_content.clone()),
-									}
+									self.captured_data.append_reasoning_content(&reasoning_content)?;
 								}
 
 								// Return the Event

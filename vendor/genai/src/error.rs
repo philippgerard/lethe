@@ -118,6 +118,12 @@ Cause:\n{cause}
 		error: BoxError,
 	},
 
+	#[display("Stream {resource} exceeded the configured limit of {limit}")]
+	StreamLimitExceeded { resource: &'static str, limit: usize },
+
+	#[display("Tool-call index {index} is invalid; expected a dense index below {limit}")]
+	InvalidToolCallIndex { index: usize, limit: usize },
+
 	#[display("HTTP error.\nStatus: {status} {canonical_reason}\nBody: {body}")]
 	HttpError {
 		status: StatusCode,

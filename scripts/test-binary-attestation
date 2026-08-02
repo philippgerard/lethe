@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$TEST_DIR"' EXIT
+
+fail() {
+    printf 'binary attestation regression: %s\n' "$1" >&2
+    exit 1
+}
+
+mkdir -p "$TEST_DIR/bin"
+
+cat > "$TEST_DIR/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+output=""
+write_format=""
+follow=0
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            output="$2"
+            shift 2
+            ;;
+        -w)
+            write_format="$2"
+            shift 2
+            ;;
+        -*L*)
+            follow=1
+            shift
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            url="$1"
+            shift
+            ;;
+    esac
+done
+[ -n "$url" ]
+if [ -n "$write_format" ]; then
+    [ "$follow" = "0" ]
+    [ "$output" = "/dev/null" ]
+    printf 'resolve:%s\n' "$url" >> "$MOCK_CURL_LOG"
+    printf '%s' "$MOCK_TAGGED_URL"
+    exit 0
+fi
+[ "$follow" = "1" ]
+[ -n "$output" ]
+[ "$url" = "$MOCK_TAGGED_URL" ]
+printf 'download:%s\n' "$url" >> "$MOCK_CURL_LOG"
+printf 'final:%s\n' "$MOCK_FINAL_URL" >> "$MOCK_CURL_LOG"
+printf 'mock release archive' > "$output"
+EOF
+
+cat > "$TEST_DIR/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+: > "$MOCK_GH_LOG"
+printf '%s\n' "$@" >> "$MOCK_GH_LOG"
+[ "${MOCK_GH_RESULT:-reject}" = "accept" ]
+EOF
+
+cat > "$TEST_DIR/bin/tar" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'called\n' > "$MOCK_TAR_MARKER"
+printf '#!/usr/bin/env sh\nexit 0\n'
+EOF
+
+cat > "$TEST_DIR/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${MOCK_MV_RESULT:-accept}" = "reject" ]; then
+    exit 1
+fi
+exec /bin/mv "$@"
+EOF
+
+chmod +x "$TEST_DIR/bin/curl" "$TEST_DIR/bin/gh" "$TEST_DIR/bin/tar" "$TEST_DIR/bin/mv"
+
+run_case() (
+    local script="$1"
+    local mode="$2"
+    local binary_name="$3"
+    local gh_result="$4"
+    local expected_workflow="$5"
+    local label="$6"
+    local release_mode="${7:-latest}"
+    local mv_result="${8:-accept}"
+    local destination_kind="${9:-symlink}"
+    local case_dir="$TEST_DIR/$label"
+    local tagged_base="https://github.com/test-owner/test-repo/releases/download/v1.2.3"
+    local tagged_url="$tagged_base/${binary_name}-test-target.tar.gz"
+    local final_url="https://release-assets.githubusercontent.com/mock/${binary_name}.tar.gz"
+    local sentinel_target="$case_dir/sentinel-target"
+    local final_binary
+
+    mkdir -p "$case_dir/home/.lethe/bin"
+    export PATH="$TEST_DIR/bin:/usr/bin:/bin"
+    export HOME="$case_dir/home"
+    export LETHE_HOME="$case_dir/home/.lethe"
+    export LETHE_REPO_OWNER="test-owner"
+    export LETHE_REPO_NAME="test-repo"
+    if [ "$release_mode" = "direct" ]; then
+        export LETHE_RELEASE_BASE_URL="$tagged_base"
+    else
+        export LETHE_RELEASE_BASE_URL="https://github.com/test-owner/test-repo/releases/latest/download"
+    fi
+    export MOCK_BINARY_NAME="$binary_name"
+    export MOCK_TAGGED_URL="$tagged_url"
+    export MOCK_FINAL_URL="$final_url"
+    export MOCK_CURL_LOG="$case_dir/curl-requests"
+    export MOCK_GH_RESULT="$gh_result"
+    export MOCK_GH_LOG="$case_dir/gh-args"
+    export MOCK_TAR_MARKER="$case_dir/tar-called"
+    export MOCK_MV_RESULT="$mv_result"
+    : > "$MOCK_CURL_LOG"
+    final_binary="$LETHE_HOME/bin/$binary_name"
+    if [ "$destination_kind" = "directory" ]; then
+        mkdir -p "$final_binary"
+        printf 'sentinel\n' > "$final_binary/sentinel"
+    else
+        mkdir -p "$sentinel_target"
+        printf 'sentinel\n' > "$sentinel_target/sentinel"
+        # A destination symlink to a directory catches `mv source destination`
+        # implementations that follow the link and move the staged file inside.
+        ln -s "$sentinel_target" "$final_binary"
+    fi
+
+    # Both scripts must be sourceable for offline unit testing without running
+    # their installer/updater main paths.
+    # shellcheck source=/dev/null
+    source "$script"
+
+    detect_release_target() {
+        printf '%s\n' "test-target"
+    }
+
+    invoke_install() {
+        if [ "$mode" = "install" ]; then
+            download_binary "$binary_name" "test-target"
+        else
+            install_release_binary
+        fi
+    }
+
+    if [ "$gh_result" = "accept" ] && [ "$mv_result" = "accept" ] \
+        && [ "$destination_kind" != "directory" ]; then
+        invoke_install || fail "$label rejected a valid attestation"
+        [ -x "$BIN_DIR/$binary_name" ] || fail "$label did not install the verified binary"
+        [ ! -L "$BIN_DIR/$binary_name" ] || fail "$label followed the existing destination symlink"
+        [ -f "$MOCK_TAR_MARKER" ] || fail "$label did not unpack after verification"
+    else
+        if invoke_install; then
+            fail "$label succeeded despite a rejected attestation or atomic rename"
+        fi
+        if [ "$destination_kind" = "directory" ]; then
+            [ -d "$final_binary" ] && [ ! -L "$final_binary" ] \
+                || fail "$label changed the destination directory on failure"
+        else
+            [ -L "$final_binary" ] || fail "$label changed the destination on failure"
+        fi
+        if [ "$gh_result" != "accept" ]; then
+            [ ! -e "$MOCK_TAR_MARKER" ] || fail "$label unpacked an unverified archive"
+        fi
+    fi
+    if [ "$destination_kind" = "directory" ]; then
+        [ "$(cat "$final_binary/sentinel")" = "sentinel" ] \
+            || fail "$label modified the destination directory on failure"
+        [ "$(find "$final_binary" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = "1" ] \
+            || fail "$label moved the staged binary inside the destination directory"
+    else
+        [ "$(cat "$sentinel_target/sentinel")" = "sentinel" ] \
+            || fail "$label modified the destination symlink target"
+    fi
+
+    grep -Fx -- "download:$tagged_url" "$MOCK_CURL_LOG" >/dev/null \
+        || fail "$label did not download the immutable tagged URL"
+    grep -Fx -- "final:$final_url" "$MOCK_CURL_LOG" >/dev/null \
+        || fail "$label did not simulate the final release-assets redirect"
+    if [ "$release_mode" = "direct" ]; then
+        if grep -q '^resolve:' "$MOCK_CURL_LOG"; then
+            fail "$label needlessly resolved an already tagged URL"
+        fi
+    else
+        grep -Fx -- "resolve:$LETHE_RELEASE_BASE_URL/${binary_name}-test-target.tar.gz" \
+            "$MOCK_CURL_LOG" >/dev/null \
+            || fail "$label did not resolve exactly the first latest redirect"
+    fi
+
+    grep -Fx -- "attestation" "$MOCK_GH_LOG" >/dev/null \
+        || fail "$label did not invoke gh attestation"
+    grep -Fx -- "verify" "$MOCK_GH_LOG" >/dev/null \
+        || fail "$label did not invoke gh attestation verify"
+    grep -Fx -- "test-owner/test-repo" "$MOCK_GH_LOG" >/dev/null \
+        || fail "$label did not constrain the repository"
+    grep -Fx -- "test-owner/test-repo/.github/workflows/$expected_workflow" "$MOCK_GH_LOG" >/dev/null \
+        || fail "$label did not constrain the signer workflow"
+    grep -Fx -- "refs/tags/v1.2.3" "$MOCK_GH_LOG" >/dev/null \
+        || fail "$label did not constrain the source tag"
+    grep -Fx -- "--deny-self-hosted-runners" "$MOCK_GH_LOG" >/dev/null \
+        || fail "$label allowed self-hosted provenance"
+)
+
+run_case "$ROOT_DIR/install.sh" install lethe reject release.yml install-reject
+run_case "$ROOT_DIR/install.sh" install lethe accept release.yml install-accept
+run_case "$ROOT_DIR/install.sh" install lethe-migrate accept release-migrator.yml migrator-accept
+run_case "$ROOT_DIR/update.sh" update lethe reject release.yml update-reject
+run_case "$ROOT_DIR/update.sh" update lethe accept release.yml update-accept
+run_case "$ROOT_DIR/install.sh" install lethe accept release.yml install-direct direct
+run_case "$ROOT_DIR/update.sh" update lethe accept release.yml update-direct direct
+run_case "$ROOT_DIR/install.sh" install lethe accept release.yml install-rename-failure latest reject
+run_case "$ROOT_DIR/install.sh" install lethe accept release.yml install-directory-failure latest accept directory
+run_case "$ROOT_DIR/update.sh" update lethe accept release.yml update-directory-failure latest accept directory
+
+(
+    export HOME="$TEST_DIR/tag-test-home"
+    export LETHE_HOME="$TEST_DIR/tag-test-home/.lethe"
+    # shellcheck source=/dev/null
+    source "$ROOT_DIR/install.sh"
+    if release_tag_from_url "https://example.test/releases/latest/download/lethe.tar.gz"; then
+        fail "unresolved latest URL was accepted as an attested source tag"
+    fi
+    if release_tag_from_url "https://example.test/releases/download/v1%2Fevil/lethe.tar.gz"; then
+        fail "encoded source tag was accepted"
+    fi
+)
+
+printf 'binary attestation regressions passed\n'

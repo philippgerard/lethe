@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::tools::registry::ToolRegistry;
@@ -38,6 +39,7 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const TOOLS_TTL: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const RESULT_MAX_CHARS: usize = 30_000;
 const NOT_CONFIGURED: &str =
     "Error: remote MCP server not configured (MCP_SERVER_URL/MCP_SERVER_TOKEN unset).";
@@ -125,8 +127,34 @@ async fn post_rpc(
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let text = response.text().await.unwrap_or_default();
+    let text = read_bounded_response(response).await?;
     Ok((status, content_type, session_id, text))
+}
+
+async fn read_bounded_response(response: reqwest::Response) -> Result<String, String> {
+    let content_length = response.content_length();
+    if content_length.is_some_and(|length| length > RESPONSE_MAX_BYTES as u64) {
+        return Err(format!(
+            "Error: MCP response exceeded the {RESPONSE_MAX_BYTES}-byte limit"
+        ));
+    }
+
+    let initial_capacity = content_length
+        .map(|length| length as usize)
+        .unwrap_or_default();
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("Error: MCP response read failed: {error}"))?;
+        if chunk.len() > RESPONSE_MAX_BYTES.saturating_sub(body.len()) {
+            return Err(format!(
+                "Error: MCP response exceeded the {RESPONSE_MAX_BYTES}-byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    String::from_utf8(body).map_err(|_| "Error: MCP response was not valid UTF-8".to_string())
 }
 
 /// Split an SSE body into its `data:` event payloads (multi-line data joined).
@@ -559,6 +587,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
 mod tests {
     use super::*;
     use axum::Router;
+    use axum::body::Body;
     use axum::response::IntoResponse;
     use axum::routing::post;
     use std::sync::Arc;
@@ -888,6 +917,72 @@ mod tests {
         assert_eq!(probe.method_requests.load(Ordering::SeqCst), 2);
         assert!(cached_session().is_some());
         reset_state();
+    }
+
+    fn fixed_body(size: usize) -> axum::response::Response {
+        axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(vec![b' '; size]))
+            .unwrap()
+    }
+
+    async fn exact_limit_body() -> axum::response::Response {
+        fixed_body(RESPONSE_MAX_BYTES)
+    }
+
+    async fn oversized_fixed_body() -> axum::response::Response {
+        fixed_body(RESPONSE_MAX_BYTES + 1)
+    }
+
+    async fn oversized_chunked_sse_body() -> axum::response::Response {
+        let chunks = [
+            Ok::<_, std::convert::Infallible>(vec![b'a'; RESPONSE_MAX_BYTES / 2]),
+            Ok(vec![b'b'; RESPONSE_MAX_BYTES / 2]),
+            Ok(vec![b'c']),
+        ];
+        axum::response::Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(futures_util::stream::iter(chunks)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_body_limit_rejects_fixed_and_chunked_overflow() {
+        let app = Router::new()
+            .route("/exact", post(exact_limit_body))
+            .route("/fixed", post(oversized_fixed_body))
+            .route("/chunked", post(oversized_chunked_sse_body));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "test"});
+        let (_, _, _, exact) = post_rpc(
+            &format!("http://{addr}/exact"),
+            "test-token",
+            &McpSession::default(),
+            &request,
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exact.len(), RESPONSE_MAX_BYTES);
+
+        for path in ["fixed", "chunked"] {
+            let error = post_rpc(
+                &format!("http://{addr}/{path}"),
+                "test-token",
+                &McpSession::default(),
+                &request,
+                HANDSHAKE_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("response exceeded"), "{error}");
+            assert!(error.contains(&RESPONSE_MAX_BYTES.to_string()), "{error}");
+        }
     }
 
     #[tokio::test]

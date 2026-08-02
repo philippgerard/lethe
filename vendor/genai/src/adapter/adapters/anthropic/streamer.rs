@@ -82,6 +82,7 @@ impl futures::Stream for AnthropicStreamer {
 								Ok("tool_use") => {
 									let id: String = data.x_take("/content_block/id")?;
 									let name: String = data.x_take("/content_block/name")?;
+									self.captured_data.record_capture(id.len() + name.len())?;
 
 									// Emit an initial ToolCallChunk with name and empty args,
 									// matching OpenAI's incremental streaming behaviour.
@@ -91,7 +92,6 @@ impl futures::Stream for AnthropicStreamer {
 										fn_arguments: Value::String(String::new()),
 										thought_signatures: None,
 									};
-
 									self.in_progress_block = InProgressBlock::ToolUse {
 										id,
 										name,
@@ -117,16 +117,18 @@ impl futures::Stream for AnthropicStreamer {
 									serde_error,
 								})?;
 
+							if matches!(self.in_progress_block, InProgressBlock::ToolUse { .. }) {
+								let partial_json_len = data.x_get_str("/delta/partial_json")?.len();
+								self.captured_data.record_capture(partial_json_len)?;
+							}
+
 							match &mut self.in_progress_block {
 								InProgressBlock::Text => {
 									let content: String = data.x_take("/delta/text")?;
 
 									// Add to the captured_content if chat options say so
 									if self.options.capture_content {
-										match self.captured_data.content {
-											Some(ref mut c) => c.push_str(&content),
-											None => self.captured_data.content = Some(content.clone()),
-										}
+										self.captured_data.append_content(&content)?;
 									}
 
 									return Poll::Ready(Some(Ok(InterStreamEvent::Chunk(content))));
@@ -150,10 +152,7 @@ impl futures::Stream for AnthropicStreamer {
 									if let Ok(thinking) = data.x_take::<String>("/delta/thinking") {
 										// Add to the captured_thinking if chat options say so
 										if self.options.capture_reasoning_content {
-											match self.captured_data.reasoning_content {
-												Some(ref mut r) => r.push_str(&thinking),
-												None => self.captured_data.reasoning_content = Some(thinking.clone()),
-											}
+											self.captured_data.append_reasoning_content(&thinking)?;
 										}
 
 										return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(thinking))));
@@ -190,10 +189,7 @@ impl futures::Stream for AnthropicStreamer {
 										thought_signatures: None,
 									};
 
-									match self.captured_data.tool_calls {
-										Some(ref mut t) => t.push(tc),
-										None => self.captured_data.tool_calls = Some(vec![tc]),
-									}
+									self.captured_data.push_tool_call(tc)?;
 								}
 								_ => {
 									// no-op for remaining block types
@@ -227,9 +223,9 @@ impl futures::Stream for AnthropicStreamer {
 							let inter_stream_end = InterStreamEnd {
 								captured_usage,
 								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-								captured_text_content: self.captured_data.content.take(),
-								captured_reasoning_content: self.captured_data.reasoning_content.take(),
-								captured_tool_calls: self.captured_data.tool_calls.take(),
+								captured_text_content: self.captured_data.take_content(),
+								captured_reasoning_content: self.captured_data.take_reasoning_content(),
+								captured_tool_calls: self.captured_data.take_tool_calls(),
 								captured_thought_signatures: None,
 								captured_response_id: None,
 							};

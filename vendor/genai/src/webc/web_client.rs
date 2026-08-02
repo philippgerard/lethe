@@ -1,8 +1,39 @@
 use crate::Headers;
 use crate::webc::{Error, Result};
+use bytes::Bytes;
+use futures::{Stream, TryStreamExt};
 use reqwest::header::HeaderMap;
-use reqwest::{Method, RequestBuilder, StatusCode};
+use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::Value;
+
+pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+pub(crate) async fn collect_limited_text<S>(stream: S, limit: usize) -> Result<String>
+where
+	S: Stream<Item = core::result::Result<Bytes, reqwest::Error>>,
+{
+	let mut stream = Box::pin(stream);
+	let mut body = Vec::new();
+	while let Some(chunk) = stream.as_mut().try_next().await? {
+		let next_len = body
+			.len()
+			.checked_add(chunk.len())
+			.ok_or(Error::ResponseBodyTooLarge { limit })?;
+		if next_len > limit {
+			return Err(Error::ResponseBodyTooLarge { limit });
+		}
+		body.extend_from_slice(&chunk);
+	}
+	Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+pub(crate) async fn response_text_limited(response: Response, limit: usize) -> Result<String> {
+	if response.content_length().is_some_and(|len| len > limit as u64) {
+		return Err(Error::ResponseBodyTooLarge { limit });
+	}
+	collect_limited_text(response.bytes_stream(), limit).await
+}
 
 /// A simple reqwest client wrapper for this library.
 #[derive(Debug)]
@@ -100,7 +131,7 @@ impl WebResponse {
 
 		if !status.is_success() {
 			let headers = res.headers().clone();
-			let body = res.text().await?;
+			let body = response_text_limited(res, MAX_ERROR_BODY_BYTES).await?;
 			tracing::trace!("AI Response failed. Body:\n{body}");
 			return Err(Error::ResponseFailedStatus {
 				status,
@@ -115,7 +146,7 @@ impl WebResponse {
 
 		// Capture the body
 		let ct = header_map.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
-		let body = res.text().await?;
+		let body = response_text_limited(res, MAX_RESPONSE_BODY_BYTES).await?;
 
 		let body = if ct.starts_with("application/json") {
 			tracing::trace!("AI Response body:\n{body}");
@@ -136,3 +167,33 @@ impl WebResponse {
 }
 
 // endregion: --- WebResponse
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use futures::stream;
+
+	#[tokio::test]
+	async fn limited_text_accepts_a_legitimate_chunked_body() {
+		let chunks = stream::iter(vec![
+			Ok::<_, reqwest::Error>(Bytes::from_static(b"hello ")),
+			Ok::<_, reqwest::Error>(Bytes::from_static(b"world")),
+		]);
+
+		let body = collect_limited_text(chunks, 11).await.expect("body should fit");
+
+		assert_eq!(body, "hello world");
+	}
+
+	#[tokio::test]
+	async fn limited_text_rejects_an_oversized_body_before_appending_the_chunk() {
+		let chunks = stream::iter(vec![
+			Ok::<_, reqwest::Error>(Bytes::from_static(b"hello")),
+			Ok::<_, reqwest::Error>(Bytes::from_static(b"!")),
+		]);
+
+		let error = collect_limited_text(chunks, 5).await.expect_err("body should exceed the limit");
+
+		assert!(matches!(error, Error::ResponseBodyTooLarge { limit: 5 }));
+	}
+}

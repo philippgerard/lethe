@@ -18,6 +18,7 @@
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::chat::{ChatOptionsSet, StopReason, ToolCall, Usage};
+use crate::webc::{MAX_STREAM_BUFFER_BYTES, MAX_STREAM_CHUNK_BYTES, MAX_STREAM_EVENT_BYTES, MAX_STREAM_EVENTS};
 use crate::{Error, ModelIden, Result};
 use bytes::{Buf, BytesMut};
 use futures::Stream;
@@ -37,6 +38,7 @@ pub(super) struct BedrockStreamer {
 	captured_data: StreamerCapturedData,
 	done: bool,
 	emitted_start: bool,
+	accepted_events: usize,
 	in_progress_tool: Option<ToolCallAccumulator>,
 }
 
@@ -59,6 +61,7 @@ impl BedrockStreamer {
 			captured_data: StreamerCapturedData::default(),
 			done: false,
 			emitted_start: false,
+			accepted_events: 0,
 			in_progress_tool: None,
 		}
 	}
@@ -73,8 +76,17 @@ impl BedrockStreamer {
 		let total_len = u32::from_be_bytes(self.buf[0..4].try_into().unwrap()) as usize;
 		let headers_len = u32::from_be_bytes(self.buf[4..8].try_into().unwrap()) as usize;
 
-		if !(16..=16 * 1024 * 1024).contains(&total_len) {
+		if total_len < 16 {
 			return Err(self.frame_err(format!("invalid event-stream total_len: {total_len}")));
+		}
+		if total_len > MAX_STREAM_EVENT_BYTES {
+			return Err(stream_limit("event bytes", MAX_STREAM_EVENT_BYTES));
+		}
+		if headers_len > total_len - 16 {
+			return Err(self.frame_err(format!(
+				"invalid event-stream headers_len: {headers_len} exceeds frame capacity {}",
+				total_len - 16
+			)));
 		}
 
 		if self.buf.len() < total_len {
@@ -102,6 +114,7 @@ impl BedrockStreamer {
 		let headers = parse_headers(&self.buf[headers_start..headers_end])
 			.map_err(|e| self.frame_err(format!("header parse: {e}")))?;
 		let payload = self.buf[headers_end..payload_end].to_vec();
+		record_stream_event(&mut self.accepted_events, MAX_STREAM_EVENTS)?;
 
 		// Advance past the frame
 		self.buf.advance(total_len);
@@ -154,6 +167,7 @@ impl BedrockStreamer {
 				if let Ok(mut tool_use) = payload.x_take::<Value>("/start/toolUse") {
 					let call_id: String = tool_use.x_take("toolUseId").unwrap_or_default();
 					let fn_name: String = tool_use.x_take("name").unwrap_or_default();
+					self.captured_data.record_capture(call_id.len() + fn_name.len())?;
 
 					let tc = ToolCall {
 						call_id: call_id.clone(),
@@ -173,14 +187,12 @@ impl BedrockStreamer {
 				// { delta: { text? | toolUse { input }? | reasoningContent { text | signature } }, contentBlockIndex }
 				if let Ok(text) = payload.x_take::<String>("/delta/text") {
 					if self.options.capture_content {
-						match self.captured_data.content {
-							Some(ref mut c) => c.push_str(&text),
-							None => self.captured_data.content = Some(text.clone()),
-						}
+						self.captured_data.append_content(&text)?;
 					}
 					events.push(InterStreamEvent::Chunk(text));
 				} else if let Ok(partial) = payload.x_take::<String>("/delta/toolUse/input") {
 					if let Some(acc) = self.in_progress_tool.as_mut() {
+						self.captured_data.record_capture(partial.len())?;
 						acc.input.push_str(&partial);
 						events.push(InterStreamEvent::ToolCallChunk(ToolCall {
 							call_id: acc.call_id.clone(),
@@ -191,10 +203,7 @@ impl BedrockStreamer {
 					}
 				} else if let Ok(reasoning) = payload.x_take::<String>("/delta/reasoningContent/text") {
 					if self.options.capture_reasoning_content {
-						match self.captured_data.reasoning_content {
-							Some(ref mut r) => r.push_str(&reasoning),
-							None => self.captured_data.reasoning_content = Some(reasoning.clone()),
-						}
+						self.captured_data.append_reasoning_content(&reasoning)?;
 					}
 					events.push(InterStreamEvent::ReasoningChunk(reasoning));
 				} else if let Ok(signature) = payload.x_take::<String>("/delta/reasoningContent/signature") {
@@ -216,10 +225,7 @@ impl BedrockStreamer {
 						fn_arguments,
 						thought_signatures: None,
 					};
-					match self.captured_data.tool_calls {
-						Some(ref mut t) => t.push(tc),
-						None => self.captured_data.tool_calls = Some(vec![tc]),
-					}
+					self.captured_data.push_accounted_tool_call(tc)?;
 				}
 			}
 			"messageStop" => {
@@ -251,9 +257,9 @@ impl BedrockStreamer {
 		let end = InterStreamEnd {
 			captured_usage,
 			captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
-			captured_text_content: self.captured_data.content.take(),
-			captured_reasoning_content: self.captured_data.reasoning_content.take(),
-			captured_tool_calls: self.captured_data.tool_calls.take(),
+			captured_text_content: self.captured_data.take_content(),
+			captured_reasoning_content: self.captured_data.take_reasoning_content(),
+			captured_tool_calls: self.captured_data.take_tool_calls(),
 			captured_thought_signatures: None,
 			captured_response_id: None,
 		};
@@ -305,6 +311,8 @@ impl Stream for BedrockStreamer {
 			// Pull more bytes.
 			match Pin::new(&mut self.inner).poll_next(cx) {
 				Poll::Ready(Some(Ok(bytes))) => {
+					ensure_stream_chunk_size(bytes.len(), MAX_STREAM_CHUNK_BYTES)?;
+					ensure_stream_buffer_size(self.buf.len(), bytes.len(), MAX_STREAM_BUFFER_BYTES)?;
 					self.buf.extend_from_slice(&bytes);
 					continue;
 				}
@@ -326,6 +334,36 @@ impl Stream for BedrockStreamer {
 			}
 		}
 	}
+}
+
+fn stream_limit(resource: &'static str, limit: usize) -> Error {
+	Error::StreamLimitExceeded { resource, limit }
+}
+
+fn ensure_stream_chunk_size(bytes: usize, limit: usize) -> Result<()> {
+	if bytes > limit {
+		return Err(stream_limit("chunk bytes", limit));
+	}
+	Ok(())
+}
+
+fn ensure_stream_buffer_size(buffer_bytes: usize, chunk_bytes: usize, limit: usize) -> Result<()> {
+	let combined = buffer_bytes
+		.checked_add(chunk_bytes)
+		.ok_or_else(|| stream_limit("buffer bytes", limit))?;
+	if combined > limit {
+		return Err(stream_limit("buffer bytes", limit));
+	}
+	Ok(())
+}
+
+fn record_stream_event(accepted: &mut usize, limit: usize) -> Result<()> {
+	let next = accepted.checked_add(1).ok_or_else(|| stream_limit("event count", limit))?;
+	if next > limit {
+		return Err(stream_limit("event count", limit));
+	}
+	*accepted = next;
+	Ok(())
 }
 
 struct DecodedFrame {
@@ -418,10 +456,26 @@ fn parse_stream_usage(mut value: Value) -> Usage {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::adapter::adapters::support::{MAX_CAPTURED_STREAM_BYTES, MAX_CAPTURED_TOOL_CALLS};
+	use crate::chat::ChatOptions;
+	use futures::StreamExt;
 
 	/// Test only needs a valid ModelIden; the AdapterKind doesn't affect parser behavior.
 	fn test_model_iden() -> crate::ModelIden {
 		crate::ModelIden::new(crate::adapter::AdapterKind::BedrockApi, "anthropic.claude-test")
+	}
+
+	fn test_streamer(options: Option<&ChatOptions>) -> BedrockStreamer {
+		let inner: Pin<Box<dyn Stream<Item = _> + Send>> = Box::pin(futures::stream::empty());
+		let options_set = ChatOptionsSet::default().with_chat_options(options);
+		BedrockStreamer::new(inner, test_model_iden(), options_set)
+	}
+
+	fn decoded_frame(event_type: &str, payload: Value) -> DecodedFrame {
+		DecodedFrame {
+			headers: std::collections::HashMap::from([(":event-type".to_string(), event_type.to_string())]),
+			payload: serde_json::to_vec(&payload).expect("test payload should serialize"),
+		}
 	}
 
 	/// Build a minimal valid event-stream frame with the given headers and payload.
@@ -477,5 +531,227 @@ mod tests {
 		let mut streamer = BedrockStreamer::new(inner, model_iden, Default::default());
 		streamer.buf.extend_from_slice(&[0u8; 10]); // <12, not enough for prelude
 		assert!(streamer.try_parse_frame().expect("ok").is_none());
+	}
+
+	#[test]
+	fn crc_valid_frame_with_impossible_header_length_is_rejected_without_panicking() {
+		let total_len = 16_u32;
+		let headers_len = 1_u32;
+		let mut frame = Vec::new();
+		frame.extend_from_slice(&total_len.to_be_bytes());
+		frame.extend_from_slice(&headers_len.to_be_bytes());
+		let prelude_crc = super::crc32(&frame);
+		frame.extend_from_slice(&prelude_crc.to_be_bytes());
+		let message_crc = super::crc32(&frame);
+		frame.extend_from_slice(&message_crc.to_be_bytes());
+
+		let mut streamer = test_streamer(None);
+		streamer.buf.extend_from_slice(&frame);
+		let error = streamer
+			.try_parse_frame()
+			.err()
+			.expect("headers cannot overlap the message CRC");
+
+		assert!(matches!(error, Error::ChatResponse { .. }));
+	}
+
+	#[test]
+	fn oversized_event_frame_is_rejected_from_its_prelude() {
+		let total_len = (MAX_STREAM_EVENT_BYTES + 1) as u32;
+		let mut prelude = Vec::new();
+		prelude.extend_from_slice(&total_len.to_be_bytes());
+		prelude.extend_from_slice(&0_u32.to_be_bytes());
+		let prelude_crc = super::crc32(&prelude);
+		prelude.extend_from_slice(&prelude_crc.to_be_bytes());
+
+		let mut streamer = test_streamer(None);
+		streamer.buf.extend_from_slice(&prelude);
+		let error = streamer
+			.try_parse_frame()
+			.err()
+			.expect("oversized frame should fail before buffering its body");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "event bytes",
+				limit: MAX_STREAM_EVENT_BYTES
+			}
+		));
+	}
+
+	#[test]
+	fn event_count_limit_is_enforced_before_consuming_the_next_frame() {
+		let frame = build_frame("messageStart", br#"{}"#);
+		let mut streamer = test_streamer(None);
+		streamer.accepted_events = MAX_STREAM_EVENTS;
+		streamer.buf.extend_from_slice(&frame);
+
+		let error = streamer
+			.try_parse_frame()
+			.err()
+			.expect("event above the count limit should fail");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "event count",
+				limit: MAX_STREAM_EVENTS
+			}
+		));
+		assert_eq!(streamer.buf.len(), frame.len());
+	}
+
+	#[tokio::test]
+	async fn oversized_raw_chunk_is_rejected_before_buffer_growth() {
+		let chunk = bytes::Bytes::from(vec![0_u8; MAX_STREAM_CHUNK_BYTES + 1]);
+		let inner: Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, crate::error::BoxError>> + Send>> =
+			Box::pin(futures::stream::iter(vec![Ok(chunk)]));
+		let mut streamer = BedrockStreamer::new(inner, test_model_iden(), Default::default());
+
+		let error = streamer
+			.next()
+			.await
+			.expect("chunk should produce one result")
+			.expect_err("oversized raw chunk should fail");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "chunk bytes",
+				limit: MAX_STREAM_CHUNK_BYTES
+			}
+		));
+		assert!(streamer.buf.is_empty());
+	}
+
+	#[test]
+	fn captured_content_reasoning_and_tool_calls_preserve_bedrock_semantics() {
+		let options = ChatOptions::default()
+			.with_capture_content(true)
+			.with_capture_reasoning_content(true)
+			.with_capture_tool_calls(true);
+		let mut streamer = test_streamer(Some(&options));
+
+		streamer
+			.handle_frame(decoded_frame(
+				"contentBlockDelta",
+				serde_json::json!({ "delta": { "text": "hello" } }),
+			))
+			.expect("text should fit");
+		streamer
+			.handle_frame(decoded_frame(
+				"contentBlockDelta",
+				serde_json::json!({ "delta": { "reasoningContent": { "text": "think" } } }),
+			))
+			.expect("reasoning should fit");
+		streamer
+			.handle_frame(decoded_frame(
+				"contentBlockStart",
+				serde_json::json!({ "start": { "toolUse": { "toolUseId": "call-1", "name": "lookup" } } }),
+			))
+			.expect("tool call should start");
+		streamer
+			.handle_frame(decoded_frame(
+				"contentBlockDelta",
+				serde_json::json!({ "delta": { "toolUse": { "input": "{\"id\":" } } }),
+			))
+			.expect("first tool fragment should fit");
+		let events = streamer
+			.handle_frame(decoded_frame(
+				"contentBlockDelta",
+				serde_json::json!({ "delta": { "toolUse": { "input": "1}" } } }),
+			))
+			.expect("second tool fragment should fit");
+		streamer
+			.handle_frame(decoded_frame("contentBlockStop", serde_json::json!({})))
+			.expect("tool call should finish");
+
+		assert!(events.iter().any(|event| matches!(
+			event,
+			InterStreamEvent::ToolCallChunk(tool_call)
+				if tool_call.fn_arguments == Value::String("{\"id\":1}".to_string())
+		)));
+		assert_eq!(streamer.captured_data.take_content().as_deref(), Some("hello"));
+		assert_eq!(
+			streamer.captured_data.take_reasoning_content().as_deref(),
+			Some("think")
+		);
+		let tool_calls = streamer
+			.captured_data
+			.take_tool_calls()
+			.expect("captured tool call should exist");
+		assert_eq!(tool_calls.len(), 1);
+		assert_eq!(tool_calls[0].fn_arguments, serde_json::json!({ "id": 1 }));
+	}
+
+	#[test]
+	fn in_progress_tool_fragments_share_the_capture_budget_even_without_final_capture() {
+		let mut streamer = test_streamer(None);
+		streamer
+			.handle_frame(decoded_frame(
+				"contentBlockStart",
+				serde_json::json!({ "start": { "toolUse": { "toolUseId": "", "name": "" } } }),
+			))
+			.expect("empty tool metadata should fit");
+		streamer
+			.captured_data
+			.record_capture(MAX_CAPTURED_STREAM_BYTES)
+			.expect("exact byte limit should fit");
+
+		let error = streamer
+			.handle_frame(decoded_frame(
+				"contentBlockDelta",
+				serde_json::json!({ "delta": { "toolUse": { "input": "x" } } }),
+			))
+			.expect_err("next tool byte should exceed the shared limit");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "capture bytes",
+				limit: MAX_CAPTURED_STREAM_BYTES
+			}
+		));
+		assert_eq!(
+			streamer.in_progress_tool.as_ref().map(|tool| tool.input.as_str()),
+			Some("")
+		);
+	}
+
+	#[test]
+	fn captured_bedrock_tool_calls_stop_at_the_shared_count_limit() {
+		let options = ChatOptions::default().with_capture_tool_calls(true);
+		let mut streamer = test_streamer(Some(&options));
+		for index in 0..MAX_CAPTURED_TOOL_CALLS {
+			streamer
+				.handle_frame(decoded_frame(
+					"contentBlockStart",
+					serde_json::json!({ "start": { "toolUse": { "toolUseId": format!("call-{index}"), "name": "lookup" } } }),
+				))
+				.expect("tool call within count limit should start");
+			streamer
+				.handle_frame(decoded_frame("contentBlockStop", serde_json::json!({})))
+				.expect("tool call within count limit should finish");
+		}
+		streamer
+			.handle_frame(decoded_frame(
+				"contentBlockStart",
+				serde_json::json!({ "start": { "toolUse": { "toolUseId": "overflow", "name": "lookup" } } }),
+			))
+			.expect("overflow tool call metadata remains within the byte limit");
+
+		let error = streamer
+			.handle_frame(decoded_frame("contentBlockStop", serde_json::json!({})))
+			.expect_err("tool call above the count limit should fail");
+
+		assert!(matches!(
+			error,
+			Error::StreamLimitExceeded {
+				resource: "captured tool calls",
+				limit: MAX_CAPTURED_TOOL_CALLS
+			}
+		));
+		assert_eq!(streamer.captured_data.tool_call_count(), MAX_CAPTURED_TOOL_CALLS);
 	}
 }
