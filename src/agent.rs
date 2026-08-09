@@ -12,7 +12,7 @@ use tokio::sync::broadcast;
 mod summarizer;
 mod tool_loop;
 use tool_loop::{
-    TurnExecutionContext, actor_turn_executor, complete_turn_with_tools_config_shared,
+    TurnExecutionContext, TurnOutput, actor_turn_executor, complete_turn_with_tools_config_shared,
 };
 #[cfg(test)]
 use tool_loop::{actor_turn_instruction, extract_image_views, image_view_message};
@@ -29,7 +29,11 @@ use crate::llm::{
     HistoricalToolCall, HistoricalToolResponse, LlmAttachment, LlmMessage, LlmRole, LlmRouter,
     LlmRouterConfig, PromptBuilder, dialect_for_model,
 };
-use crate::memory::message_metadata::{MessageKind, MessageMetadata};
+use crate::memory::message_metadata::{
+    HISTORY_CONTENT_KEY, MessageKind, MessageMetadata, MessageVisibility, RawMessageKind,
+    annotate_map, metadata_value, raw_message_kind, raw_metadata_value,
+    user_visible_history_content,
+};
 use crate::memory::messages::{MessageHistoryError, MessageRole, StoredMessage};
 use crate::memory::recall::{Hippocampus, HippocampusConfig, HippocampusError};
 use crate::memory::{MemoryStore, MemoryStoreError};
@@ -70,6 +74,11 @@ pub struct AgentTurn {
     pub dropped_for_summary: Vec<LlmMessage>,
 }
 
+struct PreparedAgentTurn {
+    turn: AgentTurn,
+    resumable_checkpoint_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentOptions {
     pub use_hippocampus: bool,
@@ -91,7 +100,8 @@ impl Default for AgentOptions {
 }
 
 /// A single agent turn input. Build via [`TurnRequest::new`] and the
-/// `with_*` setters; pass to [`Agent::chat_once`] or [`Agent::prepare_turn`].
+/// `with_*` setters; pass to [`Agent::chat_once`], [`Agent::chat_once_result`],
+/// or [`Agent::prepare_turn`].
 #[derive(Clone, Debug, Default)]
 pub struct TurnRequest {
     pub message: String,
@@ -129,6 +139,44 @@ impl TurnRequest {
         self
     }
 }
+
+/// Public disposition of a completed agent call.
+///
+/// A cut-short tool loop deliberately does not expose its checkpoint text:
+/// callers can branch on the typed status, but cannot accidentally forward
+/// internal GOAL/DONE/REMAINING/NEXT state to a user-facing transport.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnResult {
+    Complete(String),
+    Checkpointed,
+}
+
+impl TurnResult {
+    pub fn complete_text(&self) -> Option<&str> {
+        match self {
+            Self::Complete(text) => Some(text),
+            Self::Checkpointed => None,
+        }
+    }
+
+    pub fn into_complete_text(self) -> Option<String> {
+        match self {
+            Self::Complete(text) => Some(text),
+            Self::Checkpointed => None,
+        }
+    }
+
+    pub fn is_checkpointed(&self) -> bool {
+        matches!(self, Self::Checkpointed)
+    }
+}
+
+/// Fixed user-safe status for an interrupted ordinary conversation turn.
+/// Never interpolate the raw checkpoint or its stop reason into this text.
+pub const TURN_CHECKPOINT_NOTICE: &str = "I couldn't finish that reliably in this turn. I've saved the progress and can continue without starting over.";
+const RESUMABLE_CHECKPOINT_PREFIX: &str = "<internal_resumable_checkpoint>\n";
+const RESUMABLE_CHECKPOINT_SUFFIX: &str = "\n</internal_resumable_checkpoint>";
+const CHECKPOINT_ID_KEY: &str = "checkpoint_id";
 
 /// A conversation message produced outside the requesting client's own stream —
 /// e.g. a Telegram turn — broadcast so other live surfaces (an open web tab) can
@@ -266,7 +314,7 @@ impl Agent {
             registry.restore_unfinished(&principal_id);
             let runtime = ActorRuntime::new(registry);
             runtime
-                .install_turn_executor(actor_turn_executor(
+                .install_typed_turn_executor(actor_turn_executor(
                     settings.clone(),
                     memory.clone(),
                     router.clone(),
@@ -386,10 +434,21 @@ impl Agent {
 
     /// Assemble the LLM messages for a single turn without calling the model.
     pub async fn prepare_turn(&self, req: &TurnRequest) -> AgentResult<AgentTurn> {
+        Ok(self.prepare_turn_with_checkpoint(req).await?.turn)
+    }
+
+    async fn prepare_turn_with_checkpoint(
+        &self,
+        req: &TurnRequest,
+    ) -> AgentResult<PreparedAgentTurn> {
         // Sync point: the prompt reads the conversation_summary block, so let
         // the previous turn's in-flight summary update land first (bounded).
         await_pending_task(&self.pending_summary, SUMMARY_SYNC_TIMEOUT).await;
-        let hosted_context = if let Some(client) = self.hosted_plugins.as_ref() {
+        let request_metadata = MessageMetadata::from_value(req.metadata.as_ref());
+        let reaction_turn = request_metadata.kind == Some(MessageKind::TelegramReaction);
+        let hosted_context = if reaction_turn {
+            String::new()
+        } else if let Some(client) = self.hosted_plugins.as_ref() {
             if let Err(error) = client.refresh_catalog().await {
                 tracing::warn!(error = %error, "hosted plugin catalog refresh failed during prompt assembly");
             }
@@ -417,7 +476,7 @@ impl Agent {
             ..req.clone()
         };
         let req = &req;
-        let mut turn = prepare_turn(
+        let mut prepared = prepare_turn_with_checkpoint(
             &self.settings,
             self.memory.as_ref(),
             &self.prompts,
@@ -426,7 +485,12 @@ impl Agent {
             req.metadata.as_ref(),
             &req.options,
         )?;
-        let actor_context = self.actor_context_for_prompt_async().await?;
+        let turn = &mut prepared.turn;
+        let actor_context = if reaction_turn {
+            None
+        } else {
+            self.actor_context_for_prompt_async().await?
+        };
         // Actor context and the requestable directory are per-turn volatile —
         // they belong on the volatile system message so they don't invalidate
         // the stable cache prefix.
@@ -443,14 +507,18 @@ impl Agent {
             system.content.push_str("\n\n");
             system.content.push_str(hosted_context.trim());
         }
-        let directory = self.requestable_tools_directory_async(req).await?;
+        let directory = if reaction_turn {
+            String::new()
+        } else {
+            self.requestable_tools_directory_async(req).await?
+        };
         if !directory.is_empty()
             && let Some(system) = volatile_system_message_mut(&mut turn.messages)
         {
             system.content.push_str("\n\n");
             system.content.push_str(&directory);
         }
-        Ok(turn)
+        Ok(prepared)
     }
 
     async fn requestable_tools_directory_async(&self, req: &TurnRequest) -> AgentResult<String> {
@@ -487,10 +555,57 @@ impl Agent {
         ))
     }
 
-    /// Run one full turn: prepare messages, call the model with tool support,
-    /// persist user/assistant history, and return the final assistant response.
+    /// Backward-compatible text-only turn API. Cut-short checkpoints fail
+    /// closed as either the fixed safe notice for an ordinary undelivered user
+    /// turn or an empty response for internal/reaction/already-delivered turns.
+    /// Transports that need the typed status must use [`Agent::chat_once_result`].
     pub async fn chat_once(&self, req: TurnRequest) -> AgentResult<String> {
-        let turn = self.prepare_turn(&req).await?;
+        let metadata = MessageMetadata::from_value(req.metadata.as_ref());
+        let telegram_guard = req
+            .runtime
+            .telegram
+            .as_ref()
+            .and_then(|telegram| telegram.guard.clone());
+        match self.chat_once_result(req).await? {
+            TurnResult::Complete(_) if metadata.kind == Some(MessageKind::TelegramReaction) => {
+                Ok(String::new())
+            }
+            TurnResult::Complete(response) => Ok(response),
+            TurnResult::Checkpointed
+                if !metadata.is_internal()
+                    && metadata.kind != Some(MessageKind::TelegramReaction)
+                    && final_response_should_be_persisted(telegram_guard.as_ref())? =>
+            {
+                Ok(TURN_CHECKPOINT_NOTICE.to_string())
+            }
+            TurnResult::Checkpointed => Ok(String::new()),
+        }
+    }
+
+    /// Run one full turn: prepare messages, call the model with tool support,
+    /// persist user/assistant history, and return a typed completion status.
+    pub async fn chat_once_result(&self, req: TurnRequest) -> AgentResult<TurnResult> {
+        let request_metadata = MessageMetadata::from_value(req.metadata.as_ref());
+        // Reactions to Lethe's own Telegram messages are durable social input,
+        // not a new task. Persist only their sanitized public event and do not
+        // invoke the model/tools at all: a silent reaction cannot stream,
+        // persist, or deliver unrelated resumable work by accident.
+        if request_metadata.kind == Some(MessageKind::TelegramReaction) {
+            if !request_metadata.is_internal() {
+                let defensive_history =
+                    user_visible_history_content(&req.message, req.metadata.as_ref());
+                self.memory.messages.add(
+                    MessageRole::User,
+                    &defensive_history,
+                    metadata_for_persistence(req.metadata.clone()),
+                )?;
+            }
+            return Ok(TurnResult::Complete(String::new()));
+        }
+        let PreparedAgentTurn {
+            turn,
+            resumable_checkpoint_id,
+        } = self.prepare_turn_with_checkpoint(&req).await?;
         let TurnRequest {
             message,
             metadata,
@@ -498,9 +613,12 @@ impl Agent {
             ..
         } = req;
         if !turn.synthetic {
-            self.memory
-                .messages
-                .add(MessageRole::User, &message, metadata)?;
+            let defensive_history = user_visible_history_content(&message, metadata.as_ref());
+            self.memory.messages.add(
+                MessageRole::User,
+                &defensive_history,
+                metadata_for_persistence(metadata),
+            )?;
         }
         let runtime = self.with_actor_runtime(runtime);
         let telegram_guard = runtime
@@ -508,20 +626,38 @@ impl Agent {
             .as_ref()
             .and_then(|telegram| telegram.guard.clone());
         let dropped_for_summary = turn.dropped_for_summary.clone();
-        let response = self
+        let ordinary_turn =
+            !turn.synthetic && request_metadata.kind != Some(MessageKind::TelegramReaction);
+        let output = self
             .complete_turn_with_tools(turn.messages, runtime, !turn.synthetic)
             .await?;
-        if !turn.synthetic && final_response_should_be_persisted(telegram_guard.as_ref())? {
-            let history_content = assistant_history_content(&response);
-            // Don't persist whitespace-only final replies — unlike the loop's
-            // per-iteration rows (whose tool_calls metadata pairs the tool
-            // results that follow), an empty row here is pure noise.
-            if !history_content.trim().is_empty() {
-                self.memory
-                    .messages
-                    .add(MessageRole::Assistant, &history_content, None)?;
+
+        let result = if let Some(stop_reason) = output.stop_reason.as_deref() {
+            tracing::warn!(reason = %stop_reason, "turn cut short — preserving an internal resumable checkpoint");
+            if !turn.synthetic && request_metadata.kind != Some(MessageKind::TelegramReaction) {
+                // The raw resumable state is the durability boundary. Store it
+                // before reading any transport guard so a poisoned guard can
+                // suppress a notice but can never lose the checkpoint itself.
+                persist_resumable_checkpoint(self.memory.as_ref(), &output.text, stop_reason)?;
+                let should_show_notice =
+                    final_response_should_be_persisted(telegram_guard.as_ref())?;
+                if should_show_notice {
+                    persist_checkpoint_notice(self.memory.as_ref())?;
+                }
             }
-        }
+            TurnResult::Checkpointed
+        } else {
+            let response = output.text;
+            if ordinary_turn {
+                persist_completed_ordinary_turn(
+                    self.memory.as_ref(),
+                    &response,
+                    telegram_guard.as_ref(),
+                    resumable_checkpoint_id.as_deref(),
+                )?;
+            }
+            TurnResult::Complete(response)
+        };
         // Post-turn memory maintenance — rolling the dropped batch into the
         // persistent conversation_summary, plus the cadence-gated curator pass —
         // is background work that makes aux-model LLM calls. It must NEVER block
@@ -531,9 +667,9 @@ impl Agent {
         // can wait for it before reading the summary block (see prepare_turn);
         // the curator stays fully detached — nothing downstream reads its output
         // synchronously.
-        let needs_summary = !dropped_for_summary.is_empty();
+        let needs_summary = ordinary_turn && !dropped_for_summary.is_empty();
         let curator_enabled = self.settings.background.curator_enabled;
-        if !turn.synthetic && needs_summary {
+        if needs_summary {
             let memory = self.memory.clone();
             let router = self.router.clone();
             let prompts = self.prompts.clone();
@@ -551,7 +687,7 @@ impl Agent {
             });
             *self.pending_summary.lock().await = Some(handle);
         }
-        if !turn.synthetic && curator_enabled {
+        if ordinary_turn && curator_enabled {
             let memory = self.memory.clone();
             let router = self.router.clone();
             let memory_dir = self.settings.paths.memory_dir.clone();
@@ -572,7 +708,7 @@ impl Agent {
                 }
             });
         }
-        Ok(response)
+        Ok(result)
     }
 
     pub fn actor_registry(&self) -> Option<SharedActorRegistry> {
@@ -699,35 +835,10 @@ impl Agent {
     /// it can spot redundant pings (e.g. "I already asked them this 10 min
     /// ago and they haven't replied"). Cheap — just last N user messages.
     fn recent_user_context_for_review(&self, count: usize) -> String {
-        let Ok(recent) = self.memory.messages.get_recent(count.saturating_mul(2)) else {
+        let Ok(recent) = self.memory.messages.get_recent(count.saturating_mul(4)) else {
             return String::new();
         };
-        let mut lines = Vec::new();
-        for message in recent.iter().rev() {
-            if !message.role.is_user() && !message.role.is_assistant() {
-                continue;
-            }
-            let role = if message.role.is_user() {
-                "user"
-            } else {
-                "assistant"
-            };
-            let content = message.content.trim();
-            if content.is_empty() {
-                continue;
-            }
-            let snippet = if content.chars().count() > 400 {
-                content.chars().take(400).collect::<String>() + "…"
-            } else {
-                content.to_string()
-            };
-            lines.push(format!("[{role}] {snippet}"));
-            if lines.len() >= count {
-                break;
-            }
-        }
-        lines.reverse();
-        lines.join("\n")
+        recent_user_context_from_messages(&recent, count)
     }
 
     pub async fn process_background_heartbeat_quiet(
@@ -802,7 +913,7 @@ impl Agent {
         messages: Vec<LlmMessage>,
         runtime: ToolRuntime,
         record_tool_messages: bool,
-    ) -> AgentResult<String> {
+    ) -> AgentResult<TurnOutput> {
         self.complete_turn_with_tools_config(messages, runtime, false, record_tool_messages)
             .await
     }
@@ -813,8 +924,8 @@ impl Agent {
         runtime: ToolRuntime,
         use_aux: bool,
         record_tool_messages: bool,
-    ) -> AgentResult<String> {
-        let output = complete_turn_with_tools_config_shared(
+    ) -> AgentResult<TurnOutput> {
+        complete_turn_with_tools_config_shared(
             TurnExecutionContext {
                 settings: self.settings.clone(),
                 memory: self.memory.clone(),
@@ -828,14 +939,41 @@ impl Agent {
             use_aux,
             record_tool_messages,
         )
-        .await?;
-        if let Some(reason) = &output.stop_reason {
-            // The reply is a checkpoint, not a finished answer. It persists in
-            // conversation history, so the next turn resumes from it.
-            tracing::warn!(reason = %reason, "turn cut short — reply is a resumable checkpoint");
-        }
-        Ok(output.text)
+        .await
     }
+}
+
+fn recent_user_context_from_messages(recent: &[StoredMessage], count: usize) -> String {
+    let mut lines = Vec::new();
+    let visible = history_records_for_turn(recent.to_vec(), false);
+    for message in visible.iter().rev() {
+        if !message.role.is_user() && !message.role.is_assistant() {
+            continue;
+        }
+        if MessageMetadata::from_value(Some(&message.metadata)).has_tool_calls() {
+            continue;
+        }
+        let role = if message.role.is_user() {
+            "user"
+        } else {
+            "assistant"
+        };
+        let content = message.content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let snippet = if content.chars().count() > 400 {
+            content.chars().take(400).collect::<String>() + "…"
+        } else {
+            content.to_string()
+        };
+        lines.push(format!("[{role}] {snippet}"));
+        if lines.len() >= count {
+            break;
+        }
+    }
+    lines.reverse();
+    lines.join("\n")
 }
 
 pub fn prepare_turn(
@@ -847,10 +985,47 @@ pub fn prepare_turn(
     metadata: Option<&Value>,
     options: &AgentOptions,
 ) -> AgentResult<AgentTurn> {
-    let synthetic = MessageMetadata::from_value(metadata).is_internal();
+    Ok(prepare_turn_with_checkpoint(
+        settings,
+        memory,
+        prompts,
+        message,
+        attachments,
+        metadata,
+        options,
+    )?
+    .turn)
+}
+
+fn prepare_turn_with_checkpoint(
+    settings: &Settings,
+    memory: &MemoryStore,
+    prompts: &PromptStore,
+    message: &str,
+    attachments: Vec<LlmAttachment>,
+    metadata: Option<&Value>,
+    options: &AgentOptions,
+) -> AgentResult<PreparedAgentTurn> {
+    let request_metadata = MessageMetadata::from_value(metadata);
+    let synthetic = request_metadata.is_internal();
+    let reaction_turn = request_metadata.kind == Some(MessageKind::TelegramReaction);
+    // A reaction to Lethe's own message is social feedback, not permission to
+    // resume an unfinished tool task. Internal scheduler/heartbeat turns also
+    // must not inherit hidden checkpoints, while otherwise retaining their
+    // established context behavior.
+    let include_checkpoints = !synthetic && !reaction_turn;
     let raw_recent = memory.messages.get_recent(HISTORY_FETCH_LIMIT)?;
-    let recent = history_records_for_turn(raw_recent.clone());
-    let recall = if options.use_hippocampus && !synthetic {
+    let recent = if reaction_turn {
+        Vec::new()
+    } else {
+        history_records_for_turn(raw_recent, include_checkpoints)
+    };
+    let resumable_checkpoint_id = recent
+        .iter()
+        .rev()
+        .find(|message| is_resumable_checkpoint_record(message))
+        .map(|message| message.id.clone());
+    let recall = if options.use_hippocampus && !synthetic && !reaction_turn {
         Hippocampus::new(HippocampusConfig {
             enabled: settings.background.hippocampus_enabled,
             ..Default::default()
@@ -864,14 +1039,30 @@ pub fn prepare_turn(
         memory,
         prompts,
         recall.as_deref(),
-        !settings.hosted_plugins.replace_local_todos,
+        !reaction_turn && !settings.hosted_plugins.replace_local_todos,
+        !reaction_turn,
     )?;
     let dialect = dialect_for_model(&settings.llm.llm_model);
     let mut messages = parts.into_messages();
     apply_cache_markers(&mut messages, dialect.as_ref());
     let mut history_messages = history_to_llm_messages(recent);
+    // Pull typed resumable state out of the ordinary compaction pool, then
+    // place it immediately before the current request. Both the hard prompt
+    // clamp and the tool-loop clamp recognize only this provenance-derived
+    // wrapper and will fail with an explicit overflow rather than silently
+    // deleting the state we told the user was saved.
+    let mut checkpoint_messages = Vec::new();
+    history_messages.retain(|message| {
+        if is_resumable_checkpoint_message(message) {
+            checkpoint_messages.push(message.clone());
+            false
+        } else {
+            true
+        }
+    });
     let dropped_for_summary = compact_history(&mut history_messages, options.compaction_budget);
     messages.extend(history_messages);
+    messages.extend(checkpoint_messages);
     let stamped = stamp_user_message(message);
     let user_message = if attachments.is_empty() {
         LlmMessage::user(stamped)
@@ -897,11 +1088,14 @@ pub fn prepare_turn(
     // turn with an Anthropic 400 ("tool_result without tool_use").
     drop_leading_orphan_tool_results(&mut messages);
 
-    Ok(AgentTurn {
-        messages,
-        recall,
-        synthetic,
-        dropped_for_summary,
+    Ok(PreparedAgentTurn {
+        turn: AgentTurn {
+            messages,
+            recall,
+            synthetic,
+            dropped_for_summary,
+        },
+        resumable_checkpoint_id,
     })
 }
 
@@ -947,6 +1141,7 @@ fn build_system_prompt(
     prompts: &PromptStore,
     recall: Option<&str>,
     include_local_active_tasks: bool,
+    include_continuation_context: bool,
 ) -> AgentResult<SystemParts> {
     let identity = memory
         .blocks
@@ -956,7 +1151,11 @@ fn build_system_prompt(
         .unwrap_or_default();
     let instructions = prompts.load("agent_instructions", "You are Lethe.").text;
     let (memory_stable, memory_volatile) = memory.get_context_split()?;
-    let summary = memory.conversation_summary()?;
+    let summary = if include_continuation_context {
+        memory.conversation_summary()?
+    } else {
+        String::new()
+    };
     let clock_block = format_clock_block();
 
     let mut stable_builder = PromptBuilder::new();
@@ -973,7 +1172,7 @@ fn build_system_prompt(
     // every turn so unfinished work survives context compaction and session
     // restarts without the model having to remember to call todo_list. Text
     // comes from the overridable `active_tasks` template.
-    if include_local_active_tasks {
+    if include_continuation_context && include_local_active_tasks {
         match memory.todos.open_work_digest(ACTIVE_TASKS_PROMPT_LIMIT) {
             Ok(digest) if !digest.trim().is_empty() => {
                 let mut variables = std::collections::HashMap::new();
@@ -987,7 +1186,10 @@ fn build_system_prompt(
             Err(error) => tracing::warn!(error = %error, "active-tasks digest failed"),
         }
     }
-    volatile_builder.raw(memory_volatile).raw(clock_block);
+    if include_continuation_context {
+        volatile_builder.raw(memory_volatile);
+    }
+    volatile_builder.raw(clock_block);
 
     if let Some(recall) = recall.filter(|value| !value.trim().is_empty()) {
         let timestamp = Local::now().format("%a %Y-%m-%d %H:%M:%S %Z").to_string();
@@ -1019,21 +1221,51 @@ const HISTORY_FETCH_LIMIT: usize = 500;
 /// the standing work block cheap even with a crowded todo list.
 const ACTIVE_TASKS_PROMPT_LIMIT: usize = 10;
 
-fn history_records_for_turn(recent: Vec<StoredMessage>) -> Vec<StoredMessage> {
-    let mut history = Vec::new();
+fn history_records_for_turn(
+    recent: Vec<StoredMessage>,
+    include_checkpoints: bool,
+) -> Vec<StoredMessage> {
+    let mut history: Vec<StoredMessage> = Vec::new();
     let mut inside_internal_turn = false;
+    let mut active_checkpoint_id: Option<String> = None;
     for message in recent {
-        let internal = MessageMetadata::from_value(Some(&message.metadata)).is_internal();
+        let metadata = MessageMetadata::from_value(Some(&message.metadata));
+        let internal = metadata.is_internal();
         if message.role.is_user() {
             inside_internal_turn = internal;
             if inside_internal_turn {
                 continue;
             }
-        } else if inside_internal_turn || internal {
+        } else if inside_internal_turn {
             continue;
         }
 
-        if is_visible_history_record(&message) {
+        if raw_message_kind(Some(&message.metadata)) == Some(RawMessageKind::CheckpointResolved) {
+            let resolved_id = message
+                .metadata
+                .get(CHECKPOINT_ID_KEY)
+                .and_then(Value::as_str);
+            if active_checkpoint_id.as_deref() == resolved_id {
+                history.retain(|stored| {
+                    raw_message_kind(Some(&stored.metadata)) != Some(RawMessageKind::Checkpoint)
+                });
+                active_checkpoint_id = None;
+            }
+            continue;
+        }
+
+        let resumable_checkpoint = include_checkpoints && is_resumable_checkpoint_record(&message);
+        if internal && !resumable_checkpoint {
+            continue;
+        }
+
+        if is_turn_history_record(&message, include_checkpoints) {
+            if resumable_checkpoint {
+                history.retain(|stored| {
+                    raw_message_kind(Some(&stored.metadata)) != Some(RawMessageKind::Checkpoint)
+                });
+                active_checkpoint_id = Some(message.id.clone());
+            }
             history.push(message);
         }
     }
@@ -1042,8 +1274,21 @@ fn history_records_for_turn(recent: Vec<StoredMessage>) -> Vec<StoredMessage> {
     history
 }
 
-fn is_visible_history_record(message: &StoredMessage) -> bool {
-    if MessageMetadata::from_value(Some(&message.metadata)).is_internal() {
+fn is_resumable_checkpoint_record(message: &StoredMessage) -> bool {
+    message.role.is_assistant()
+        && raw_message_kind(Some(&message.metadata)) == Some(RawMessageKind::Checkpoint)
+}
+
+fn is_turn_history_record(message: &StoredMessage, include_checkpoints: bool) -> bool {
+    let metadata = MessageMetadata::from_value(Some(&message.metadata));
+    // The companion notice exists for transcript parity only. Keeping it out
+    // of model history makes the checkpoint + current user message the atomic
+    // minimum retained pair under tight compaction budgets.
+    if raw_message_kind(Some(&message.metadata)) == Some(RawMessageKind::CheckpointNotice) {
+        return false;
+    }
+    let resumable_checkpoint = include_checkpoints && is_resumable_checkpoint_record(message);
+    if metadata.is_internal() && !resumable_checkpoint {
         return false;
     }
     match message.role {
@@ -1124,9 +1369,9 @@ fn history_to_llm_messages(history: Vec<StoredMessage>) -> Vec<LlmMessage> {
                 out.push(LlmMessage::user(history_content_with_timestamp(&message)));
             }
             MessageRole::Assistant => {
+                let metadata = MessageMetadata::from_value(Some(&message.metadata));
                 let calls = extract_historical_tool_calls(&message.metadata);
-                let intended_tool_calls =
-                    MessageMetadata::from_value(Some(&message.metadata)).has_tool_calls();
+                let intended_tool_calls = metadata.has_tool_calls();
                 if calls.is_empty() {
                     // The model was reported to have made tool calls but the
                     // payload is missing call_ids — we can't reconstruct a
@@ -1136,7 +1381,17 @@ fn history_to_llm_messages(history: Vec<StoredMessage>) -> Vec<LlmMessage> {
                         continue;
                     }
                     if !message.content.trim().is_empty() {
-                        out.push(LlmMessage::assistant(message.content));
+                        let content = if raw_message_kind(Some(&message.metadata))
+                            == Some(RawMessageKind::Checkpoint)
+                        {
+                            format!(
+                                "{RESUMABLE_CHECKPOINT_PREFIX}{}{RESUMABLE_CHECKPOINT_SUFFIX}",
+                                message.content
+                            )
+                        } else {
+                            message.content
+                        };
+                        out.push(LlmMessage::assistant(content));
                     }
                     continue;
                 }
@@ -1195,6 +1450,12 @@ fn history_to_llm_messages(history: Vec<StoredMessage>) -> Vec<LlmMessage> {
     out
 }
 
+fn is_resumable_checkpoint_message(message: &LlmMessage) -> bool {
+    message.role == LlmRole::Assistant
+        && message.content.starts_with(RESUMABLE_CHECKPOINT_PREFIX)
+        && message.content.ends_with(RESUMABLE_CHECKPOINT_SUFFIX)
+}
+
 fn extract_historical_tool_calls(metadata: &Value) -> Vec<HistoricalToolCall> {
     metadata
         .get("tool_calls")
@@ -1241,6 +1502,105 @@ fn extract_historical_tool_calls(metadata: &Value) -> Vec<HistoricalToolCall> {
 
 fn assistant_history_content(response: &str) -> String {
     normalize_message_envelope(response).unwrap_or_else(|| response.to_string())
+}
+
+fn metadata_for_persistence(metadata: Option<Value>) -> Option<Value> {
+    let mut metadata = metadata.unwrap_or_else(|| json!({}));
+    if let Value::Object(map) = &mut metadata {
+        map.remove(HISTORY_CONTENT_KEY);
+        let parsed = MessageMetadata::from_map(map);
+        if !parsed.is_internal() && parsed.kind.is_none() {
+            annotate_map(
+                map,
+                MessageVisibility::UserVisible,
+                MessageKind::Chat,
+                "chat",
+            );
+        }
+    }
+    Some(metadata)
+}
+
+fn persist_completed_ordinary_turn(
+    memory: &MemoryStore,
+    response: &str,
+    telegram_guard: Option<&crate::interfaces::telegram::SharedTelegramTurnGuard>,
+    resumable_checkpoint_id: Option<&str>,
+) -> AgentResult<()> {
+    // Once the model completed an ordinary resumed turn, the old checkpoint
+    // must stop influencing future prompts even if a later transport-guard
+    // read or visible-row write fails. The persisted user follow-up is enough
+    // for a retry to regenerate the final answer without reviving old state.
+    if let Some(checkpoint_id) = resumable_checkpoint_id {
+        persist_checkpoint_resolution(memory, checkpoint_id)?;
+    }
+    if final_response_should_be_persisted(telegram_guard)? {
+        let history_content = assistant_history_content(response);
+        // Don't persist whitespace-only final replies — unlike the loop's
+        // per-iteration rows (whose tool_calls metadata pairs the tool results
+        // that follow), an empty row here is pure noise.
+        if !history_content.trim().is_empty() {
+            memory.messages.add(
+                MessageRole::Assistant,
+                &history_content,
+                Some(metadata_value(
+                    MessageVisibility::UserVisible,
+                    MessageKind::Chat,
+                    "chat",
+                )),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_resumable_checkpoint(
+    memory: &MemoryStore,
+    checkpoint: &str,
+    stop_reason: &str,
+) -> AgentResult<()> {
+    let mut checkpoint_metadata = raw_metadata_value(
+        MessageVisibility::Internal,
+        RawMessageKind::Checkpoint,
+        "tool_loop",
+    );
+    if let Value::Object(map) = &mut checkpoint_metadata {
+        map.insert("stop_reason".to_string(), json!(stop_reason));
+    }
+    memory.messages.add(
+        MessageRole::Assistant,
+        &assistant_history_content(checkpoint),
+        Some(checkpoint_metadata),
+    )?;
+    Ok(())
+}
+
+fn persist_checkpoint_notice(memory: &MemoryStore) -> AgentResult<()> {
+    memory.messages.add(
+        MessageRole::Assistant,
+        TURN_CHECKPOINT_NOTICE,
+        Some(raw_metadata_value(
+            MessageVisibility::UserVisible,
+            RawMessageKind::CheckpointNotice,
+            "tool_loop",
+        )),
+    )?;
+    Ok(())
+}
+
+fn persist_checkpoint_resolution(memory: &MemoryStore, checkpoint_id: &str) -> AgentResult<()> {
+    let mut metadata = raw_metadata_value(
+        MessageVisibility::Internal,
+        RawMessageKind::CheckpointResolved,
+        "tool_loop",
+    );
+    if let Value::Object(map) = &mut metadata {
+        map.insert(CHECKPOINT_ID_KEY.to_string(), json!(checkpoint_id));
+    }
+    memory
+        .messages
+        .add(MessageRole::Assistant, "", Some(metadata))?;
+    Ok(())
 }
 
 fn final_response_should_be_persisted(
@@ -1619,16 +1979,20 @@ fn clamp_messages_to_budget(messages: &mut Vec<LlmMessage>, max_total_chars: usi
         .iter()
         .position(|message| message.role != LlmRole::System)
         .unwrap_or(messages.len());
-    while total_chars(messages) > max_total_chars
-        && history_start < messages.len().saturating_sub(1)
-    {
-        messages.remove(history_start);
+    while total_chars(messages) > max_total_chars {
+        let current_user_index = messages.len().saturating_sub(1);
+        let Some(remove_index) = (history_start..current_user_index)
+            .find(|index| !is_resumable_checkpoint_message(&messages[*index]))
+        else {
+            break;
+        };
+        messages.remove(remove_index);
         // Removing an `assistant_with_tool_calls` would orphan the `tool_results`
         // that follow it; drop those too so the wire format stays valid.
-        while history_start < messages.len().saturating_sub(1)
-            && !messages[history_start].tool_responses.is_empty()
+        while remove_index < messages.len().saturating_sub(1)
+            && !messages[remove_index].tool_responses.is_empty()
         {
-            messages.remove(history_start);
+            messages.remove(remove_index);
         }
     }
 }
@@ -2237,6 +2601,29 @@ mod tests {
     }
 
     #[test]
+    fn hard_clamp_never_discards_a_resumable_checkpoint() {
+        let checkpoint = format!(
+            "{RESUMABLE_CHECKPOINT_PREFIX}SECRET_HARD_CLAMP_CANARY{RESUMABLE_CHECKPOINT_SUFFIX}"
+        );
+        let mut messages = vec![
+            LlmMessage::system("S".repeat(80)),
+            LlmMessage::user("old history".repeat(40)),
+            LlmMessage::assistant(checkpoint.clone()),
+            LlmMessage::user("CURRENT"),
+        ];
+
+        clamp_messages_to_budget(&mut messages, 20);
+
+        assert!(messages.iter().any(|message| message.content == checkpoint));
+        assert_eq!(messages.last().unwrap().content, "CURRENT");
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content.contains("old history"))
+        );
+    }
+
+    #[test]
     fn drop_oldest_to_target_never_leaves_leading_orphan_via_min_retained() {
         // The MIN_RETAINED clamp must not be able to lower the cutoff onto a
         // tool_results boundary. Here a naive `pair_safe_cutoff(..).min(len-2)`
@@ -2418,6 +2805,582 @@ mod tests {
     }
 
     #[test]
+    fn hidden_checkpoint_resumes_an_ordinary_followup_but_not_a_reaction() {
+        const CANARY: &str = "SECRET_CHECKPOINT_CANARY";
+        const SUMMARY_CANARY: &str = "SECRET_SUMMARY_CANARY";
+        const HISTORY_CANARY: &str = "SECRET_VISIBLE_HISTORY_CANARY";
+        const VOLATILE_CANARY: &str = "SECRET_VOLATILE_MEMORY_CANARY";
+        const TODO_CANARY: &str = "SECRET_ACTIVE_TASK_CANARY";
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        let prompts = PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
+
+        memory.set_conversation_summary(SUMMARY_CANARY).unwrap();
+        memory
+            .blocks
+            .create(
+                "reaction_volatile",
+                VOLATILE_CANARY,
+                "reaction isolation test",
+                1_000,
+                false,
+                false,
+            )
+            .unwrap();
+        let todo_id = memory
+            .todos
+            .create(crate::todos::NewTodo {
+                title: TODO_CANARY.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        memory
+            .todos
+            .update(
+                todo_id,
+                crate::todos::TodoUpdate {
+                    status: Some(crate::todos::TodoStatus::InProgress),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        memory
+            .messages
+            .add(
+                MessageRole::User,
+                &format!("research this {HISTORY_CANARY}"),
+                None,
+            )
+            .unwrap();
+        persist_resumable_checkpoint(
+            &memory,
+            &format!("GOAL — {CANARY}\nDONE — partial"),
+            "test_breaker",
+        )
+        .unwrap();
+        persist_checkpoint_notice(&memory).unwrap();
+
+        let stored = memory.messages.get_recent(10).unwrap();
+        assert_eq!(stored.len(), 3);
+        let checkpoint_metadata = MessageMetadata::from_value(Some(&stored[1].metadata));
+        assert!(checkpoint_metadata.is_internal());
+        assert_eq!(
+            raw_message_kind(Some(&stored[1].metadata)),
+            Some(RawMessageKind::Checkpoint)
+        );
+        assert_eq!(stored[2].content, TURN_CHECKPOINT_NOTICE);
+        let notice_metadata = MessageMetadata::from_value(Some(&stored[2].metadata));
+        assert!(!notice_metadata.is_internal());
+        assert_eq!(
+            raw_message_kind(Some(&stored[2].metadata)),
+            Some(RawMessageKind::CheckpointNotice)
+        );
+
+        let followup = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "continue",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            followup
+                .messages
+                .iter()
+                .filter(|message| message.content.contains(CANARY))
+                .count(),
+            1,
+            "ordinary follow-up must receive the resumable checkpoint exactly once"
+        );
+        let followup_system = system_content(&followup.messages);
+        assert!(followup_system.contains(SUMMARY_CANARY));
+        assert!(followup_system.contains(VOLATILE_CANARY));
+        assert!(followup_system.contains(TODO_CANARY));
+        assert!(
+            followup
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(TURN_CHECKPOINT_NOTICE)),
+            "the UI-only notice must not displace the checkpoint during compaction"
+        );
+
+        let reaction_metadata = metadata_value(
+            MessageVisibility::UserVisible,
+            MessageKind::TelegramReaction,
+            "telegram",
+        );
+        let reaction = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "The user reacted with 👍. Silence is the default.",
+            Vec::new(),
+            Some(&reaction_metadata),
+            &AgentOptions::default(),
+        )
+        .unwrap();
+        let reaction_text = reaction
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for private_canary in [
+            CANARY,
+            SUMMARY_CANARY,
+            HISTORY_CANARY,
+            VOLATILE_CANARY,
+            TODO_CANARY,
+        ] {
+            assert!(
+                !reaction_text.contains(private_canary),
+                "reaction prompt exposed {private_canary}"
+            );
+        }
+        assert!(reaction.recall.is_none());
+        assert!(!reaction_text.contains("<runtime_context source=\"hippocampus\""));
+        assert!(reaction_text.contains("The user reacted with 👍"));
+
+        let wake_metadata =
+            raw_metadata_value(MessageVisibility::Internal, RawMessageKind::Wake, "wake");
+        let wake = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "run the scheduled task",
+            Vec::new(),
+            Some(&wake_metadata),
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            wake.messages
+                .iter()
+                .all(|message| !message.content.contains(CANARY)),
+            "an internal wake must not inherit a prior hidden checkpoint"
+        );
+        let wake_text = wake
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for preserved_context in [SUMMARY_CANARY, HISTORY_CANARY, VOLATILE_CANARY, TODO_CANARY] {
+            assert!(
+                wake_text.contains(preserved_context),
+                "wake lost established context {preserved_context}"
+            );
+        }
+        let still_resumable = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "ordinary turn after synthetic activity",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            still_resumable
+                .messages
+                .iter()
+                .filter(|message| message.content.contains(CANARY))
+                .count(),
+            1,
+            "reaction and synthetic turns must not consume an ordinary checkpoint"
+        );
+    }
+
+    #[test]
+    fn completed_resume_consumes_checkpoint_durably_across_restart() {
+        const CANARY: &str = "SECRET_CONSUMED_CHECKPOINT_CANARY";
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        let prompts = PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
+        memory
+            .messages
+            .add(MessageRole::User, "start resumable work", None)
+            .unwrap();
+        persist_resumable_checkpoint(&memory, CANARY, "test_breaker").unwrap();
+        persist_checkpoint_notice(&memory).unwrap();
+
+        let prepared = prepare_turn_with_checkpoint(
+            &settings,
+            &memory,
+            &prompts,
+            "continue",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let checkpoint_id = prepared
+            .resumable_checkpoint_id
+            .expect("ordinary follow-up should bind the active checkpoint");
+        assert!(
+            prepared
+                .turn
+                .messages
+                .iter()
+                .any(|message| message.content.contains(CANARY))
+        );
+        memory
+            .messages
+            .add(MessageRole::User, "continue", None)
+            .unwrap();
+        persist_completed_ordinary_turn(&memory, "finished result", None, Some(&checkpoint_id))
+            .unwrap();
+
+        let stored = memory.messages.get_recent(20).unwrap();
+        let resolution = stored
+            .iter()
+            .find(|message| {
+                raw_message_kind(Some(&message.metadata))
+                    == Some(RawMessageKind::CheckpointResolved)
+            })
+            .expect("durable resolution marker");
+        assert_eq!(
+            resolution
+                .metadata
+                .get(CHECKPOINT_ID_KEY)
+                .and_then(Value::as_str),
+            Some(checkpoint_id.as_str())
+        );
+        assert!(MessageMetadata::from_value(Some(&resolution.metadata)).is_internal());
+
+        let next = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "unrelated next request",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            next.messages
+                .iter()
+                .all(|message| !message.content.contains(CANARY))
+        );
+
+        drop(memory);
+        let reopened = MemoryStore::from_settings(&settings).unwrap();
+        let after_restart = prepare_turn(
+            &settings,
+            &reopened,
+            &prompts,
+            "request after restart",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            after_restart
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(CANARY))
+        );
+    }
+
+    #[test]
+    fn tool_delivery_or_poisoned_guard_cannot_leave_a_completed_checkpoint_live() {
+        for poison_guard in [false, true] {
+            let tmp = tempdir().unwrap();
+            let settings = settings(tmp.path());
+            let memory = MemoryStore::from_settings(&settings).unwrap();
+            let prompts =
+                PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
+            let canary = format!("SECRET_GUARD_CHECKPOINT_{poison_guard}");
+            memory
+                .messages
+                .add(MessageRole::User, "start", None)
+                .unwrap();
+            persist_resumable_checkpoint(&memory, &canary, "test_breaker").unwrap();
+            let prepared = prepare_turn_with_checkpoint(
+                &settings,
+                &memory,
+                &prompts,
+                "continue",
+                Vec::new(),
+                None,
+                &AgentOptions {
+                    use_hippocampus: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let checkpoint_id = prepared.resumable_checkpoint_id.unwrap();
+            memory
+                .messages
+                .add(MessageRole::User, "continue", None)
+                .unwrap();
+
+            let guard = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::interfaces::telegram::TelegramTurnGuard::new(),
+            ));
+            if poison_guard {
+                let poison = guard.clone();
+                let _ = std::panic::catch_unwind(move || {
+                    let _guard = poison.lock().unwrap();
+                    panic!("poison guard for lifecycle test");
+                });
+            } else {
+                guard
+                    .lock()
+                    .unwrap()
+                    .record_visible_text("already delivered by tool");
+            }
+            let result = persist_completed_ordinary_turn(
+                &memory,
+                "SECRET_REDUNDANT_FINAL",
+                Some(&guard),
+                Some(&checkpoint_id),
+            );
+            assert_eq!(result.is_err(), poison_guard);
+
+            let stored = memory.messages.get_recent(20).unwrap();
+            assert!(
+                stored
+                    .iter()
+                    .all(|message| message.content != "SECRET_REDUNDANT_FINAL")
+            );
+            let next = prepare_turn(
+                &settings,
+                &memory,
+                &prompts,
+                "next",
+                Vec::new(),
+                None,
+                &AgentOptions {
+                    use_hippocampus: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                next.messages
+                    .iter()
+                    .all(|message| !message.content.contains(&canary))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_turn_without_history_override_persists_only_the_safe_event() {
+        const PRIVATE_PROMPT: &str = "SECRET reaction handling prompt and copied task details";
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let agent = Agent::from_settings(settings).unwrap();
+        let metadata = json!({
+            "lethe_visibility": "user_visible",
+            "lethe_message_kind": "telegram_reaction",
+            "lethe_source": "telegram",
+            "reaction_new": ["👍"],
+            "message_id": 77,
+        });
+
+        let result = agent
+            .chat_once_result(TurnRequest::new(PRIVATE_PROMPT).with_metadata(metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(result, TurnResult::Complete(String::new()));
+        let stored = agent.memory().messages.get_recent(10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].content,
+            "[Telegram reaction added: 👍 on message 77]"
+        );
+        assert!(!stored[0].content.contains("SECRET"));
+    }
+
+    #[test]
+    fn hidden_checkpoints_are_never_folded_into_the_conversation_summary_batch() {
+        const CANARY: &str = "SECRET_CHECKPOINT_SUMMARY_CANARY";
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        let prompts = PromptStore::new(&settings.paths.workspace_dir, &settings.paths.config_dir);
+        memory
+            .messages
+            .add(MessageRole::User, "start", None)
+            .unwrap();
+        persist_resumable_checkpoint(&memory, CANARY, "test_breaker").unwrap();
+        for index in 0..6 {
+            memory
+                .messages
+                .add(
+                    MessageRole::User,
+                    &format!("newer user {index} {}", "u".repeat(120)),
+                    None,
+                )
+                .unwrap();
+            memory
+                .messages
+                .add(
+                    MessageRole::Assistant,
+                    &format!("newer assistant {index} {}", "a".repeat(120)),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let turn = prepare_turn(
+            &settings,
+            &memory,
+            &prompts,
+            "current",
+            Vec::new(),
+            None,
+            &AgentOptions {
+                use_hippocampus: false,
+                compaction_budget: CompactionBudget {
+                    max_history_chars: 300,
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(!turn.dropped_for_summary.is_empty());
+        assert!(
+            turn.dropped_for_summary
+                .iter()
+                .all(|message| !message.content.contains(CANARY))
+        );
+    }
+
+    #[test]
+    fn notification_review_context_excludes_internal_checkpoints() {
+        const CANARY: &str = "SECRET_REVIEW_CONTEXT_CANARY";
+        const LEGACY_CANARY: &str = "SECRET_LEGACY_INTERNAL_TURN_CANARY";
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        memory
+            .messages
+            .add(MessageRole::User, "visible question", None)
+            .unwrap();
+        persist_resumable_checkpoint(&memory, CANARY, "test_breaker").unwrap();
+        memory
+            .messages
+            .add(
+                MessageRole::User,
+                "internal wake",
+                Some(raw_metadata_value(
+                    MessageVisibility::Internal,
+                    RawMessageKind::Wake,
+                    "wake",
+                )),
+            )
+            .unwrap();
+        memory
+            .messages
+            .add(MessageRole::Assistant, LEGACY_CANARY, None)
+            .unwrap();
+        memory
+            .messages
+            .add(MessageRole::User, "visible follow-up", None)
+            .unwrap();
+        memory
+            .messages
+            .add(MessageRole::Assistant, "visible answer", None)
+            .unwrap();
+
+        let recent = memory.messages.get_recent(10).unwrap();
+        let context = recent_user_context_from_messages(&recent, 5);
+
+        assert!(context.contains("visible question"));
+        assert!(context.contains("visible follow-up"));
+        assert!(context.contains("visible answer"));
+        assert!(!context.contains(CANARY));
+        assert!(!context.contains(LEGACY_CANARY));
+    }
+
+    #[test]
+    fn ephemeral_history_override_is_removed_before_metadata_persistence() {
+        let metadata = metadata_for_persistence(Some(json!({
+            "lethe_message_kind": "chat",
+            (HISTORY_CONTENT_KEY): "sanitized history",
+        })))
+        .unwrap();
+
+        assert!(metadata.get(HISTORY_CONTENT_KEY).is_none());
+        assert_eq!(metadata["lethe_message_kind"], "chat");
+    }
+
+    #[test]
+    fn ordinary_history_rows_receive_explicit_visible_chat_metadata() {
+        let user_metadata = metadata_for_persistence(None).unwrap();
+        let parsed = MessageMetadata::from_value(Some(&user_metadata));
+        assert!(!parsed.is_internal());
+        assert_eq!(parsed.kind, Some(MessageKind::Chat));
+
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        persist_completed_ordinary_turn(&memory, "natural reply", None, None).unwrap();
+
+        let stored = memory.messages.get_recent(5).unwrap();
+        assert_eq!(stored.len(), 1);
+        let parsed = MessageMetadata::from_value(Some(&stored[0].metadata));
+        assert!(!parsed.is_internal());
+        assert_eq!(parsed.kind, Some(MessageKind::Chat));
+    }
+
+    #[test]
+    fn checkpoint_persists_without_a_duplicate_safe_notice() {
+        const CANARY: &str = "SECRET_CHECKPOINT_CANARY";
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let memory = MemoryStore::from_settings(&settings).unwrap();
+        memory
+            .messages
+            .add(MessageRole::User, "research this", None)
+            .unwrap();
+
+        // This is the path used after a Telegram tool already delivered a
+        // visible message. The checkpoint still has to survive for resume.
+        persist_resumable_checkpoint(&memory, CANARY, "test_breaker").unwrap();
+
+        let stored = memory.messages.get_recent(10).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[1].content, CANARY);
+        let metadata = MessageMetadata::from_value(Some(&stored[1].metadata));
+        assert!(metadata.is_internal());
+        assert_eq!(
+            raw_message_kind(Some(&stored[1].metadata)),
+            Some(RawMessageKind::Checkpoint)
+        );
+    }
+
+    #[test]
     fn prepare_turn_preserves_a_proactive_message_before_the_first_user_reply() {
         let tmp = tempdir().unwrap();
         let settings = settings(tmp.path());
@@ -2571,6 +3534,27 @@ mod tests {
         assert!(system.contains("<actor_context>"));
         assert!(system.contains("runtime role: cortex"));
         assert!(system.contains("<available_on_request>"));
+    }
+
+    #[tokio::test]
+    async fn agent_prepare_turn_isolates_reactions_from_actor_and_tool_context() {
+        let tmp = tempdir().unwrap();
+        let settings = settings(tmp.path());
+        let agent = Agent::from_settings(settings).unwrap();
+        let metadata = metadata_value(
+            MessageVisibility::UserVisible,
+            MessageKind::TelegramReaction,
+            "telegram",
+        );
+
+        let turn = agent
+            .prepare_turn(&TurnRequest::new("The user reacted with 👍").with_metadata(metadata))
+            .await
+            .unwrap();
+
+        let system = system_content(&turn.messages);
+        assert!(!system.contains("<actor_context>"));
+        assert!(!system.contains("<available_on_request>"));
     }
 
     #[tokio::test]

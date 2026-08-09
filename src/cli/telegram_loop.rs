@@ -17,7 +17,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use lethe::actor::ActorNamedEvent;
-use lethe::agent::{Agent, AgentOptions, TurnRequest};
+use lethe::agent::{Agent, AgentOptions, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
 use lethe::config::Settings;
 use lethe::conversation::transcription::{
     choose_transcription_provider, default_model_for_provider, transcribe_audio,
@@ -31,7 +31,8 @@ use lethe::interfaces::telegram::{
 };
 use lethe::memory::MessageRole;
 use lethe::memory::message_metadata::{
-    MessageKind, MessageVisibility, annotate_map, metadata_value as message_metadata_value,
+    MessageKind, MessageMetadata, MessageVisibility, annotate_map,
+    metadata_value as message_metadata_value, user_visible_history_content,
 };
 use lethe::scheduler::brainstem::{self, BrainstemEmission, BrainstemHandle};
 use lethe::tools::registry::ToolRuntime;
@@ -606,7 +607,10 @@ fn telegram_process_callback(
                 "message",
                 serde_json::json!({
                     "role": "user",
-                    "content": context.message,
+                    "content": telegram_user_event_text_from_value(
+                        &context.message,
+                        metadata_value_from_map(&context.metadata).as_ref(),
+                    ),
                     "source": "telegram",
                 }),
             );
@@ -635,9 +639,11 @@ fn telegram_process_callback(
             if let Some(metadata) = metadata_value_from_map(&context.metadata) {
                 req = req.with_metadata(metadata);
             }
-            let response =
-                match with_telegram_typing(&client, context.chat_id, agent.chat_once(req)).await {
-                    Ok(response) => response,
+            let result =
+                match with_telegram_typing(&client, context.chat_id, agent.chat_once_result(req))
+                    .await
+                {
+                    Ok(result) => result,
                     Err(error) => {
                         let error = anyhow::Error::new(error);
                         if let Some(message) =
@@ -656,6 +662,10 @@ fn telegram_process_callback(
                         return Err(error);
                     }
                 };
+            let response = telegram_turn_public_text(
+                result,
+                metadata_value_from_map(&context.metadata).as_ref(),
+            );
             if !context.interrupt.is_interrupted() {
                 tracing::info!(
                     chat_id = context.chat_id,
@@ -830,11 +840,12 @@ async fn handle_telegram_turn(
         .with_attachments(attachments)
         .with_runtime(runtime)
         .with_options(options.clone());
+    let result_metadata = metadata.clone();
     if let Some(metadata) = metadata {
         req = req.with_metadata(metadata);
     }
-    let response = match with_telegram_typing(client, chat_id, agent.chat_once(req)).await {
-        Ok(response) => response,
+    let result = match with_telegram_typing(client, chat_id, agent.chat_once_result(req)).await {
+        Ok(result) => result,
         Err(error) => {
             let error = anyhow::Error::new(error);
             if send_llm_limit_reply(client, chat_id, &error)
@@ -846,6 +857,7 @@ async fn handle_telegram_turn(
             return Err(error);
         }
     };
+    let response = telegram_turn_public_text(result, result_metadata.as_ref());
     tracing::info!(
         chat_id,
         response_chars = response.chars().count(),
@@ -1013,8 +1025,8 @@ async fn process_telegram_actor_updates(
             MessageKind::ActorUpdate,
             "actor_update",
         ));
-    let response = match with_telegram_typing(client, chat_id, agent.chat_once(req)).await {
-        Ok(response) => response,
+    let result = match with_telegram_typing(client, chat_id, agent.chat_once_result(req)).await {
+        Ok(result) => result,
         Err(error) => {
             let error = anyhow::Error::new(error);
             if send_llm_limit_reply(client, chat_id, &error)
@@ -1025,6 +1037,16 @@ async fn process_telegram_actor_updates(
             }
             return Err(error);
         }
+    };
+    let Some(response) = result.into_complete_text() else {
+        tracing::warn!(
+            updates = updates.len(),
+            "actor-update turn checkpointed; suppressing internal checkpoint"
+        );
+        // Actor events remain queryable in durable actor state. Treat this
+        // poll as consumed: retrying an unpersisted synthetic checkpoint every
+        // second would loop and could duplicate later notification effects.
+        return Ok(());
     };
     // Match Python heartbeat: the synthetic prompt explicitly instructs the
     // model to reply with literal "ok" when there's nothing to surface.
@@ -1523,9 +1545,10 @@ async fn process_telegram_once(
             last_chat_id = Some(reaction.chat_id);
             match client.recent_sent_message(reaction.chat_id, reaction.message_id) {
                 Some(sent) => {
-                    // The reaction landed on one of Lethe's own messages. Run a
-                    // real turn so she can answer — but the prompt makes silence
-                    // the default, and an empty reply sends nothing.
+                    // The reaction landed on one of Lethe's own messages. Route
+                    // it through the conversation boundary so the sanitized
+                    // social event is durable; Agent deliberately keeps these
+                    // turns model/tool-free and silent.
                     handle_telegram_turn(
                         client,
                         agent,
@@ -1629,6 +1652,31 @@ async fn send_guarded_telegram_final_response(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn telegram_turn_public_text(result: TurnResult, metadata: Option<&serde_json::Value>) -> String {
+    if MessageMetadata::from_value(metadata).kind == Some(MessageKind::TelegramReaction) {
+        return String::new();
+    }
+    match result {
+        TurnResult::Complete(response) => response,
+        TurnResult::Checkpointed => TURN_CHECKPOINT_NOTICE.to_string(),
+    }
+}
+
+#[cfg(test)]
+fn telegram_user_event_text(
+    message: &str,
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    user_visible_history_content(message, Some(&serde_json::Value::Object(metadata.clone())))
+}
+
+fn telegram_user_event_text_from_value(
+    message: &str,
+    metadata: Option<&serde_json::Value>,
+) -> String {
+    user_visible_history_content(message, metadata)
 }
 
 async fn send_telegram_messages_with_delays(
@@ -1780,6 +1828,53 @@ mod tests {
             llm_limit_reply(&anyhow::anyhow!("429 Too Many Requests")),
             Some(lethe::interfaces::telegram::USAGE_LIMIT_MESSAGE)
         );
+    }
+
+    #[test]
+    fn checkpoint_text_is_typed_not_pattern_matched_for_telegram() {
+        let natural_goal = "GOAL — this is an intentional user-facing answer";
+        assert_eq!(
+            telegram_turn_public_text(TurnResult::Complete(natural_goal.to_string()), None),
+            natural_goal
+        );
+        assert_eq!(
+            telegram_turn_public_text(TurnResult::Checkpointed, None),
+            TURN_CHECKPOINT_NOTICE
+        );
+    }
+
+    #[test]
+    fn every_self_message_reaction_result_stays_silent() {
+        let metadata = message_metadata_value(
+            MessageVisibility::UserVisible,
+            MessageKind::TelegramReaction,
+            "telegram",
+        );
+
+        assert!(telegram_turn_public_text(TurnResult::Checkpointed, Some(&metadata)).is_empty());
+        assert!(
+            telegram_turn_public_text(
+                TurnResult::Complete("SECRET_COMPLETE_CANARY".to_string()),
+                Some(&metadata),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn reaction_conversation_event_hides_the_internal_turn_prompt() {
+        let metadata = serde_json::Map::from_iter([
+            ("lethe_visibility".to_string(), json!("user_visible")),
+            ("lethe_message_kind".to_string(), json!("telegram_reaction")),
+            ("reaction_new".to_string(), json!(["👍"])),
+            ("message_id".to_string(), json!(77)),
+        ]);
+        let prompt = "[Telegram] private reaction handling instructions";
+
+        let visible = telegram_user_event_text(prompt, &metadata);
+
+        assert_eq!(visible, "[Telegram reaction added: 👍 on message 77]");
+        assert!(!visible.contains("private reaction handling"));
     }
 
     #[tokio::test]

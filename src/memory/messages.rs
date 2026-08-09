@@ -10,12 +10,25 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::codec::{ensure_parent, f32_slice_as_bytes, open_conn, parent_dir, semantic_score};
+use super::message_metadata::{
+    MESSAGE_KIND_KEY, MessageKind, MessageMetadata, SOURCE_KEY, VISIBILITY_KEY,
+};
 use super::search::{indent_block, query_terms, search_result_text};
 use super::semantic::{EmbeddingEngine, LEGACY_EMBEDDING_DIMENSIONS};
 
 const TABLE_NAME: &str = "message_history";
 const VEC_TABLE_NAME: &str = "message_history_vec";
+const MIGRATION_TABLE_NAME: &str = "message_history_migrations";
 const SEARCH_RESULT_MAX_LINES: usize = 50;
+const LEGACY_WAKE_QUARANTINE_VERSION: i64 = 1;
+const LEGACY_WAKE_QUARANTINE_NAME: &str = "legacy_wake_forced_wrap_quarantine";
+const LEGACY_WAKE_QUARANTINE_SOURCE: &str = "legacy_wake_quarantine_v1";
+const LEGACY_WAKE_ORIGINAL_METADATA_KEY: &str = "lethe_quarantine_original_metadata";
+const LEGACY_WAKE_QUARANTINE_VERSION_KEY: &str = "lethe_quarantine_version";
+const LEGACY_WAKE_QUARANTINE_REASON_KEY: &str = "lethe_quarantine_reason";
+const LEGACY_WAKE_QUARANTINE_REASON: &str = "legacy_untyped_wake_forced_wrap";
+const LEGACY_INTERNAL_DESCENDANT_SOURCE: &str = "legacy_internal_turn_quarantine_v1";
+const LEGACY_INTERNAL_DESCENDANT_REASON: &str = "legacy_untyped_internal_turn_descendant";
 
 #[derive(Debug, Error)]
 pub enum MessageHistoryError {
@@ -103,6 +116,15 @@ pub struct StoredMessage {
 pub struct MessageHistory {
     data_path: PathBuf,
     embedder: EmbeddingEngine,
+}
+
+#[derive(Debug)]
+struct LegacyMessageRow {
+    id: String,
+    role: MessageRole,
+    content: String,
+    metadata_raw: String,
+    metadata: Option<Value>,
 }
 
 impl MessageHistory {
@@ -439,7 +461,7 @@ impl MessageHistory {
 
     fn ensure_schema(&self) -> MessageHistoryResult<()> {
         ensure_parent(&self.data_path)?;
-        let conn = self.open_conn()?;
+        let mut conn = self.open_conn()?;
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS {table} (
                 id          TEXT PRIMARY KEY,
@@ -453,11 +475,85 @@ impl MessageHistory {
             CREATE VIRTUAL TABLE IF NOT EXISTS {vec_table} USING vec0(
                 id TEXT PRIMARY KEY,
                 embedding float[{dim}]
+            );
+            CREATE TABLE IF NOT EXISTS {migration_table} (
+                version             INTEGER PRIMARY KEY,
+                name                TEXT NOT NULL,
+                applied_at          TEXT NOT NULL,
+                quarantined_turns   INTEGER NOT NULL,
+                quarantined_rows    INTEGER NOT NULL,
+                cleanup_completed_at TEXT,
+                conversation_summary_cleared INTEGER NOT NULL DEFAULT 0,
+                archival_entries_deleted INTEGER NOT NULL DEFAULT 0
             );",
             table = TABLE_NAME,
             vec_table = VEC_TABLE_NAME,
+            migration_table = MIGRATION_TABLE_NAME,
             dim = LEGACY_EMBEDDING_DIMENSIONS,
         ))?;
+        ensure_legacy_quarantine_cleanup_columns(&conn)?;
+        quarantine_legacy_wake_forced_wraps(&mut conn)?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_legacy_wake_cleanup_message_ids(
+        &self,
+    ) -> MessageHistoryResult<Vec<String>> {
+        let conn = self.open_conn()?;
+        let cleanup_pending = conn
+            .query_row(
+                &format!(
+                    "SELECT 1 FROM {MIGRATION_TABLE_NAME} \
+                     WHERE version = ? AND quarantined_rows > 0 \
+                     AND cleanup_completed_at IS NULL"
+                ),
+                params![LEGACY_WAKE_QUARANTINE_VERSION],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !cleanup_pending {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .all()?
+            .into_iter()
+            .filter(|message| {
+                message.metadata.get(VISIBILITY_KEY) == Some(&json!("internal"))
+                    && message
+                        .metadata
+                        .get(LEGACY_WAKE_ORIGINAL_METADATA_KEY)
+                        .is_some()
+                    && message.metadata.get(LEGACY_WAKE_QUARANTINE_VERSION_KEY)
+                        == Some(&json!(LEGACY_WAKE_QUARANTINE_VERSION))
+            })
+            .map(|message| message.id)
+            .collect())
+    }
+
+    pub(crate) fn complete_legacy_wake_cleanup(
+        &self,
+        conversation_summary_cleared: bool,
+        archival_entries_deleted: usize,
+    ) -> MessageHistoryResult<()> {
+        let conn = self.open_conn()?;
+        conn.execute(
+            &format!(
+                "UPDATE {MIGRATION_TABLE_NAME} \
+                 SET cleanup_completed_at = ?, \
+                     conversation_summary_cleared = \
+                         conversation_summary_cleared + ?, \
+                     archival_entries_deleted = archival_entries_deleted + ? \
+                 WHERE version = ? AND cleanup_completed_at IS NULL"
+            ),
+            params![
+                Utc::now().to_rfc3339(),
+                i64::from(conversation_summary_cleared),
+                archival_entries_deleted as i64,
+                LEGACY_WAKE_QUARANTINE_VERSION,
+            ],
+        )?;
         Ok(())
     }
 
@@ -500,6 +596,300 @@ impl MessageHistory {
         }
         Ok(messages)
     }
+}
+
+fn ensure_legacy_quarantine_cleanup_columns(conn: &Connection) -> MessageHistoryResult<()> {
+    let columns = {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({MIGRATION_TABLE_NAME})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<rusqlite::Result<HashSet<_>>>()?
+    };
+    for (name, definition) in [
+        ("cleanup_completed_at", "TEXT"),
+        ("conversation_summary_cleared", "INTEGER NOT NULL DEFAULT 0"),
+        ("archival_entries_deleted", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.contains(name) {
+            conn.execute(
+                &format!("ALTER TABLE {MIGRATION_TABLE_NAME} ADD COLUMN {name} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn quarantine_legacy_wake_forced_wraps(conn: &mut Connection) -> MessageHistoryResult<()> {
+    let tx = conn.transaction()?;
+    let prior_state = tx
+        .query_row(
+            &format!(
+                "SELECT quarantined_turns, quarantined_rows, \
+                        conversation_summary_cleared, archival_entries_deleted \
+                 FROM {MIGRATION_TABLE_NAME} WHERE version = ?"
+            ),
+            params![LEGACY_WAKE_QUARANTINE_VERSION],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let rows = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, role, content, metadata FROM {TABLE_NAME} ORDER BY created_at, rowid"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            let metadata_raw: String = row.get(3)?;
+            let metadata = serde_json::from_str::<Value>(&metadata_raw)
+                .ok()
+                .filter(Value::is_object);
+            Ok(LegacyMessageRow {
+                id: row.get(0)?,
+                role: MessageRole::parse(&row.get::<_, String>(1)?),
+                content: row.get(2)?,
+                metadata_raw,
+                metadata,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut candidate_ranges = Vec::new();
+    let mut turn_start = None;
+    for (index, row) in rows.iter().enumerate() {
+        if !row.role.is_user() {
+            continue;
+        }
+        if let Some(start) = turn_start.replace(index)
+            && should_quarantine_legacy_turn(&rows[start..index])
+        {
+            candidate_ranges.push(start..index);
+        }
+    }
+    if let Some(start) = turn_start
+        && should_quarantine_legacy_turn(&rows[start..])
+    {
+        candidate_ranges.push(start..rows.len());
+    }
+
+    let mut quarantined_rows = 0usize;
+    for range in &candidate_ranges {
+        for row in &rows[range.clone()] {
+            let original_metadata = row
+                .metadata
+                .as_ref()
+                .expect("validated legacy metadata object")
+                .clone();
+            let mut metadata = original_metadata
+                .as_object()
+                .expect("validated legacy metadata object")
+                .clone();
+            metadata.insert(VISIBILITY_KEY.to_string(), json!("internal"));
+            // Use the private wake provenance rather than `checkpoint`: these
+            // historical rows must be hidden, never resumed as active work.
+            metadata.insert(MESSAGE_KIND_KEY.to_string(), json!("wake"));
+            metadata.insert(SOURCE_KEY.to_string(), json!(LEGACY_WAKE_QUARANTINE_SOURCE));
+            metadata.insert(
+                LEGACY_WAKE_ORIGINAL_METADATA_KEY.to_string(),
+                original_metadata,
+            );
+            metadata.insert(
+                LEGACY_WAKE_QUARANTINE_VERSION_KEY.to_string(),
+                json!(LEGACY_WAKE_QUARANTINE_VERSION),
+            );
+            metadata.insert(
+                LEGACY_WAKE_QUARANTINE_REASON_KEY.to_string(),
+                json!(LEGACY_WAKE_QUARANTINE_REASON),
+            );
+            tx.execute(
+                &format!("UPDATE {TABLE_NAME} SET metadata = ? WHERE id = ?"),
+                params![serde_json::to_string(&Value::Object(metadata))?, row.id],
+            )?;
+            quarantined_rows += 1;
+        }
+    }
+
+    let mut internal_descendant_turns = 0usize;
+    let mut inside_internal_turn = false;
+    let mut turn_modified = false;
+    for row in &rows {
+        if row.role.is_user() {
+            if turn_modified {
+                internal_descendant_turns += 1;
+            }
+            let parent_metadata = MessageMetadata::from_value(row.metadata.as_ref());
+            inside_internal_turn = parent_metadata.is_internal();
+            turn_modified = false;
+            continue;
+        }
+        if !inside_internal_turn {
+            continue;
+        }
+        let row_metadata = MessageMetadata::from_value(row.metadata.as_ref());
+        if !row_metadata.is_internal()
+            && row.role.is_assistant()
+            && row_metadata.kind == Some(MessageKind::Proactive)
+        {
+            inside_internal_turn = false;
+            continue;
+        }
+        let already_typed = row
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|metadata| {
+                metadata.contains_key(VISIBILITY_KEY) || metadata.contains_key(MESSAGE_KIND_KEY)
+            });
+        if already_typed {
+            continue;
+        }
+
+        let original_metadata = row
+            .metadata
+            .clone()
+            .unwrap_or_else(|| Value::String(row.metadata_raw.clone()));
+        let mut metadata = row
+            .metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        metadata.insert(VISIBILITY_KEY.to_string(), json!("internal"));
+        // Quarantined descendants are historical internal protocol, never a
+        // resumable checkpoint even if the legacy parent carried bad metadata.
+        metadata.insert(MESSAGE_KIND_KEY.to_string(), json!("wake"));
+        metadata.insert(
+            SOURCE_KEY.to_string(),
+            json!(LEGACY_INTERNAL_DESCENDANT_SOURCE),
+        );
+        metadata.insert(
+            LEGACY_WAKE_ORIGINAL_METADATA_KEY.to_string(),
+            original_metadata,
+        );
+        metadata.insert(
+            LEGACY_WAKE_QUARANTINE_VERSION_KEY.to_string(),
+            json!(LEGACY_WAKE_QUARANTINE_VERSION),
+        );
+        metadata.insert(
+            LEGACY_WAKE_QUARANTINE_REASON_KEY.to_string(),
+            json!(LEGACY_INTERNAL_DESCENDANT_REASON),
+        );
+        tx.execute(
+            &format!("UPDATE {TABLE_NAME} SET metadata = ? WHERE id = ?"),
+            params![serde_json::to_string(&Value::Object(metadata))?, row.id],
+        )?;
+        quarantined_rows += 1;
+        turn_modified = true;
+    }
+    if turn_modified {
+        internal_descendant_turns += 1;
+    }
+    let quarantined_turns = candidate_ranges.len() + internal_descendant_turns;
+
+    if prior_state.is_none() || quarantined_turns > 0 {
+        let (prior_turns, prior_rows, prior_summary_clears, prior_archival_deletes) =
+            prior_state.unwrap_or_default();
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {MIGRATION_TABLE_NAME} \
+                 (version, name, applied_at, quarantined_turns, quarantined_rows, \
+                  cleanup_completed_at, conversation_summary_cleared, \
+                  archival_entries_deleted) \
+                 VALUES (?, ?, ?, ?, ?, NULL, ?, ?)"
+            ),
+            params![
+                LEGACY_WAKE_QUARANTINE_VERSION,
+                LEGACY_WAKE_QUARANTINE_NAME,
+                Utc::now().to_rfc3339(),
+                prior_turns + quarantined_turns as i64,
+                prior_rows + quarantined_rows as i64,
+                prior_summary_clears,
+                prior_archival_deletes,
+            ],
+        )?;
+    }
+    tx.commit()?;
+
+    tracing::info!(
+        migration = LEGACY_WAKE_QUARANTINE_NAME,
+        version = LEGACY_WAKE_QUARANTINE_VERSION,
+        quarantined_turns,
+        quarantined_rows,
+        "message-history legacy quarantine applied"
+    );
+    Ok(())
+}
+
+fn should_quarantine_legacy_turn(turn: &[LegacyMessageRow]) -> bool {
+    let (Some(first), Some(last)) = (turn.first(), turn.last()) else {
+        return false;
+    };
+    if !first.role.is_user() || !last.role.is_assistant() {
+        return false;
+    }
+    if !metadata_is_empty_object(first.metadata.as_ref())
+        || !metadata_is_empty_object(last.metadata.as_ref())
+    {
+        return false;
+    }
+    if turn.iter().any(|row| {
+        row.metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_none_or(|metadata| {
+                metadata.contains_key(VISIBILITY_KEY) || metadata.contains_key(MESSAGE_KIND_KEY)
+            })
+    }) {
+        return false;
+    }
+    matches_legacy_forced_wrap_contract(&last.content)
+}
+
+fn metadata_is_empty_object(metadata: Option<&Value>) -> bool {
+    metadata
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+}
+
+fn matches_legacy_forced_wrap_contract(content: &str) -> bool {
+    if content.contains("```") || content.contains("~~~") {
+        return false;
+    }
+
+    let mut sections = vec![Vec::new()];
+    let mut dividers = 0usize;
+    for line in content.lines() {
+        if line == "---" {
+            dividers += 1;
+            sections.push(Vec::new());
+        } else {
+            sections
+                .last_mut()
+                .expect("at least one forced-wrap section")
+                .push(line);
+        }
+    }
+    if dividers != 3 || sections.len() != 4 {
+        return false;
+    }
+
+    ["GOAL —", "DONE —", "REMAINING —", "NEXT —"]
+        .into_iter()
+        .zip(sections)
+        .all(|(prefix, section)| {
+            section.first().is_some_and(|line| {
+                *line == prefix
+                    || line.strip_prefix(prefix).is_some_and(|suffix| {
+                        suffix.chars().next().is_some_and(char::is_whitespace)
+                    })
+            })
+        })
 }
 
 fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
@@ -570,9 +960,20 @@ fn clean_names(names: &[String]) -> HashSet<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use tempfile::tempdir;
 
     use super::*;
+
+    const EXACT_LEGACY_FORCED_WRAP: &str = "GOAL — preserve the current task\n\
+continue from the durable state\n\
+---\n\
+DONE — completed the safe step\n\
+---\n\
+REMAINING — finish the pending work\n\
+---\n\
+NEXT — resume with the next tool call";
 
     fn history() -> (tempfile::TempDir, MessageHistory) {
         let tmp = tempdir().unwrap();
@@ -580,6 +981,99 @@ mod tests {
         let history =
             MessageHistory::open_with_hash_embedder(path, LEGACY_EMBEDDING_DIMENSIONS).unwrap();
         (tmp, history)
+    }
+
+    fn seed_legacy_history(rows: &[(MessageRole, &str, Value)]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("messages.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message_history (
+                id          TEXT PRIMARY KEY,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                metadata    TEXT NOT NULL DEFAULT '{}',
+                created_at  TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (index, (role, content, metadata)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO message_history (id, role, content, metadata, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![
+                    format!("legacy-{index:03}"),
+                    role.as_str(),
+                    *content,
+                    serde_json::to_string(metadata).unwrap(),
+                    format!("2026-08-08T22:00:{index:02}Z"),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        (tmp, path)
+    }
+
+    fn open_legacy_history(path: &Path) -> MessageHistory {
+        MessageHistory::open_with_hash_embedder(path, LEGACY_EMBEDDING_DIMENSIONS).unwrap()
+    }
+
+    fn exact_legacy_turn() -> Vec<(MessageRole, &'static str, Value)> {
+        vec![
+            (MessageRole::User, "/wake legacy task", json!({})),
+            (
+                MessageRole::Assistant,
+                "",
+                json!({
+                    "tool_calls": [{
+                        "id": "legacy-call",
+                        "function": {"name": "memory_read"}
+                    }]
+                }),
+            ),
+            (
+                MessageRole::Tool,
+                "legacy tool result",
+                json!({"tool_call_id": "legacy-call", "name": "memory_read"}),
+            ),
+            (MessageRole::Assistant, EXACT_LEGACY_FORCED_WRAP, json!({})),
+        ]
+    }
+
+    fn assert_legacy_turn_quarantined(
+        messages: &[StoredMessage],
+        original_rows: &[(MessageRole, &str, Value)],
+    ) {
+        assert_eq!(messages.len(), original_rows.len());
+        for (message, (_, _, original_metadata)) in messages.iter().zip(original_rows) {
+            assert_eq!(
+                message.metadata.get(VISIBILITY_KEY),
+                Some(&json!("internal"))
+            );
+            assert_eq!(message.metadata.get(MESSAGE_KIND_KEY), Some(&json!("wake")));
+            assert_ne!(
+                message.metadata.get(MESSAGE_KIND_KEY),
+                Some(&json!("checkpoint")),
+                "legacy quarantine must never create a resumable checkpoint"
+            );
+            assert_eq!(
+                message.metadata.get(SOURCE_KEY),
+                Some(&json!(LEGACY_WAKE_QUARANTINE_SOURCE))
+            );
+            assert_eq!(
+                message.metadata.get(LEGACY_WAKE_ORIGINAL_METADATA_KEY),
+                Some(original_metadata)
+            );
+            assert_eq!(
+                message.metadata.get(LEGACY_WAKE_QUARANTINE_VERSION_KEY),
+                Some(&json!(LEGACY_WAKE_QUARANTINE_VERSION))
+            );
+            assert_eq!(
+                message.metadata.get(LEGACY_WAKE_QUARANTINE_REASON_KEY),
+                Some(&json!(LEGACY_WAKE_QUARANTINE_REASON))
+            );
+        }
     }
 
     #[test]
@@ -664,5 +1158,255 @@ mod tests {
 
         let window = history.get_context_window(3, 10).unwrap();
         assert!(window.is_empty() || window.last().unwrap().content.len() <= 10);
+    }
+
+    #[test]
+    fn legacy_forced_wrap_turn_is_quarantined_across_reopen_and_queries() {
+        let rows = exact_legacy_turn();
+        let (_tmp, path) = seed_legacy_history(&rows);
+        let history = open_legacy_history(&path);
+
+        let recent = history.get_recent(20).unwrap();
+        assert_legacy_turn_quarantined(&recent, &rows);
+
+        let final_message = history.get("legacy-003").unwrap().unwrap();
+        assert_eq!(final_message.content, EXACT_LEGACY_FORCED_WRAP);
+        assert_legacy_turn_quarantined(&[final_message], &rows[3..]);
+
+        let results = history.search("pending work", 20, None).unwrap();
+        let final_result = results
+            .iter()
+            .find(|message| message.id == "legacy-003")
+            .expect("legacy final should remain auditable through search");
+        assert_legacy_turn_quarantined(&[final_result.clone()], &rows[3..]);
+
+        drop(history);
+        let reopened = open_legacy_history(&path);
+        assert_legacy_turn_quarantined(&reopened.get_recent(20).unwrap(), &rows);
+    }
+
+    #[test]
+    fn legacy_quarantine_ignores_near_misses_and_visible_goal_replies() {
+        let two_dividers =
+            "GOAL — first\n---\nDONE — second\n---\nREMAINING — third\nNEXT — fourth";
+        let four_dividers = "GOAL — first\n---\nDONE — second\n---\nREMAINING — third\n---\nNEXT — fourth\n---\nextra";
+        let padded_divider =
+            "GOAL — first\n --- \nDONE — second\n---\nREMAINING — third\n---\nNEXT — fourth";
+        let wrong_order =
+            "GOAL — first\n---\nREMAINING — third\n---\nDONE — second\n---\nNEXT — fourth";
+        let fenced = "GOAL — first\n```text\nprivate\n```\n---\nDONE — second\n---\nREMAINING — third\n---\nNEXT — fourth";
+        let typed_visible = json!({
+            VISIBILITY_KEY: "user_visible",
+            MESSAGE_KIND_KEY: "chat"
+        });
+        let rows = vec![
+            (MessageRole::User, "ordinary question", json!({})),
+            (
+                MessageRole::Assistant,
+                "GOAL — this is an ordinary natural planning reply",
+                json!({}),
+            ),
+            (MessageRole::User, "two-divider case", json!({})),
+            (MessageRole::Assistant, two_dividers, json!({})),
+            (MessageRole::User, "four-divider case", json!({})),
+            (MessageRole::Assistant, four_dividers, json!({})),
+            (MessageRole::User, "padded-divider case", json!({})),
+            (MessageRole::Assistant, padded_divider, json!({})),
+            (MessageRole::User, "wrong-order case", json!({})),
+            (MessageRole::Assistant, wrong_order, json!({})),
+            (MessageRole::User, "fenced case", json!({})),
+            (MessageRole::Assistant, fenced, json!({})),
+            (MessageRole::User, "typed exact case", typed_visible.clone()),
+            (
+                MessageRole::Assistant,
+                EXACT_LEGACY_FORCED_WRAP,
+                typed_visible,
+            ),
+            (MessageRole::User, "untyped metadata case", json!({})),
+            (
+                MessageRole::Assistant,
+                EXACT_LEGACY_FORCED_WRAP,
+                json!({"style": "natural"}),
+            ),
+            (MessageRole::User, "typed intermediate case", json!({})),
+            (
+                MessageRole::Tool,
+                "typed internal row",
+                json!({VISIBILITY_KEY: "internal", MESSAGE_KIND_KEY: "wake"}),
+            ),
+            (MessageRole::Assistant, EXACT_LEGACY_FORCED_WRAP, json!({})),
+        ];
+        let expected_metadata = rows
+            .iter()
+            .map(|(_, _, metadata)| metadata.clone())
+            .collect::<Vec<_>>();
+        let (_tmp, path) = seed_legacy_history(&rows);
+        let history = open_legacy_history(&path);
+
+        let stored = history.get_recent(50).unwrap();
+        assert_eq!(stored.len(), rows.len());
+        assert_eq!(
+            stored
+                .iter()
+                .map(|message| message.metadata.clone())
+                .collect::<Vec<_>>(),
+            expected_metadata
+        );
+        assert!(stored.iter().all(|message| {
+            message
+                .metadata
+                .get(LEGACY_WAKE_ORIGINAL_METADATA_KEY)
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn legacy_quarantine_is_versioned_idempotent_and_auditable() {
+        let rows = exact_legacy_turn();
+        let (_tmp, path) = seed_legacy_history(&rows);
+        let history = open_legacy_history(&path);
+        let metadata_after_first_open = history
+            .get_recent(20)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.metadata)
+            .collect::<Vec<_>>();
+        drop(history);
+
+        let reopened = open_legacy_history(&path);
+        let metadata_after_reopen = reopened
+            .get_recent(20)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.metadata)
+            .collect::<Vec<_>>();
+        assert_eq!(metadata_after_reopen, metadata_after_first_open);
+
+        let conn = Connection::open(&path).unwrap();
+        let ledger = conn
+            .query_row(
+                &format!(
+                    "SELECT name, quarantined_turns, quarantined_rows \
+                     FROM {MIGRATION_TABLE_NAME} WHERE version = ?"
+                ),
+                params![LEGACY_WAKE_QUARANTINE_VERSION],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ledger,
+            (
+                LEGACY_WAKE_QUARANTINE_NAME.to_string(),
+                1,
+                rows.len() as i64
+            )
+        );
+        let version_rows: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {MIGRATION_TABLE_NAME} WHERE version = ?"),
+                params![LEGACY_WAKE_QUARANTINE_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_rows, 1);
+        assert_legacy_turn_quarantined(&reopened.get_recent(20).unwrap(), &rows);
+    }
+
+    #[test]
+    fn legacy_internal_turn_descendant_is_typed_before_limited_tail_reads() {
+        let rows = vec![
+            (
+                MessageRole::User,
+                "typed internal wake prompt",
+                json!({
+                    VISIBILITY_KEY: "internal",
+                    MESSAGE_KIND_KEY: "checkpoint",
+                    SOURCE_KEY: "wake",
+                }),
+            ),
+            (
+                MessageRole::Assistant,
+                "LEGACY_UNTYPED_INTERNAL_CHILD_CANARY",
+                json!({}),
+            ),
+        ];
+        let (_tmp, path) = seed_legacy_history(&rows);
+        let history = open_legacy_history(&path);
+
+        let tail = history.get_recent(1).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].content, "LEGACY_UNTYPED_INTERNAL_CHILD_CANARY");
+        assert_eq!(tail[0].metadata[VISIBILITY_KEY], "internal");
+        assert_eq!(tail[0].metadata[MESSAGE_KIND_KEY], "wake");
+        assert_eq!(
+            tail[0].metadata[SOURCE_KEY],
+            LEGACY_INTERNAL_DESCENDANT_SOURCE
+        );
+        assert_eq!(
+            tail[0].metadata[LEGACY_WAKE_ORIGINAL_METADATA_KEY],
+            json!({})
+        );
+        assert_eq!(
+            tail[0].metadata[LEGACY_WAKE_QUARANTINE_REASON_KEY],
+            LEGACY_INTERNAL_DESCENDANT_REASON
+        );
+
+        drop(history);
+        let reopened = open_legacy_history(&path);
+        assert_eq!(
+            reopened.get_recent(1).unwrap()[0].metadata,
+            tail[0].metadata
+        );
+    }
+
+    #[test]
+    fn visible_proactive_message_ends_legacy_internal_descendant_backfill() {
+        let rows = vec![
+            (
+                MessageRole::User,
+                "typed internal wake prompt",
+                json!({
+                    VISIBILITY_KEY: "internal",
+                    MESSAGE_KIND_KEY: "wake",
+                    SOURCE_KEY: "wake",
+                }),
+            ),
+            (
+                MessageRole::Assistant,
+                "confirmed proactive delivery",
+                json!({
+                    VISIBILITY_KEY: "user_visible",
+                    MESSAGE_KIND_KEY: "proactive",
+                    SOURCE_KEY: "wake",
+                }),
+            ),
+            (
+                MessageRole::Assistant,
+                "legacy visible continuation",
+                json!({}),
+            ),
+        ];
+        let expected_metadata = rows[1..]
+            .iter()
+            .map(|(_, _, metadata)| metadata.clone())
+            .collect::<Vec<_>>();
+        let (_tmp, path) = seed_legacy_history(&rows);
+        let history = open_legacy_history(&path);
+
+        assert_eq!(
+            history
+                .get_recent(2)
+                .unwrap()
+                .into_iter()
+                .map(|message| message.metadata)
+                .collect::<Vec<_>>(),
+            expected_metadata
+        );
     }
 }

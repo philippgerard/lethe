@@ -47,6 +47,41 @@ fn exposes_core_tool_specs() {
 }
 
 #[test]
+fn conversation_tools_never_return_internal_checkpoint_rows() {
+    use crate::memory::message_metadata::{MessageVisibility, RawMessageKind, raw_metadata_value};
+    use crate::memory::messages::MessageRole;
+
+    let (_tmp, memory, shell) = registry();
+    memory
+        .messages
+        .add(MessageRole::User, "public checkpoint search canary", None)
+        .unwrap();
+    let internal_id = memory
+        .messages
+        .add(
+            MessageRole::Assistant,
+            "SECRET_CHECKPOINT_CANARY",
+            Some(raw_metadata_value(
+                MessageVisibility::Internal,
+                RawMessageKind::Checkpoint,
+                "tool_loop",
+            )),
+        )
+        .unwrap();
+    let registry = ToolRegistry::new(&memory, memory.workspace_dir(), "/tmp/lethe-cache", &shell);
+
+    let search = registry.execute(
+        "conversation_search",
+        &json!({"query": "checkpoint canary", "limit": 10}),
+    );
+    assert!(search.contains("public checkpoint search canary"));
+    assert!(!search.contains("SECRET_CHECKPOINT_CANARY"));
+
+    let get = registry.execute("conversation_get", &json!({"message_id": internal_id}));
+    assert_eq!(get, format!("Message {internal_id} not found."));
+}
+
+#[test]
 fn active_tool_specs_start_small_and_expand_on_request() {
     let (_tmp, memory, shell) = registry();
     let registry = ToolRegistry::new(&memory, memory.workspace_dir(), "/tmp/lethe-cache", &shell);

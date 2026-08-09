@@ -644,6 +644,22 @@ mod tests {
     }
 
     #[test]
+    fn history_hides_internal_resumable_checkpoint() {
+        let item = history_entry_to_item(serde_json::json!({
+            "role": "assistant",
+            "content": "GOAL — SECRET_CHECKPOINT_CANARY",
+            "created_at": "2026-08-08T20:00:00Z",
+            "metadata": {
+                "lethe_visibility": "internal",
+                "lethe_message_kind": "checkpoint",
+                "lethe_source": "tool_loop"
+            }
+        }));
+
+        assert!(item.is_none());
+    }
+
+    #[test]
     fn history_hides_legacy_actor_update_rows_but_keeps_typed_delivery() {
         let legacy = history_entry_to_item(serde_json::json!({
             "role": "assistant",

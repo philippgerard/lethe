@@ -8,7 +8,7 @@
 use anyhow::{Result, anyhow};
 use serde_json::json;
 
-use lethe::agent::{Agent, AgentOptions, TurnRequest};
+use lethe::agent::{Agent, AgentOptions, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
 use lethe::config::Settings;
 use lethe::conversation::transcription::{
     choose_transcription_provider, infer_audio_format, transcribe_audio,
@@ -528,10 +528,13 @@ pub(crate) async fn agent_command(command: AgentCommand) -> Result<()> {
     };
     match command {
         AgentCommand::Chat { message, .. } => {
-            let response = agent
-                .chat_once(TurnRequest::new(message).with_options(options))
+            let result = agent
+                .chat_once_result(TurnRequest::new(message).with_options(options))
                 .await?;
-            println!("{response}");
+            match result {
+                TurnResult::Complete(response) => println!("{response}"),
+                TurnResult::Checkpointed => println!("{TURN_CHECKPOINT_NOTICE}"),
+            }
         }
         AgentCommand::Prepare { message, .. } => {
             let turn = agent
@@ -575,7 +578,9 @@ pub(crate) async fn heartbeat_command(command: HeartbeatCommand) -> Result<()> {
                     use_hippocampus: !no_recall,
                     ..Default::default()
                 });
-            let response = agent.chat_once(req).await?;
+            let result = agent.chat_once_result(req).await?;
+            let checkpointed = result.is_checkpointed();
+            let response = result.into_complete_text().unwrap_or_default();
             let evaluated = if summarize && !response.trim().is_empty() {
                 let router = LlmRouter::new(LlmRouterConfig::from_settings(&settings));
                 Some(
@@ -601,6 +606,7 @@ pub(crate) async fn heartbeat_command(command: HeartbeatCommand) -> Result<()> {
                         "first_tick": prompt.first_tick,
                     },
                     "raw_response": response,
+                    "checkpointed": checkpointed,
                     "evaluated": evaluated,
                     "outcome": outcome,
                     "background": background,

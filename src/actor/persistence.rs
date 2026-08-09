@@ -17,9 +17,12 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
+#[cfg(test)]
+use super::ActorTurnResult;
 use super::helpers::{intent_model_name, parse_model_tier, parse_task_state};
 use super::{
-    Actor, ActorCompletionDelivery, ActorConfig, ActorError, ActorResult, ActorState, TaskState,
+    Actor, ActorCompletionDelivery, ActorConfig, ActorError, ActorResult, ActorState,
+    ActorTurnDisposition, TaskState,
 };
 
 #[derive(Clone, Debug)]
@@ -34,6 +37,7 @@ pub struct ActorStore {
 pub struct RestoredActor {
     pub actor: Actor,
     pub last_response: Option<String>,
+    pub(crate) last_response_disposition: ActorTurnDisposition,
 }
 
 impl ActorStore {
@@ -61,9 +65,9 @@ impl ActorStore {
                 id, name, group_name, goals, spawned_by, is_principal, state,
                 task_state, task_state_note, turn_count, max_turns, max_messages,
                 model, tools, persistent, completion_delivery, background,
-                outcome, result, last_response,
+                outcome, result, last_response, last_response_kind,
                 created_at, terminated_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 actor.id,
                 actor.config.name,
@@ -85,6 +89,7 @@ impl ActorStore {
                 actor.outcome.map(|outcome| outcome.as_str()),
                 actor.result(),
                 last_self_response_text(actor),
+                last_self_response_disposition(actor).as_str(),
                 actor.created_at.to_rfc3339(),
                 actor.terminated_at.map(|at| at.to_rfc3339()),
                 Utc::now().to_rfc3339(),
@@ -106,7 +111,7 @@ impl ActorStore {
                 "SELECT id, name, group_name, goals, spawned_by, task_state,
                         task_state_note, turn_count, max_turns, max_messages,
                         model, tools, persistent, completion_delivery, background,
-                        last_response, created_at
+                        last_response, last_response_kind, created_at
                  FROM actors
                  WHERE state != 'terminated' AND is_principal = 0",
             )
@@ -131,6 +136,8 @@ impl ActorStore {
                     ActorCompletionDelivery::from_str(&completion_delivery);
                 config.background = row.get::<_, i64>("background")? != 0;
                 let task_state_raw: String = row.get("task_state")?;
+                let last_response: Option<String> = row.get("last_response")?;
+                let last_response_kind: String = row.get("last_response_kind")?;
                 let actor = Actor {
                     id: row.get("id")?,
                     config,
@@ -150,7 +157,8 @@ impl ActorStore {
                 };
                 Ok(RestoredActor {
                     actor,
-                    last_response: row.get("last_response")?,
+                    last_response,
+                    last_response_disposition: ActorTurnDisposition::from_str(&last_response_kind),
                 })
             })
             .map_err(sql_error)?
@@ -187,6 +195,7 @@ impl ActorStore {
                 outcome TEXT,
                 result TEXT,
                 last_response TEXT,
+                last_response_kind TEXT NOT NULL DEFAULT 'complete',
                 created_at TEXT NOT NULL,
                 terminated_at TEXT,
                 updated_at TEXT NOT NULL
@@ -219,6 +228,18 @@ impl ActorStore {
         if !has_background {
             conn.execute(
                 "ALTER TABLE actors ADD COLUMN background INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(sql_error)?;
+        }
+        let has_last_response_kind = conn
+            .prepare("SELECT 1 FROM pragma_table_info('actors') WHERE name = 'last_response_kind'")
+            .map_err(sql_error)?
+            .exists([])
+            .map_err(sql_error)?;
+        if !has_last_response_kind {
+            conn.execute(
+                "ALTER TABLE actors ADD COLUMN last_response_kind TEXT NOT NULL DEFAULT 'complete'",
                 [],
             )
             .map_err(sql_error)?;
@@ -268,6 +289,16 @@ fn last_self_response_text(actor: &Actor) -> Option<String> {
         .rev()
         .find(|message| message.sender == actor.id && message.recipient == actor.id)
         .map(|message| message.content.clone())
+}
+
+fn last_self_response_disposition(actor: &Actor) -> ActorTurnDisposition {
+    actor
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.sender == actor.id && message.recipient == actor.id)
+        .and_then(|message| message.turn_disposition())
+        .unwrap_or(ActorTurnDisposition::Complete)
 }
 
 #[cfg(test)]
@@ -335,6 +366,36 @@ mod tests {
             .persist(registry.get(&worker).unwrap())
             .expect("re-persist is an upsert, not a duplicate insert");
     }
+
+    #[test]
+    fn store_round_trips_checkpoint_provenance() {
+        const CANARY: &str = "ACTOR_CHECKPOINT_RESTART_CANARY";
+        let tmp = tempdir().unwrap();
+        let store = ActorStore::open(tmp.path().join("actors.db")).unwrap();
+        let mut registry = ActorRegistry::new();
+        let principal = registry.spawn(ActorConfig::new("cortex", "Serve"), None, true);
+        let worker = registry.spawn(
+            ActorConfig::new("worker", "Resume after restart"),
+            Some(&principal),
+            false,
+        );
+        registry
+            .record_actor_turn_response(&worker, ActorTurnResult::Checkpointed(CANARY.to_string()))
+            .unwrap();
+        store.persist(registry.get(&worker).unwrap()).unwrap();
+
+        let restored = store.load_unfinished().unwrap();
+        let restored = restored
+            .into_iter()
+            .find(|entry| entry.actor.id == worker)
+            .unwrap();
+        assert_eq!(restored.last_response, Some(CANARY.to_string()));
+        assert_eq!(
+            restored.last_response_disposition,
+            ActorTurnDisposition::Checkpointed
+        );
+    }
+
     #[test]
     fn store_migrates_old_schema_with_parent_message_default() {
         let tmp = tempdir().unwrap();

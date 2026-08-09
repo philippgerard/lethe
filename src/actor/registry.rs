@@ -153,17 +153,19 @@ impl ActorRegistry {
             }
             // Carry the last checkpoint across the restart as a self-message
             // so <your_previous_turn> renders on the actor's next turn.
+            let last_response_disposition = entry.last_response_disposition;
             if let Some(last_response) = entry
                 .last_response
-                .as_deref()
-                .filter(|text| !text.trim().is_empty())
+                .filter(|response| !response.trim().is_empty())
             {
-                actor.messages.push(ActorMessage::new(
+                let mut message = ActorMessage::new(
                     actor.id.clone(),
                     actor.id.clone(),
                     last_response,
                     MessageIntent::Info,
-                ));
+                );
+                message.set_turn_disposition(last_response_disposition);
+                actor.messages.push(message);
             }
             let notice = ActorMessage::new(
                 fallback_parent,
@@ -609,10 +611,8 @@ impl ActorRegistry {
             return Ok(None);
         }
         if actor.turn_count >= actor.config.max_turns.max(1) {
-            // Don't terminate empty-handed: the handoff carries the last task
-            // state and the actor's final checkpoint to the parent, so a
-            // successor can be spawned to continue instead of restarting from
-            // zero.
+            // The raw end-of-turn checkpoint is actor-private resumable state.
+            // The parent gets bounded task-state context, never that raw text.
             let handoff = max_turns_handoff(&self.prompts, &actor);
             self.terminate(actor_id, Outcome::MaxTurns, handoff)?;
             return Ok(None);
@@ -653,7 +653,7 @@ impl ActorRegistry {
     pub(super) fn record_actor_turn_response(
         &mut self,
         actor_id: &str,
-        response: impl Into<String>,
+        response: impl Into<ActorTurnResult>,
     ) -> ActorResult<()> {
         let actor = self
             .actors
@@ -663,8 +663,10 @@ impl ActorRegistry {
             return Ok(());
         }
         let response = response.into();
+        let disposition = ActorTurnDisposition::from_result(&response);
+        let response = response.into_text();
         if !response.trim().is_empty() {
-            actor.messages.push(ActorMessage {
+            let mut message = ActorMessage {
                 id: short_id(),
                 sender: actor_id.to_string(),
                 recipient: actor_id.to_string(),
@@ -673,18 +675,19 @@ impl ActorRegistry {
                 intent: MessageIntent::Info,
                 metadata: serde_json::Map::new(),
                 created_at: Utc::now(),
-            });
+            };
+            message.set_turn_disposition(disposition);
+            actor.messages.push(message);
         }
         actor.state = ActorState::Waiting;
         self.persist_actor(actor_id);
         Ok(())
     }
 
-    /// One line per unfinished subagent — anything not terminated, excluding
-    /// the principal and the DMN housekeeping actor. Feeds the heartbeat's
-    /// open-work digest so background work that stalls (especially Blocked
-    /// actors, which never autocontinue) stays visible instead of being
-    /// silently parked forever.
+    /// One structural line per unfinished subagent — anything not terminated,
+    /// excluding the principal and the DMN housekeeping actor. This feeds a
+    /// potentially user-facing heartbeat, so it must never include actor
+    /// identity, goals, or model-controlled task notes.
     pub fn open_work_lines(&self) -> Vec<String> {
         let now = Utc::now();
         let mut unfinished = self
@@ -701,26 +704,18 @@ impl ActorRegistry {
             .into_iter()
             .map(|actor| {
                 let age = format_age(now.signed_duration_since(actor.created_at));
-                let note = if actor.task_state_note.is_empty() {
-                    truncate_chars(&actor.config.goals, 160)
-                } else {
-                    truncate_chars(&actor.task_state_note, 160)
-                };
                 let blocked_marker = if actor.task_state == TaskState::Blocked {
                     " — BLOCKED, needs attention"
                 } else {
                     ""
                 };
                 format!(
-                    "- subagent '{}' (id={}, state={}, task={}, turns {}/{}, age {age}){}: {}",
-                    actor.config.name,
-                    actor.id,
+                    "- subagent (state={}, task={}, turns {}/{}, age {age}){}",
                     actor_state_name(actor.state),
                     state_name(actor.task_state),
                     actor.turn_count,
                     actor.config.max_turns.max(1),
                     blocked_marker,
-                    note,
                 )
             })
             .collect()
@@ -1280,25 +1275,21 @@ fn last_self_response(actor: &Actor) -> Option<&ActorMessage> {
         .find(|message| message.sender == actor.id && message.recipient == actor.id)
 }
 
-/// Termination result for an actor that ran out of turns: last task state +
-/// final checkpoint, so the parent's notification is a handoff rather than a
-/// bare failure notice. Wording comes from the overridable
-/// `actor_max_turns_handoff` template; the state/checkpoint lines are
-/// structural and pre-composed into `{details}`.
+/// Termination result for an actor that ran out of turns. The parent's handoff
+/// carries only the task-state enum, never the private task-state note or raw
+/// turn response; both remain available only inside the actor's state.
 fn max_turns_handoff(prompts: &crate::llm::prompts::PromptStore, actor: &Actor) -> String {
-    let mut details = Vec::new();
+    let mut details = vec![format!(
+        "Last task state: {}.",
+        state_name(actor.task_state)
+    )];
     if !actor.task_state_note.is_empty() {
-        details.push(format!(
-            "Last task state: {} — {}",
-            state_name(actor.task_state),
-            actor.task_state_note
-        ));
+        details.push(
+            "The actor's private task-state note was withheld from this handoff.".to_string(),
+        );
     }
-    if let Some(last_own) = last_self_response(actor) {
-        details.push(format!(
-            "Last checkpoint:\n{}",
-            truncate_chars(&last_own.content, 1200)
-        ));
+    if last_self_response(actor).is_some() {
+        details.push("The actor's private turn state was withheld from this handoff.".to_string());
     }
     let details = if details.is_empty() {
         String::new()

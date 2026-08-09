@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::memory::message_metadata::MessageMetadata;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::args::{
     bool_arg, i64_arg, nonempty_string, optional_tags, string_arg, string_arg_default,
@@ -145,7 +146,15 @@ fn exec_conversation_search(registry: &ToolRegistry<'_>, args: &Value) -> String
         usize_arg(args, "limit", 10),
         role_filter.as_ref(),
     ) {
-        Ok(messages) => crate::memory::messages::MessageHistory::format_messages(&messages),
+        Ok(messages) => {
+            let visible = messages
+                .into_iter()
+                .filter(|message| {
+                    !MessageMetadata::from_value(Some(&message.metadata)).is_internal()
+                })
+                .collect::<Vec<_>>();
+            crate::memory::messages::MessageHistory::format_messages(&visible)
+        }
         Err(error) => format!("Error: {error}"),
     }
 }
@@ -156,7 +165,12 @@ fn exec_conversation_get(registry: &ToolRegistry<'_>, args: &Value) -> String {
         return "Error: message_id is required.".to_string();
     }
     match registry.memory.messages.get(&id) {
-        Ok(Some(message)) => crate::memory::messages::MessageHistory::format_detail(&message),
+        Ok(Some(message))
+            if !MessageMetadata::from_value(Some(&message.metadata)).is_internal() =>
+        {
+            crate::memory::messages::MessageHistory::format_detail(&message)
+        }
+        Ok(Some(_)) => format!("Message {id} not found."),
         Ok(None) => format!("Message {id} not found."),
         Err(error) => format!("Error: {error}"),
     }

@@ -19,7 +19,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::actor::ActorEvent;
-use crate::agent::{Agent, TurnRequest};
+use crate::agent::{Agent, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use crate::interfaces::telegram::{
@@ -28,6 +28,10 @@ use crate::interfaces::telegram::{
 };
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
+use crate::memory::message_metadata::{
+    MessageKind, MessageMetadata, MessageVisibility, RawMessageKind,
+    metadata_value as message_metadata_value, raw_metadata_value as raw_message_metadata_value,
+};
 use crate::scheduler::brainstem::{BrainstemEmission, BrainstemHandle};
 use crate::todos::{TodoFilter, TodoPriority, TodoStatus};
 use crate::tools::registry::{
@@ -413,8 +417,8 @@ impl ApiTurnObserver {
 
     /// Also mirror tool lifecycle onto the durable `/events` broadcast so a
     /// reloaded/second tab shows tool activity for a turn it doesn't own.
-    /// Deltas/reasoning are deliberately NOT broadcast (per-token volume); the
-    /// final `text` mirror carries the full reply.
+    /// Assistant deltas stay session-local, while provider reasoning is dropped
+    /// entirely; the final `text` mirror carries the full reply.
     fn mirror(&self, event: ApiEvent) {
         let _ = self.broadcast.send(event);
     }
@@ -469,23 +473,21 @@ impl TurnObserver for ApiTurnObserver {
             json!({"content": content}),
         ));
     }
-
-    fn on_reasoning_delta(&self, content: &str) {
-        if content.is_empty() {
-            return;
-        }
-        self.deliver(ApiEvent::new(
-            "assistant.reasoning",
-            json!({"content": content}),
-        ));
-    }
 }
 
 /// Translate an internal `ActorEvent` into the TUI-facing actor.* surface.
 /// Returns `None` for events that the TUI doesn't render so the SSE stream
 /// stays low-traffic.
 fn actor_event_to_api(event: &ActorEvent) -> Option<ApiEvent> {
-    let payload = serde_json::Value::Object(event.payload.clone());
+    let mut public_payload = event.payload.clone();
+    if event.event_type == "task_state_changed" {
+        // `update_task_state.note` is actor-private checkpoint/blocker state.
+        // Keep state transitions observable without turning the model-controlled
+        // note into public SSE content.
+        public_payload.remove("note");
+        public_payload.remove("task_state_note");
+    }
+    let payload = serde_json::Value::Object(public_payload);
     match event.event_type.as_str() {
         "actor_spawned" => Some(ApiEvent::new(
             "actor.spawned",
@@ -835,17 +837,22 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
         secure_prompt: state.secure_prompt.clone(),
         ..ToolRuntime::default()
     };
-    let response = state
-        .agent
-        .chat_once(TurnRequest::new(&context.message).with_runtime(tool_runtime))
-        .await;
+    let request_metadata = MessageMetadata::from_map(&context.metadata);
+    let mut req = TurnRequest::new(&context.message).with_runtime(tool_runtime);
+    if !context.metadata.is_empty() {
+        req = req.with_metadata(Value::Object(context.metadata.clone()));
+    }
+    let response = state.agent.chat_once_result(req).await;
 
     match response {
         // Deliver the reply even when the user typed mid-turn (interrupt token
         // set): the work is done and already persisted to history — dropping it
         // here just desyncs the live view from reality (observed: a 7-minute
         // research turn whose answer only ever existed after a page reload).
-        Ok(message) if !message.trim().is_empty() => {
+        Ok(TurnResult::Complete(message))
+            if request_metadata.kind != Some(MessageKind::TelegramReaction)
+                && !message.trim().is_empty() =>
+        {
             let _ = state
                 .send_to_chat(
                     context.chat_id,
@@ -861,7 +868,26 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
             // renders it live (reuses the UI's existing `message` handler).
             state.broadcast_events("message", json!({"role": "assistant", "content": message}));
         }
-        Ok(_) => {}
+        Ok(TurnResult::Checkpointed)
+            if !request_metadata.is_internal()
+                && request_metadata.kind != Some(MessageKind::TelegramReaction) =>
+        {
+            let message = TURN_CHECKPOINT_NOTICE.to_string();
+            let _ = state
+                .send_to_chat(
+                    context.chat_id,
+                    "text",
+                    json!({
+                        "content": &message,
+                        "parse_mode": "Markdown",
+                        "message_id": 0,
+                    }),
+                )
+                .await;
+            state.broadcast_events("message", json!({"role": "assistant", "content": message}));
+        }
+        Ok(TurnResult::Checkpointed) => {}
+        Ok(TurnResult::Complete(_)) => {}
         Err(error) if !context.interrupt.is_interrupted() => {
             let _ = state
                 .send_to_chat(
@@ -1178,11 +1204,34 @@ async fn session_history(
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
     };
-    let serialized = messages
+    let serialized = user_visible_session_messages(messages)
         .into_iter()
         .map(serialize_message)
         .collect::<Vec<_>>();
     Json(json!({"messages": serialized})).into_response()
+}
+
+fn user_visible_session_messages(messages: Vec<StoredMessage>) -> Vec<StoredMessage> {
+    let mut inside_internal_turn = false;
+    messages
+        .into_iter()
+        .filter(|message| {
+            let metadata = MessageMetadata::from_value(Some(&message.metadata));
+            let internal = metadata.is_internal();
+            if message.role.is_user() {
+                inside_internal_turn = internal;
+                return !internal;
+            }
+            if !internal
+                && message.role.is_assistant()
+                && metadata.kind == Some(MessageKind::Proactive)
+            {
+                inside_internal_turn = false;
+                return true;
+            }
+            !inside_internal_turn && !internal
+        })
+        .collect()
 }
 
 fn serialize_message(message: StoredMessage) -> Value {
@@ -1323,6 +1372,7 @@ fn wake_tool_runtime(
 #[derive(Debug, Default, Eq, PartialEq)]
 struct WakeGuardDelivery {
     tool_messages_sent: usize,
+    visible_texts: Vec<String>,
     pending_reactions: Vec<PendingReaction>,
 }
 
@@ -1413,6 +1463,7 @@ fn take_wake_guard_delivery(
         .lock()
         .map(|mut guard| WakeGuardDelivery {
             tool_messages_sent: guard.visible_messages_sent(),
+            visible_texts: guard.drain_visible_texts(),
             pending_reactions: guard.drain_pending_reactions(),
         })
         .map_err(|error| error.to_string())
@@ -1511,7 +1562,7 @@ fn reaction_failure_status(base: &str, reactions: &WakeReactionDelivery) -> Stri
 
 async fn finish_wake_delivery<RF, RFut, FF, FFut>(
     chat_id: i64,
-    reply: String,
+    result: TurnResult,
     tool_messages_sent: usize,
     pending_reactions: Vec<PendingReaction>,
     send_reaction: RF,
@@ -1523,8 +1574,34 @@ where
     FF: FnMut(String) -> FFut,
     FFut: Future<Output = std::result::Result<i64, String>>,
 {
-    let reply_chars = reply.chars().count();
+    let reply_chars = result
+        .complete_text()
+        .map(|reply| reply.chars().count())
+        .unwrap_or(0);
     let reactions = deliver_wake_reactions(pending_reactions, send_reaction).await;
+    let reply = match result {
+        TurnResult::Complete(reply) => reply,
+        TurnResult::Checkpointed => {
+            let delivered = tool_messages_sent > 0 || reactions.delivered > 0;
+            let delivery_status = if reactions.has_failures() {
+                reaction_failure_status("checkpoint_suppressed", &reactions)
+            } else {
+                "checkpoint_suppressed".to_string()
+            };
+            return wake_delivery_error(
+                StatusCode::OK,
+                chat_id,
+                0,
+                &delivery_status,
+                false,
+                delivered,
+                tool_messages_sent,
+                None,
+                "turn ended with an internal checkpoint; fallback delivery was suppressed",
+                &reactions,
+            );
+        }
+    };
     if tool_messages_sent > 0 {
         if reactions.has_failures() {
             return wake_delivery_error(
@@ -1784,13 +1861,38 @@ async fn send_wake_telegram_message(
     chat_id: i64,
     text: String,
     progress: Arc<WakeDeliveryProgress>,
+    visible_texts: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> std::result::Result<i64, String> {
     match client.send_message(chat_id, &text).await {
         Ok(message_id) => {
             progress.record_message();
+            if let Ok(mut visible_texts) = visible_texts.lock() {
+                visible_texts.push(text);
+            }
             Ok(message_id)
         }
         Err(error) => Err(error.to_string()),
+    }
+}
+
+fn persist_wake_visible_history(agent: &Agent, visible_texts: Vec<String>) {
+    for text in visible_texts {
+        if text.trim().is_empty() {
+            continue;
+        }
+        if let Err(error) = agent.memory().messages.add(
+            crate::memory::MessageRole::Assistant,
+            &text,
+            Some(message_metadata_value(
+                MessageVisibility::UserVisible,
+                MessageKind::Proactive,
+                "wake",
+            )),
+        ) {
+            // Delivery is already confirmed. A local transcript failure must
+            // never turn the webhook into a retry that duplicates Telegram.
+            tracing::warn!(error = %error, "failed to persist confirmed wake delivery");
+        }
     }
 }
 
@@ -1869,12 +1971,19 @@ async fn wake(
         }
     };
     let (runtime, delivery_guard) = wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
-    let req = TurnRequest::new(&body.message).with_runtime(runtime);
+    let req = TurnRequest::new(&body.message)
+        .with_runtime(runtime)
+        .with_metadata(raw_message_metadata_value(
+            MessageVisibility::Internal,
+            RawMessageKind::Wake,
+            "wake",
+        ));
 
     let turn_result =
-        run_wake_turn_with_timeout(WAKE_TURN_TIMEOUT, state.agent.chat_once(req)).await;
+        run_wake_turn_with_timeout(WAKE_TURN_TIMEOUT, state.agent.chat_once_result(req)).await;
     let WakeGuardDelivery {
         tool_messages_sent,
+        visible_texts: tool_visible_texts,
         pending_reactions,
     } = match take_wake_guard_delivery(&delivery_guard) {
         Ok(delivery) => delivery,
@@ -1894,9 +2003,19 @@ async fn wake(
         }
     };
 
-    match turn_result {
-        Ok(Ok(reply)) => {
-            let reply_chars = reply.chars().count();
+    let fallback_visible_texts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let response = match turn_result {
+        Ok(Ok(result)) => {
+            let reply_chars = result
+                .complete_text()
+                .map(|reply| reply.chars().count())
+                .unwrap_or(0);
+            let turn_completed = !result.is_checkpointed();
+            let delivery_kind = if turn_completed {
+                "fallback"
+            } else {
+                "checkpoint"
+            };
             let progress = Arc::new(WakeDeliveryProgress::new(
                 tool_messages_sent,
                 pending_reactions.len(),
@@ -1905,9 +2024,10 @@ async fn wake(
             let reaction_client = telegram_client.clone();
             let send_progress = progress.clone();
             let fallback_client = telegram_client.clone();
+            let visible_texts = fallback_visible_texts.clone();
             let delivery = finish_wake_delivery(
                 chat_id,
-                reply,
+                result,
                 tool_messages_sent,
                 pending_reactions,
                 move |pending| {
@@ -1918,15 +2038,16 @@ async fn wake(
                 move |text| {
                     let client = fallback_client.clone();
                     let progress = send_progress.clone();
-                    send_wake_telegram_message(client, chat_id, text, progress)
+                    let visible_texts = visible_texts.clone();
+                    send_wake_telegram_message(client, chat_id, text, progress, visible_texts)
                 },
             );
             run_wake_delivery_with_timeout(
                 WAKE_DELIVERY_TIMEOUT,
                 chat_id,
                 reply_chars,
-                true,
-                "fallback",
+                turn_completed,
+                delivery_kind,
                 progress,
                 delivery,
             )
@@ -1957,6 +2078,7 @@ async fn wake(
             let reaction_client = telegram_client.clone();
             let send_progress = progress.clone();
             let notification_client = telegram_client.clone();
+            let visible_texts = fallback_visible_texts.clone();
             let delivery = finish_wake_failure(
                 chat_id,
                 tool_messages_sent,
@@ -1971,7 +2093,13 @@ async fn wake(
                     send_wake_telegram_reaction(client, pending, progress)
                 },
                 move |text| {
-                    send_wake_telegram_message(notification_client, chat_id, text, send_progress)
+                    send_wake_telegram_message(
+                        notification_client,
+                        chat_id,
+                        text,
+                        send_progress,
+                        visible_texts,
+                    )
                 },
             );
             let delivery_kind = format!("{failure_kind}_notice");
@@ -1995,6 +2123,7 @@ async fn wake(
             let reaction_client = telegram_client.clone();
             let send_progress = progress.clone();
             let notification_client = telegram_client.clone();
+            let visible_texts = fallback_visible_texts.clone();
             let delivery = finish_wake_failure(
                 chat_id,
                 tool_messages_sent,
@@ -2012,7 +2141,13 @@ async fn wake(
                     send_wake_telegram_reaction(client, pending, progress)
                 },
                 move |text| {
-                    send_wake_telegram_message(notification_client, chat_id, text, send_progress)
+                    send_wake_telegram_message(
+                        notification_client,
+                        chat_id,
+                        text,
+                        send_progress,
+                        visible_texts,
+                    )
                 },
             );
             run_wake_delivery_with_timeout(
@@ -2026,7 +2161,15 @@ async fn wake(
             )
             .await
         }
+    };
+
+    let mut visible_texts = tool_visible_texts;
+    match fallback_visible_texts.lock() {
+        Ok(fallback_texts) => visible_texts.extend(fallback_texts.iter().cloned()),
+        Err(error) => tracing::warn!(error = %error, "wake delivery transcript lock poisoned"),
     }
+    persist_wake_visible_history(state.agent.as_ref(), visible_texts);
+    response
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
@@ -2120,9 +2263,22 @@ mod tests {
     fn actor_events_carry_group_and_surface_user_notify() {
         let mut event = ActorEvent::new("task_state_changed", "worker-1");
         event.group = "default".to_string();
+        event.payload = serde_json::json!({
+            "from": "pending",
+            "to": "in_progress",
+            "note": "SECRET_ACTOR_TASK_STATE_CANARY",
+            "task_state_note": "SECOND_SECRET_ACTOR_TASK_STATE_CANARY",
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
         let api_event = actor_event_to_api(&event).unwrap();
         assert_eq!(api_event.event, "actor.task");
         assert_eq!(api_event.data["group"], "default");
+        assert_eq!(api_event.data["payload"]["from"], "pending");
+        assert_eq!(api_event.data["payload"]["to"], "in_progress");
+        assert!(api_event.data["payload"].get("note").is_none());
+        assert!(api_event.data["payload"].get("task_state_note").is_none());
 
         let mut notify = ActorEvent::new("user_notify", "worker-1");
         notify.group = "default".to_string();
@@ -2181,6 +2337,86 @@ mod tests {
     }
 
     #[test]
+    fn session_history_filters_internal_checkpoints_and_turns_server_side() {
+        const CANARY: &str = "SECRET_CHECKPOINT_CANARY";
+        let tmp = tempdir().unwrap();
+        let settings = test_settings(tmp.path());
+        let memory = crate::memory::MemoryStore::from_settings(&settings).unwrap();
+
+        memory
+            .messages
+            .add(crate::memory::MessageRole::User, "visible question", None)
+            .unwrap();
+        memory
+            .messages
+            .add(
+                crate::memory::MessageRole::Assistant,
+                CANARY,
+                Some(raw_message_metadata_value(
+                    MessageVisibility::Internal,
+                    RawMessageKind::Checkpoint,
+                    "tool_loop",
+                )),
+            )
+            .unwrap();
+        memory
+            .messages
+            .add(
+                crate::memory::MessageRole::User,
+                "internal wake prompt",
+                Some(raw_message_metadata_value(
+                    MessageVisibility::Internal,
+                    RawMessageKind::Wake,
+                    "wake",
+                )),
+            )
+            .unwrap();
+        memory
+            .messages
+            .add(
+                crate::memory::MessageRole::Assistant,
+                "legacy untagged internal answer",
+                None,
+            )
+            .unwrap();
+        memory
+            .messages
+            .add(
+                crate::memory::MessageRole::User,
+                "next visible question",
+                None,
+            )
+            .unwrap();
+
+        let visible = user_visible_session_messages(memory.messages.get_recent(20).unwrap());
+        let contents = visible
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["visible question", "next visible question"]);
+        assert!(contents.iter().all(|content| !content.contains(CANARY)));
+    }
+
+    #[test]
+    fn confirmed_wake_text_is_persisted_as_user_visible_proactive_history() {
+        let tmp = tempdir().unwrap();
+        let settings = test_settings(tmp.path());
+        let agent = Agent::from_settings(settings).unwrap();
+
+        persist_wake_visible_history(
+            &agent,
+            vec!["first confirmed bubble".to_string(), "   ".to_string()],
+        );
+
+        let stored = agent.memory().messages.get_recent(10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].content, "first confirmed bubble");
+        let metadata = MessageMetadata::from_value(Some(&stored[0].metadata));
+        assert!(!metadata.is_internal());
+        assert_eq!(metadata.kind, Some(MessageKind::Proactive));
+    }
+
+    #[test]
     fn wake_target_prefers_explicit_chat_then_configured_user() {
         let tmp = tempdir().unwrap();
         let mut settings = test_settings(tmp.path());
@@ -2236,7 +2472,7 @@ mod tests {
         let guard = Arc::new(StdMutex::new(TelegramTurnGuard::new()));
         {
             let mut guard = guard.lock().unwrap();
-            guard.record_visible_message();
+            guard.record_visible_text("confirmed tool message");
             guard.queue_pending_reaction(42, 70, "👍");
             guard.queue_pending_reaction(42, 71, "🔥");
         }
@@ -2244,6 +2480,7 @@ mod tests {
         let delivery = take_wake_guard_delivery(&guard).unwrap();
 
         assert_eq!(delivery.tool_messages_sent, 1);
+        assert_eq!(delivery.visible_texts, ["confirmed tool message"]);
         assert_eq!(
             delivery.pending_reactions,
             vec![pending_reaction(70, "👍"), pending_reaction(71, "🔥")]
@@ -2260,7 +2497,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "redundant final".to_string(),
+            TurnResult::Complete("redundant final".to_string()),
             2,
             Vec::new(),
             |_| async { Ok(()) },
@@ -2290,7 +2527,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "redundant final".to_string(),
+            TurnResult::Complete("redundant final".to_string()),
             1,
             vec![pending_reaction(70, "👍"), pending_reaction(71, "🔥")],
             |pending| async move {
@@ -2331,7 +2568,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "  final answer  ".to_string(),
+            TurnResult::Complete("  final answer  ".to_string()),
             0,
             Vec::new(),
             |_| async { Ok(()) },
@@ -2356,13 +2593,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wake_delivery_never_uses_a_checkpoint_as_fallback() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            TurnResult::Checkpointed,
+            0,
+            Vec::new(),
+            |_| async { Ok(()) },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(73) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], false);
+        assert_eq!(body["reply_chars"], 0);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "checkpoint_suppressed");
+        assert_eq!(body["delivered_messages"], 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn wake_checkpoint_keeps_confirmed_tool_delivery_non_retryable() {
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let calls = fallback_calls.clone();
+
+        let response = finish_wake_delivery(
+            42,
+            TurnResult::Checkpointed,
+            2,
+            vec![pending_reaction(70, "👍")],
+            |_| async { Ok(()) },
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(73) }
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], false);
+        assert_eq!(body["delivered"], true);
+        assert_eq!(body["delivery_status"], "checkpoint_suppressed");
+        assert_eq!(body["delivered_messages"], 2);
+        assert_eq!(body["delivered_reactions"], 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn wake_delivery_reports_reaction_failure_even_when_fallback_text_arrives() {
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let calls = fallback_calls.clone();
 
         let response = finish_wake_delivery(
             42,
-            "final answer".to_string(),
+            TurnResult::Complete("final answer".to_string()),
             0,
             vec![pending_reaction(70, "👍")],
             |_| async { Err("reaction rejected".to_string()) },
@@ -2397,7 +2692,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "   ".to_string(),
+            TurnResult::Complete("   ".to_string()),
             0,
             vec![pending_reaction(70, "👍")],
             |_| async { Ok(()) },
@@ -2428,7 +2723,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "x".repeat(5000),
+            TurnResult::Complete("x".repeat(5000)),
             0,
             Vec::new(),
             |_| async { Ok(()) },
@@ -2463,7 +2758,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "   ".to_string(),
+            TurnResult::Complete("   ".to_string()),
             0,
             Vec::new(),
             |_| async { Ok(()) },
@@ -2488,7 +2783,7 @@ mod tests {
     async fn wake_delivery_reports_fallback_send_failure() {
         let response = finish_wake_delivery(
             42,
-            "final answer".to_string(),
+            TurnResult::Complete("final answer".to_string()),
             0,
             Vec::new(),
             |_| async { Ok(()) },
@@ -2513,7 +2808,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            "x".repeat(5000),
+            TurnResult::Complete("x".repeat(5000)),
             0,
             Vec::new(),
             |_| async { Ok(()) },
@@ -2755,7 +3050,7 @@ mod tests {
         let calls = fallback_calls.clone();
         let delivery = finish_wake_delivery(
             42,
-            "fallback answer".to_string(),
+            TurnResult::Complete("fallback answer".to_string()),
             0,
             vec![pending_reaction(70, "👍")],
             move |_| {
@@ -2926,6 +3221,41 @@ mod tests {
         assert_eq!(event.event, "reaction");
         assert_eq!(event.data["emoji"], "✅");
         assert_eq!(event.data["message_id"], 42);
+    }
+
+    #[tokio::test]
+    async fn api_turn_observer_drops_reasoning_but_keeps_assistant_deltas() {
+        let chat_id = 99;
+        let session_id = "observer-test".to_string();
+        let (sender, mut receiver) = mpsc::channel::<ApiEvent>(SESSION_QUEUE_DEPTH);
+        let mut sessions = ApiSessions::default();
+        sessions.by_chat.insert(chat_id, session_id.clone());
+        sessions
+            .by_id
+            .insert(session_id, ApiSession { chat_id, sender });
+        let (broadcast, mut broadcast_receiver) = broadcast::channel(EVENT_QUEUE_DEPTH);
+        let observer = ApiTurnObserver::new(Arc::new(Mutex::new(sessions)), chat_id, broadcast);
+
+        observer.on_reasoning_delta("SECRET_REASONING_CANARY");
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            broadcast_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        observer.on_assistant_delta("natural answer");
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.event, "assistant.delta");
+        assert_eq!(event.data, json!({"content": "natural answer"}));
+        assert!(matches!(
+            broadcast_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,6 +102,7 @@ impl MemoryStore {
         let archival = ArchivalMemory::from_db(memory_db.clone());
         let messages =
             MessageHistory::open_with_embedder(&memory_data_path, memory_db.embedder().clone())?;
+        cleanup_legacy_wake_derivatives(&blocks, &archival, &messages)?;
         let notes = NoteStore::new_with_db(notes_dir, memory_db)?;
         let todos = TodoManager::open(&memory_data_path)?;
         if let Some(legacy) = legacy_db_path.as_deref() {
@@ -359,6 +361,57 @@ impl MemoryStore {
     }
 }
 
+fn cleanup_legacy_wake_derivatives(
+    blocks: &BlockManager,
+    archival: &ArchivalMemory,
+    messages: &MessageHistory,
+) -> MemoryStoreResult<()> {
+    let quarantined_ids = messages.pending_legacy_wake_cleanup_message_ids()?;
+    if quarantined_ids.is_empty() {
+        return Ok(());
+    }
+    let quarantined_ids = quarantined_ids.into_iter().collect::<HashSet<_>>();
+
+    let mut archival_entries_deleted = 0usize;
+    for entry in archival.all_entries()? {
+        let is_curator_episode = entry.metadata.get("source")
+            == Some(&serde_json::Value::String(
+                "rust_curator_harvest".to_string(),
+            ))
+            && entry.tags.iter().any(|tag| tag == "conversation")
+            && entry.tags.iter().any(|tag| tag == "curator");
+        let references_quarantined_message = entry
+            .metadata
+            .get("message_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| {
+                ids.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .any(|id| quarantined_ids.contains(id))
+            });
+        if is_curator_episode && references_quarantined_message && archival.delete(&entry.id)? {
+            archival_entries_deleted += 1;
+        }
+    }
+
+    let conversation_summary_cleared = blocks
+        .get(super::blocks::CONVERSATION_SUMMARY_LABEL)?
+        .is_some_and(|block| !block.value.trim().is_empty());
+    if conversation_summary_cleared {
+        blocks.system_update(super::blocks::CONVERSATION_SUMMARY_LABEL, "")?;
+    }
+    messages
+        .complete_legacy_wake_cleanup(conversation_summary_cleared, archival_entries_deleted)?;
+
+    tracing::info!(
+        quarantined_rows = quarantined_ids.len(),
+        conversation_summary_cleared,
+        archival_entries_deleted,
+        "removed derived state for quarantined legacy wake output"
+    );
+    Ok(())
+}
+
 fn ensure_skills_bootstrap(skills_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(skills_dir)?;
     let readme = skills_dir.join("README.md");
@@ -606,5 +659,198 @@ mod tests {
 
         let combined = store.get_context_for_prompt().unwrap();
         assert!(combined.contains("<memory_metadata>"));
+    }
+
+    #[test]
+    fn late_legacy_wake_import_clears_only_derived_state_once() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let legacy_db_path = tmp.path().join("data").join("lethe.db");
+        let notes_dir = workspace.join("notes");
+        let store = MemoryStore::open(&workspace, &legacy_db_path, &notes_dir).unwrap();
+        let memory_data_path = store.memory_data_path().to_path_buf();
+
+        let user_id = store
+            .messages
+            .add(MessageRole::User, "/wake legacy task", None)
+            .unwrap();
+        let assistant_tool_id = store
+            .messages
+            .add(
+                MessageRole::Assistant,
+                "",
+                Some(json!({
+                    "tool_calls": [{
+                        "id": "legacy-call",
+                        "function": {"name": "memory_read"}
+                    }]
+                })),
+            )
+            .unwrap();
+        let tool_id = store
+            .messages
+            .add(
+                MessageRole::Tool,
+                "legacy tool result",
+                Some(json!({
+                    "tool_call_id": "legacy-call",
+                    "name": "memory_read"
+                })),
+            )
+            .unwrap();
+        let final_id = store
+            .messages
+            .add(
+                MessageRole::Assistant,
+                "GOAL — preserve the current task\n\
+                 ---\n\
+                 DONE — completed the safe step\n\
+                 ---\n\
+                 REMAINING — finish the pending work\n\
+                 ---\n\
+                 NEXT — resume with the next tool call",
+                None,
+            )
+            .unwrap();
+        let forced_wrap_ids = vec![user_id, assistant_tool_id, tool_id, final_id];
+        let internal_user_id = store
+            .messages
+            .add(
+                MessageRole::User,
+                "typed legacy internal prompt",
+                Some(json!({
+                    "lethe_visibility": "internal",
+                    "lethe_message_kind": "wake",
+                    "lethe_source": "wake",
+                })),
+            )
+            .unwrap();
+        let internal_child_id = store
+            .messages
+            .add(
+                MessageRole::Assistant,
+                "LEGACY_UNTYPED_INTERNAL_CHILD_CANARY",
+                None,
+            )
+            .unwrap();
+        let mut legacy_ids = forced_wrap_ids.clone();
+        legacy_ids.extend([internal_user_id.clone(), internal_child_id.clone()]);
+
+        store
+            .set_conversation_summary("SUMMARY_DERIVED_FROM_LEGACY_WAKE")
+            .unwrap();
+        let derived_archive_id = store
+            .archival
+            .add(
+                "ARCHIVE_DERIVED_FROM_LEGACY_WAKE",
+                Some(json!({
+                    "source": "rust_curator_harvest",
+                    "message_ids": legacy_ids,
+                })),
+                &["conversation".to_string(), "curator".to_string()],
+            )
+            .unwrap();
+        let unrelated_archive_id = store
+            .archival
+            .add(
+                "UNRELATED_CURATOR_ARCHIVE",
+                Some(json!({
+                    "source": "rust_curator_harvest",
+                    "message_ids": ["unrelated-message"],
+                })),
+                &["conversation".to_string(), "curator".to_string()],
+            )
+            .unwrap();
+        let non_curator_archive_id = store
+            .archival
+            .add(
+                "USER_ARCHIVE_WITH_SAME_IDS",
+                Some(json!({
+                    "source": "user_import",
+                    "message_ids": legacy_ids,
+                })),
+                &[],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = MemoryStore::open(&workspace, &legacy_db_path, &notes_dir).unwrap();
+        for message_id in &forced_wrap_ids {
+            let message = reopened.messages.get(message_id).unwrap().unwrap();
+            assert_eq!(message.metadata["lethe_visibility"], "internal");
+            assert_eq!(message.metadata["lethe_message_kind"], "wake");
+            assert_eq!(
+                message.metadata["lethe_source"],
+                "legacy_wake_quarantine_v1"
+            );
+        }
+        let internal_user = reopened.messages.get(&internal_user_id).unwrap().unwrap();
+        assert_eq!(internal_user.metadata["lethe_visibility"], "internal");
+        assert_eq!(internal_user.metadata["lethe_source"], "wake");
+        let internal_child = reopened.messages.get(&internal_child_id).unwrap().unwrap();
+        assert_eq!(internal_child.metadata["lethe_visibility"], "internal");
+        assert_eq!(internal_child.metadata["lethe_message_kind"], "wake");
+        assert_eq!(
+            internal_child.metadata["lethe_source"],
+            "legacy_internal_turn_quarantine_v1"
+        );
+        assert_eq!(reopened.conversation_summary().unwrap(), "");
+        assert!(
+            reopened
+                .archival
+                .get(&derived_archive_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .archival
+                .get(&unrelated_archive_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .archival
+                .get(&non_curator_archive_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let conn = crate::memory::codec::open_conn(&memory_data_path).unwrap();
+        let cleanup_state = conn
+            .query_row(
+                "SELECT cleanup_completed_at IS NOT NULL, \
+                        conversation_summary_cleared, archival_entries_deleted \
+                 FROM message_history_migrations WHERE version = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, bool>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(cleanup_state, (true, 1, 1));
+        drop(conn);
+
+        reopened
+            .set_conversation_summary("SAFE_SUMMARY_AFTER_QUARANTINE")
+            .unwrap();
+        drop(reopened);
+        let reopened_again = MemoryStore::open(&workspace, &legacy_db_path, &notes_dir).unwrap();
+        assert_eq!(
+            reopened_again.conversation_summary().unwrap(),
+            "SAFE_SUMMARY_AFTER_QUARANTINE"
+        );
+        assert!(
+            reopened_again
+                .archival
+                .get(&unrelated_archive_id)
+                .unwrap()
+                .is_some()
+        );
     }
 }

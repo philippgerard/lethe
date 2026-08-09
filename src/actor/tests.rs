@@ -103,6 +103,7 @@ fn spawn_event_carries_the_actor_goals() {
 
 #[test]
 fn open_work_lines_surface_unfinished_subagents_only() {
+    const TASK_NOTE_CANARY: &str = "OPEN_WORK_PRIVATE_TASK_NOTE_CANARY";
     let (mut registry, principal, worker) = registry_with_principal_and_worker();
 
     // The DMN housekeeping actor and the principal never count as open work.
@@ -121,7 +122,7 @@ fn open_work_lines_surface_unfinished_subagents_only() {
         false,
     );
     registry
-        .set_task_state(&blocked, "blocked", "waiting for the API key from the user")
+        .set_task_state(&blocked, "blocked", TASK_NOTE_CANARY)
         .unwrap();
 
     let lines = registry.open_work_lines();
@@ -131,13 +132,26 @@ fn open_work_lines_surface_unfinished_subagents_only() {
         2,
         "principal and dmn must be excluded: {joined}"
     );
-    assert!(joined.contains("researcher"));
-    assert!(joined.contains("deployer"));
+    assert!(joined.contains("state=running"));
+    assert!(joined.contains("task=running"));
+    assert!(joined.contains("task=blocked"));
     assert!(joined.contains("BLOCKED, needs attention"));
-    assert!(joined.contains("waiting for the API key"));
     assert!(joined.contains("turns 0/5"));
+    assert!(joined.contains("age "));
+
+    // Heartbeat needs only structural liveness. Never expose model-controlled
+    // or identifying actor fields in its open-work prompt.
+    assert!(!joined.contains("researcher"));
+    assert!(!joined.contains("deployer"));
     assert!(!joined.contains("cortex"));
     assert!(!joined.contains("'dmn'"));
+    assert!(!joined.contains("Research the topic and report findings"));
+    assert!(!joined.contains("Deploy the release"));
+    assert!(!joined.contains("Background reflection"));
+    assert!(!joined.contains(TASK_NOTE_CANARY));
+    assert!(!joined.contains(&worker));
+    assert!(!joined.contains(&blocked));
+    assert!(!joined.contains(&principal));
 
     // Terminated actors drop out of the digest.
     registry
@@ -215,38 +229,141 @@ fn actor_prompt_fragments_are_template_overridable() {
 }
 
 #[test]
-fn max_turns_termination_hands_checkpoint_to_parent() {
+fn max_turns_parent_delivery_redacts_private_checkpoint_and_task_note() {
+    const CHECKPOINT_CANARY: &str = "ACTOR_PRIVATE_CHECKPOINT_CANARY";
+    const TASK_NOTE_CANARY: &str = "ACTOR_PRIVATE_TASK_NOTE_CANARY";
     let (mut registry, principal, worker) = registry_with_principal_and_worker();
 
     registry
-        .set_task_state(&worker, "running", "step 3 of 5: porting the lexer")
+        .set_task_state(&worker, "running", TASK_NOTE_CANARY)
         .unwrap();
 
-    // Burn through the worker's 5-turn budget, leaving a checkpoint each turn.
+    // Burn through the worker's 5-turn budget, leaving a private checkpoint.
     for turn in 1..=5 {
         let spec = registry.prepare_actor_turn(&worker).unwrap();
         assert!(spec.is_some(), "turn {turn} should be allowed");
+        let response = if turn == 5 {
+            ActorTurnResult::Checkpointed(format!(
+                "GOAL: {CHECKPOINT_CANARY}. NEXT: inspect secret implementation details"
+            ))
+        } else {
+            ActorTurnResult::Complete(format!("completed actor turn {turn}"))
+        };
         registry
-            .record_actor_turn_response(&worker, format!("checkpoint after turn {turn}"))
+            .record_actor_turn_response(&worker, response)
             .unwrap();
     }
 
-    // Turn 6 hits the cap: actor terminates with a handoff, not a bare notice.
+    // The same actor may use the raw checkpoint to resume its own next turn.
+    let own_prompt = registry.build_system_prompt(&worker).unwrap();
+    assert!(own_prompt.contains(CHECKPOINT_CANARY));
+    assert_eq!(
+        registry.get(&worker).unwrap().task_state_note(),
+        TASK_NOTE_CANARY
+    );
+
+    // Turn 6 hits the cap: parent-facing surfaces get bounded state only.
     assert!(registry.prepare_actor_turn(&worker).unwrap().is_none());
     let actor = registry.get(&worker).unwrap();
     assert_eq!(actor.state, ActorState::Terminated);
     assert_eq!(actor.info().outcome, Some(Outcome::MaxTurns));
     let result = actor.result().unwrap();
     assert!(result.contains("Max turns reached (5)"));
-    assert!(result.contains("porting the lexer"));
-    assert!(result.contains("checkpoint after turn 5"));
+    assert!(result.contains("Last task state: running"));
+    assert!(result.contains("private task-state note was withheld"));
+    assert!(result.contains("private turn state was withheld"));
+    assert!(!result.contains(CHECKPOINT_CANARY));
+    assert!(!result.contains(TASK_NOTE_CANARY));
     assert!(result.contains("spawn a successor"));
+    assert_eq!(actor.task_state_note(), TASK_NOTE_CANARY);
 
     // The parent's inbox received the same handoff via termination notify.
     let parent_message = registry.pop_inbox(&principal).unwrap();
     assert_eq!(parent_message.sender, worker);
     assert!(parent_message.intent.is_terminal());
-    assert!(parent_message.content.contains("checkpoint after turn 5"));
+    assert!(!parent_message.content.contains(CHECKPOINT_CANARY));
+    assert!(!parent_message.content.contains(TASK_NOTE_CANARY));
+
+    // The raw task-state event remains internal. Check only outward max-turn
+    // lifecycle/message events; the API projection owns its own redaction.
+    let outward_events = registry
+        .events
+        .query(None, Some(&worker), None, 20)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "actor_terminated" | "actor_message"
+            )
+        })
+        .map(|event| serde_json::to_string(&event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!outward_events.contains(CHECKPOINT_CANARY));
+    assert!(!outward_events.contains(TASK_NOTE_CANARY));
+}
+
+#[test]
+fn max_turns_poll_only_redacts_private_checkpoint_and_task_note() {
+    const CHECKPOINT_CANARY: &str = "POLL_ONLY_PRIVATE_CHECKPOINT_CANARY";
+    const TASK_NOTE_CANARY: &str = "POLL_ONLY_PRIVATE_TASK_NOTE_CANARY";
+    let mut registry = ActorRegistry::new();
+    let principal = registry.spawn(
+        ActorConfig::new("cortex", "Serve the user").in_group("main"),
+        None,
+        true,
+    );
+    let mut config = ActorConfig::new("research-worker", "Investigate privately").in_group("main");
+    config.max_turns = 1;
+    config.completion_delivery = ActorCompletionDelivery::PollOnly;
+    let worker = registry.spawn(config, Some(&principal), false);
+    registry
+        .set_task_state(&worker, "running", TASK_NOTE_CANARY)
+        .unwrap();
+
+    assert!(registry.prepare_actor_turn(&worker).unwrap().is_some());
+    registry
+        .record_actor_turn_response(
+            &worker,
+            ActorTurnResult::Checkpointed(CHECKPOINT_CANARY.to_string()),
+        )
+        .unwrap();
+
+    let own_prompt = registry.build_system_prompt(&worker).unwrap();
+    assert!(own_prompt.contains(CHECKPOINT_CANARY));
+    assert_eq!(
+        registry.get(&worker).unwrap().task_state_note(),
+        TASK_NOTE_CANARY
+    );
+
+    assert!(registry.prepare_actor_turn(&worker).unwrap().is_none());
+    let actor = registry.get(&worker).unwrap();
+    let result = actor.result().unwrap();
+    assert!(result.contains("Last task state: running"));
+    assert!(result.contains("private task-state note was withheld"));
+    assert!(!result.contains(CHECKPOINT_CANARY));
+    assert!(!result.contains(TASK_NOTE_CANARY));
+    assert_eq!(actor.task_state_note(), TASK_NOTE_CANARY);
+
+    assert!(
+        registry.pop_inbox(&principal).is_none(),
+        "PollOnly must not gain a parent-delivery path"
+    );
+    let outward_events = registry
+        .events
+        .query(None, Some(&worker), None, 20)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "actor_terminated" | "actor_message"
+            )
+        })
+        .map(|event| serde_json::to_string(&event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!outward_events.contains(CHECKPOINT_CANARY));
+    assert!(!outward_events.contains(TASK_NOTE_CANARY));
 }
 
 #[test]
@@ -282,7 +399,9 @@ fn actor_state_survives_simulated_process_restart() {
         registry
             .record_actor_turn_response(
                 &worker_id,
-                "DONE: adapter drafted. NEXT: run the integration tests.",
+                ActorTurnResult::Checkpointed(
+                    "DONE: adapter drafted. NEXT: run the integration tests.".to_string(),
+                ),
             )
             .unwrap();
         registry
@@ -319,6 +438,16 @@ fn actor_state_survives_simulated_process_restart() {
     // …and the supervisor will autocontinue it (Waiting + Running + turns left).
     assert!(registry.should_autocontinue_actor(&worker_id));
 
+    let restored_self_message = restored
+        .messages()
+        .iter()
+        .find(|message| message.sender == worker_id && message.recipient == worker_id)
+        .expect("private actor response restored");
+    assert_eq!(
+        restored_self_message.turn_disposition(),
+        Some(ActorTurnDisposition::Checkpointed)
+    );
+
     // Its next-turn prompt carries the pre-crash checkpoint AND the notice.
     let prompt = registry.build_system_prompt(&worker_id).unwrap();
     assert!(prompt.contains("<your_previous_turn>"));
@@ -327,8 +456,12 @@ fn actor_state_survives_simulated_process_restart() {
 
     // The restored actor shows up as open work for the heartbeat.
     let open_work = registry.open_work_lines().join("\n");
-    assert!(open_work.contains("migrator"));
-    assert!(open_work.contains("adapter drafted"));
+    assert!(open_work.contains("state=waiting"));
+    assert!(open_work.contains("task=running"));
+    assert!(open_work.contains("turns 2/30"));
+    assert!(!open_work.contains("migrator"));
+    assert!(!open_work.contains("adapter drafted"));
+    assert!(!open_work.contains(&worker_id));
 
     // Restore is idempotent: running it again must not duplicate actors.
     assert_eq!(registry.restore_unfinished(&new_principal), 0);
