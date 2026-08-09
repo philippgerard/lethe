@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::anyhow;
 use genai::chat::{ChatMessage, ChatRole, ContentPart, MessageContent, ToolCall, ToolResponse};
@@ -16,7 +16,9 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::actor::{ActorError, ActorRunSpec, ActorRuntime, ActorTurnExecutor, ModelTier};
+use crate::actor::{
+    ActorError, ActorRunSpec, ActorRuntime, ActorTurnResult, ModelTier, TypedActorTurnExecutor,
+};
 use crate::config::Settings;
 use crate::llm::{LlmAttachment, LlmMessage, LlmRouter, LlmRouterConfig, build_chat_request};
 use crate::memory::MemoryStore;
@@ -26,7 +28,7 @@ use crate::tools::registry::{
 };
 use crate::tools::shell::ShellTools;
 
-use super::{AgentError, AgentResult};
+use super::{AgentError, AgentResult, RESUMABLE_CHECKPOINT_PREFIX};
 
 /// Max LLM/tool round-trips per turn. Python `main` runs up to 10 per batch
 /// with up to 5 auto-continuation batches (~50 total); we collapse that into
@@ -48,6 +50,80 @@ const MAX_EMPTY_RESPONSES: usize = 2;
 /// below their `MAX_*` breaker caps so escalation gets a chance to recover first.
 const AUTO_ESCALATE_ERROR_PRESSURE: usize = MAX_TOOL_ERROR_PRESSURE / 2;
 const AUTO_ESCALATE_NO_PROGRESS_TURNS: usize = 2;
+const EMPTY_CHECKPOINT_NOTICE: &str =
+    "Task processing limit reached. The work done so far has been saved.";
+
+/// Assistant text cannot be classified as user-visible until the complete
+/// response tells us whether it also contains tool calls. Stage streaming
+/// chunks here so tool-call narration never crosses a transport boundary.
+#[derive(Clone, Default)]
+struct BufferedAssistantDeltas(Arc<Mutex<Vec<String>>>);
+
+impl BufferedAssistantDeltas {
+    fn push(&self, chunk: &str) {
+        match self.0.lock() {
+            Ok(mut chunks) => chunks.push(chunk.to_string()),
+            Err(error) => {
+                tracing::warn!(%error, "assistant delta buffer lock poisoned; dropping chunk")
+            }
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        match self.0.lock() {
+            Ok(mut chunks) => std::mem::take(&mut *chunks),
+            Err(error) => {
+                tracing::warn!(%error, "assistant delta buffer lock poisoned; dropping chunks");
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn publish_classified_assistant_deltas(
+    observer: Option<&SharedTurnObserver>,
+    buffered: &BufferedAssistantDeltas,
+    visible_text: &str,
+    has_tool_calls: bool,
+) {
+    let chunks = buffered.take();
+    if has_tool_calls || visible_text.trim().is_empty() {
+        return;
+    }
+    let Some(observer) = observer else {
+        return;
+    };
+    if chunks.is_empty() {
+        // Some providers return aggregate text without invoking the streaming
+        // callback. Preserve the observer contract after classification.
+        observer.on_assistant_delta(visible_text);
+    } else {
+        for chunk in chunks {
+            observer.on_assistant_delta(&chunk);
+        }
+    }
+}
+
+fn publish_classified_reasoning_deltas(
+    observer: Option<&SharedTurnObserver>,
+    buffered: &BufferedAssistantDeltas,
+    visible_completion: bool,
+) {
+    let chunks = buffered.take();
+    if !visible_completion {
+        return;
+    }
+    let Some(observer) = observer else {
+        return;
+    };
+    for chunk in chunks {
+        observer.on_reasoning_delta(&chunk);
+    }
+}
+
+fn assistant_history_content<'a>(text: &'a str, tool_calls: &[ToolCall]) -> &'a str {
+    if tool_calls.is_empty() { text } else { "" }
+}
 
 /// Tools that don't count as "work" against [`total_tool_calls`] — memory
 /// reads/writes, telegram side effects, actor lifecycle. Matches Python's
@@ -148,6 +224,14 @@ fn context_overflow_error(model_id: &str, overflow: ContextOverflow) -> AgentErr
     ))
 }
 
+fn is_resumable_checkpoint_chat_message(message: &ChatMessage) -> bool {
+    message.role == ChatRole::Assistant
+        && message
+            .content
+            .first_text()
+            .is_some_and(|text| text.starts_with(RESUMABLE_CHECKPOINT_PREFIX))
+}
+
 fn clamp_chat_request_to_budget(
     request: &mut genai::chat::ChatRequest,
     current_user_index: &mut usize,
@@ -195,14 +279,19 @@ fn clamp_chat_request_to_budget(
         .iter()
         .position(|message| message.role != ChatRole::System)
         .unwrap_or(request.messages.len());
-    while total(&request.messages) > message_budget && history_start < *current_user_index {
-        request.messages.remove(history_start);
+    while total(&request.messages) > message_budget {
+        let Some(remove_index) = (history_start..*current_user_index)
+            .find(|index| !is_resumable_checkpoint_chat_message(&request.messages[*index]))
+        else {
+            break;
+        };
+        request.messages.remove(remove_index);
         *current_user_index = current_user_index.saturating_sub(1);
         dropped += 1;
-        while history_start < *current_user_index
-            && request.messages[history_start].role == ChatRole::Tool
+        while remove_index < *current_user_index
+            && request.messages[remove_index].role == ChatRole::Tool
         {
-            request.messages.remove(history_start);
+            request.messages.remove(remove_index);
             *current_user_index = current_user_index.saturating_sub(1);
             dropped += 1;
         }
@@ -608,7 +697,7 @@ pub(super) fn actor_turn_executor(
     hosted_plugins: Option<Arc<crate::tools::hosted_plugins::HostedPluginClient>>,
     tool_policy: crate::tools::registry::ToolPolicy,
     subagent_observer: crate::tools::registry::SubagentObserverSlot,
-) -> ActorTurnExecutor {
+) -> TypedActorTurnExecutor {
     let context = TurnExecutionContext {
         settings,
         memory,
@@ -692,16 +781,9 @@ pub(super) fn actor_turn_executor(
                 false,
             )
             .await
-            // A cut-short turn is marked in the recorded response so the
-            // actor sees it on its next turn (via <your_previous_turn>) and
-            // the parent sees it in any handoff — the checkpoint is explicit
-            // instead of looking like a finished answer.
             .map(|output| match output.stop_reason {
-                Some(reason) => format!(
-                    "{}\n\n[turn ended early: {reason} — the text above is a checkpoint, not a finished result]",
-                    output.text
-                ),
-                None => output.text,
+                Some(_) => ActorTurnResult::Checkpointed(output.text),
+                None => ActorTurnResult::Complete(output.text),
             })
             .map_err(|error| ActorError::Runtime(error.to_string()))
         })
@@ -770,7 +852,6 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     );
     let mut request = build_chat_request(messages);
     let mut current_user_index = request.messages.len().saturating_sub(1);
-    let mut last_text = String::new();
     let mut total_tool_calls: usize = 0;
     let mut total_tool_errors: usize = 0;
     let mut tool_error_pressure: usize = 0;
@@ -852,12 +933,15 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             );
             return Err(context_overflow_error(&model_id, overflow));
         }
+        let buffered_assistant_deltas = BufferedAssistantDeltas::default();
+        let buffered_reasoning_deltas = BufferedAssistantDeltas::default();
         let observer_for_stream = registry.turn_observer().cloned();
         let response = match observer_for_stream {
-            Some(observer) => {
-                let observer_reasoning = observer.clone();
-                let on_delta = move |chunk: &str| observer.on_assistant_delta(chunk);
-                let on_reasoning = move |chunk: &str| observer_reasoning.on_reasoning_delta(chunk);
+            Some(_) => {
+                let assistant_deltas = buffered_assistant_deltas.clone();
+                let reasoning_deltas = buffered_reasoning_deltas.clone();
+                let on_delta = move |chunk: &str| assistant_deltas.push(chunk);
+                let on_reasoning = move |chunk: &str| reasoning_deltas.push(chunk);
                 router
                     .exec_chat_request_stream_with_model(
                         request.clone(),
@@ -905,14 +989,32 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             "llm response received"
         );
 
+        let completed_text = if tool_calls.is_empty() && !text.trim().is_empty() {
+            Some(flag_truncated_output(
+                text.clone(),
+                response.usage.completion_tokens,
+                context.settings.llm.llm_max_output,
+            ))
+        } else {
+            None
+        };
+        publish_classified_reasoning_deltas(
+            registry.turn_observer(),
+            &buffered_reasoning_deltas,
+            completed_text.is_some(),
+        );
+        publish_classified_assistant_deltas(
+            registry.turn_observer(),
+            &buffered_assistant_deltas,
+            completed_text.as_deref().unwrap_or(&text),
+            !tool_calls.is_empty(),
+        );
+
+        if let Some(completed_text) = completed_text {
+            return Ok(TurnOutput::complete(completed_text));
+        }
+
         if tool_calls.is_empty() {
-            if !text.trim().is_empty() {
-                return Ok(TurnOutput::complete(flag_truncated_output(
-                    text,
-                    response.usage.completion_tokens,
-                    context.settings.llm.llm_max_output,
-                )));
-            }
             // Empty content + no tool calls — model stuck. Nudge once;
             // on second strike, fall through to the no-tools wrap-up.
             empty_count += 1;
@@ -974,13 +1076,10 @@ pub(super) async fn complete_turn_with_tools_config_shared(
             .count();
         total_tool_calls += billable;
 
-        if !text.trim().is_empty() {
-            last_text = text.clone();
-        }
         if record_tool_messages {
             context.memory.messages.add(
                 MessageRole::Assistant,
-                &text,
+                assistant_history_content(&text, &tool_calls),
                 Some(json!({ "tool_calls": tool_calls_metadata(&tool_calls) })),
             )?;
         }
@@ -1224,9 +1323,10 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         .read()
         .map_err(|error| AgentError::Llm(anyhow!("router lock poisoned: {error}")))?
         .clone();
-    // The wrap-up reply is the user-facing answer, so honor the same priority as
-    // the loop: a live escalation writes the final answer on the deep model; else
-    // the tool model when we entered a tool chain; else the base model.
+    // The wrap-up is an internal resumable checkpoint. Honor the same model
+    // priority as the loop, but do not stream it: transport observers cannot
+    // know that the turn was cut short until this call returns, so even one
+    // assistant delta here would bypass the typed delivery boundary.
     let (wrap_model, wrap_uses_deep_model) = select_turn_model(
         router.config(),
         use_aux,
@@ -1242,47 +1342,20 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         &mut power_mode_notified,
     )
     .await;
-    // Stream the wrap-up like any loop iteration: it IS the user-facing answer
-    // for this turn, and a non-streaming call here meant minutes of dead air
-    // followed by a reply the streaming UI had no deltas for.
-    let observer_for_stream = registry.turn_observer().cloned();
-    let response = match observer_for_stream {
-        Some(observer) => {
-            let observer_reasoning = observer.clone();
-            let on_delta = move |chunk: &str| observer.on_assistant_delta(chunk);
-            let on_reasoning = move |chunk: &str| observer_reasoning.on_reasoning_delta(chunk);
-            router
-                .exec_chat_request_stream_with_model(
-                    request,
-                    &wrap_model,
-                    &on_delta,
-                    Some(&on_reasoning),
-                )
-                .await?
-        }
-        None => {
-            router
-                .exec_chat_request_with_model(request, &wrap_model)
-                .await?
-        }
-    };
+    let response = router
+        .exec_chat_request_with_model(request, &wrap_model)
+        .await?;
     if let Some(prompt_tokens) = response.usage.prompt_tokens {
         context
             .last_prompt_tokens
             .store(prompt_tokens as u64, Ordering::Relaxed);
     }
     let final_text = response.first_text().unwrap_or_default().to_string();
-    let text = if !final_text.trim().is_empty() {
-        flag_truncated_output(
-            final_text,
-            response.usage.completion_tokens,
-            context.settings.llm.llm_max_output,
-        )
-    } else if !last_text.trim().is_empty() {
-        last_text
-    } else {
-        "Task processing limit reached. The work done so far has been saved.".to_string()
-    };
+    let text = finalize_checkpoint_text(
+        final_text,
+        response.usage.completion_tokens,
+        context.settings.llm.llm_max_output,
+    );
     Ok(TurnOutput {
         text,
         stop_reason: Some(stop_reason),
@@ -1343,6 +1416,18 @@ fn flag_truncated_output(text: String, completion_tokens: Option<i32>, max_outpu
             format!("{text}\n\n*[reply cut off at the output token limit]*")
         }
         _ => text,
+    }
+}
+
+fn finalize_checkpoint_text(
+    final_text: String,
+    completion_tokens: Option<i32>,
+    max_output: u32,
+) -> String {
+    if final_text.trim().is_empty() {
+        EMPTY_CHECKPOINT_NOTICE.to_string()
+    } else {
+        flag_truncated_output(final_text, completion_tokens, max_output)
     }
 }
 
@@ -1637,6 +1722,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingObserver {
         escalations: std::sync::Mutex<Vec<String>>,
+        assistant_deltas: std::sync::Mutex<Vec<String>>,
+        reasoning_deltas: std::sync::Mutex<Vec<String>>,
     }
 
     impl crate::tools::registry::TurnObserver for RecordingObserver {
@@ -1655,6 +1742,20 @@ mod tests {
             Box::pin(async move {
                 self.escalations.lock().unwrap().push(model_id.to_string());
             })
+        }
+
+        fn on_assistant_delta(&self, content: &str) {
+            self.assistant_deltas
+                .lock()
+                .unwrap()
+                .push(content.to_string());
+        }
+
+        fn on_reasoning_delta(&self, content: &str) {
+            self.reasoning_deltas
+                .lock()
+                .unwrap()
+                .push(content.to_string());
         }
     }
 
@@ -1711,6 +1812,104 @@ mod tests {
             recording.escalations.lock().unwrap().as_slice(),
             ["deep-model"]
         );
+    }
+
+    #[test]
+    fn natural_completion_publishes_buffered_deltas_after_classification() {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: SharedTurnObserver = recording.clone();
+        let buffered = BufferedAssistantDeltas::default();
+        buffered.push("final ");
+        buffered.push("answer");
+
+        publish_classified_assistant_deltas(Some(&observer), &buffered, "final answer", false);
+
+        assert_eq!(
+            recording.assistant_deltas.lock().unwrap().as_slice(),
+            ["final ", "answer"]
+        );
+    }
+
+    #[test]
+    fn tool_call_response_discards_buffered_text_and_hides_history_content() {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: SharedTurnObserver = recording.clone();
+        let buffered = BufferedAssistantDeltas::default();
+        let canary = "GOAL — private internal task details";
+        buffered.push(canary);
+        let calls = vec![ToolCall {
+            call_id: "call-1".to_string(),
+            fn_name: "read_file".to_string(),
+            fn_arguments: json!({"path": "/tmp/private"}),
+            thought_signatures: None,
+        }];
+
+        publish_classified_assistant_deltas(Some(&observer), &buffered, canary, true);
+
+        assert!(recording.assistant_deltas.lock().unwrap().is_empty());
+        assert_eq!(assistant_history_content(canary, &calls), "");
+    }
+
+    #[test]
+    fn tool_call_response_discards_buffered_reasoning() {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: SharedTurnObserver = recording.clone();
+        let buffered = BufferedAssistantDeltas::default();
+        buffered.push("SECRET_REASONING_CANARY");
+
+        publish_classified_reasoning_deltas(Some(&observer), &buffered, false);
+
+        assert!(recording.reasoning_deltas.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_embedded_tool_call_discards_streamed_narration_after_recovery() {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: SharedTurnObserver = recording.clone();
+        let buffered = BufferedAssistantDeltas::default();
+        let streamed = "GOAL — private narration\n[tool_call: read_file(path=\"/tmp/private\")]";
+        buffered.push(streamed);
+
+        let calls = recover_text_tool_calls(streamed);
+        let stripped = strip_text_tool_call_markers(streamed);
+        publish_classified_assistant_deltas(
+            Some(&observer),
+            &buffered,
+            &stripped,
+            !calls.is_empty(),
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert!(recording.assistant_deltas.lock().unwrap().is_empty());
+        assert_eq!(assistant_history_content(&stripped, &calls), "");
+    }
+
+    #[test]
+    fn aggregate_natural_completion_is_published_when_stream_has_no_chunks() {
+        let recording = Arc::new(RecordingObserver::default());
+        let observer: SharedTurnObserver = recording.clone();
+        let buffered = BufferedAssistantDeltas::default();
+
+        publish_classified_assistant_deltas(
+            Some(&observer),
+            &buffered,
+            "aggregate final answer",
+            false,
+        );
+
+        assert_eq!(
+            recording.assistant_deltas.lock().unwrap().as_slice(),
+            ["aggregate final answer"]
+        );
+    }
+
+    #[test]
+    fn empty_wrap_up_never_reuses_pre_wrap_assistant_text() {
+        let pre_wrap_canary = "GOAL — leaked pre-wrap checkpoint";
+        let checkpoint = finalize_checkpoint_text(String::new(), None, 100);
+
+        assert_eq!(checkpoint, EMPTY_CHECKPOINT_NOTICE);
+        assert!(!checkpoint.contains(pre_wrap_canary));
     }
 
     #[test]
@@ -1956,6 +2155,37 @@ mod tests {
         assert_eq!(request.messages[1].role, ChatRole::User);
         assert_eq!(request.messages[2].role, ChatRole::Assistant);
         assert_eq!(request.messages[3].role, ChatRole::Tool);
+    }
+
+    #[test]
+    fn tool_loop_budget_never_discards_a_resumable_checkpoint() {
+        let checkpoint = format!(
+            "{RESUMABLE_CHECKPOINT_PREFIX}SECRET_TOOL_CLAMP_CANARY</internal_resumable_checkpoint>"
+        );
+        let mut request = genai::chat::ChatRequest::new(vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old history that should be removed".repeat(20)),
+            ChatMessage::assistant(checkpoint.clone()),
+            ChatMessage::user("current request"),
+        ]);
+        let mut current_user_index = 3;
+
+        let clamp = clamp_chat_request_to_budget(&mut request, &mut current_user_index, 10);
+
+        assert!(clamp.overflow.is_some());
+        assert_eq!(current_user_index, 2);
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| { message.content.first_text() == Some(checkpoint.as_str()) })
+        );
+        assert!(request.messages.iter().all(|message| {
+            !message
+                .content
+                .first_text()
+                .is_some_and(|text| text.contains("old history"))
+        }));
     }
 
     #[test]

@@ -3,6 +3,42 @@ use serde_json::{Map, Value, json};
 pub const VISIBILITY_KEY: &str = "lethe_visibility";
 pub const MESSAGE_KIND_KEY: &str = "lethe_message_kind";
 pub const SOURCE_KEY: &str = "lethe_source";
+/// Ephemeral per-request override used when a transport's model prompt differs
+/// from the text that belongs in user-visible history. This key is stripped
+/// before persistence.
+pub const HISTORY_CONTENT_KEY: &str = "_lethe_history_content";
+
+/// Message kinds used only by Lethe's internal persistence and transport
+/// boundaries. Keep these out of the public [`MessageKind`] enum so adding a
+/// new internal provenance tag cannot break downstream exhaustive matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RawMessageKind {
+    Wake,
+    Checkpoint,
+    CheckpointResolved,
+    CheckpointNotice,
+}
+
+impl RawMessageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Wake => "wake",
+            Self::Checkpoint => "checkpoint",
+            Self::CheckpointResolved => "checkpoint_resolved",
+            Self::CheckpointNotice => "checkpoint_notice",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "wake" | "scheduler_wake" => Some(Self::Wake),
+            "checkpoint" | "tool_loop_checkpoint" => Some(Self::Checkpoint),
+            "checkpoint_resolved" => Some(Self::CheckpointResolved),
+            "checkpoint_notice" => Some(Self::CheckpointNotice),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageVisibility {
@@ -27,7 +63,7 @@ impl MessageVisibility {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MessageKind {
     Chat,
     Heartbeat,
@@ -129,6 +165,32 @@ pub fn metadata_value(
     Value::Object(map)
 }
 
+pub(crate) fn raw_metadata_value(
+    visibility: MessageVisibility,
+    kind: RawMessageKind,
+    source: &'static str,
+) -> Value {
+    let mut map = Map::new();
+    map.insert(VISIBILITY_KEY.to_string(), json!(visibility.as_str()));
+    map.insert(MESSAGE_KIND_KEY.to_string(), json!(kind.as_str()));
+    map.insert(SOURCE_KEY.to_string(), json!(source));
+    Value::Object(map)
+}
+
+pub(crate) fn raw_message_kind(value: Option<&Value>) -> Option<RawMessageKind> {
+    let Some(Value::Object(map)) = value else {
+        return None;
+    };
+    raw_message_kind_from_map(map)
+}
+
+fn raw_message_kind_from_map(map: &Map<String, Value>) -> Option<RawMessageKind> {
+    metadata_string(map, MESSAGE_KIND_KEY)
+        .and_then(|value| RawMessageKind::parse(&value))
+        .or_else(|| metadata_string(map, "source").and_then(|value| RawMessageKind::parse(&value)))
+        .or_else(|| metadata_string(map, "kind").and_then(|value| RawMessageKind::parse(&value)))
+}
+
 pub fn annotate_map(
     map: &mut Map<String, Value>,
     visibility: MessageVisibility,
@@ -160,8 +222,58 @@ pub fn annotate_value(
     }
 }
 
+/// Return the durable, user-facing representation of an inbound message.
+///
+/// Some transports send a richer private prompt to the model than should ever
+/// appear in chat history. Telegram self-message reactions are the canonical
+/// example: their prompt contains handling instructions and a copy of the
+/// reacted-to assistant message. Keep the sanitization at the persistence
+/// boundary so callers that forget to supply a separate history string still
+/// fail closed.
+pub fn user_visible_history_content(message: &str, metadata: Option<&Value>) -> String {
+    if let Some(Value::Object(map)) = metadata
+        && let Some(content) = map.get(HISTORY_CONTENT_KEY).and_then(Value::as_str)
+    {
+        return content.to_string();
+    }
+    let parsed = MessageMetadata::from_value(metadata);
+    if parsed.kind != Some(MessageKind::TelegramReaction) {
+        return message.to_string();
+    }
+
+    let Some(Value::Object(map)) = metadata else {
+        return "[Telegram reaction added]".to_string();
+    };
+    let emojis = map
+        .get("reaction_new")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "reaction".to_string());
+    let message_id = map
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("[Telegram reaction added: {emojis} on message {message_id}]")
+}
+
 fn legacy_visibility(map: &Map<String, Value>, kind: Option<MessageKind>) -> MessageVisibility {
-    if kind == Some(MessageKind::Heartbeat) {
+    if matches!(
+        kind,
+        Some(MessageKind::Heartbeat | MessageKind::ActorUpdate)
+    ) || matches!(
+        raw_message_kind_from_map(map),
+        Some(
+            RawMessageKind::Wake | RawMessageKind::Checkpoint | RawMessageKind::CheckpointResolved
+        )
+    ) {
         return MessageVisibility::Internal;
     }
 
@@ -244,5 +356,60 @@ mod tests {
 
         assert!(!metadata.is_internal());
         assert_eq!(metadata.kind, Some(MessageKind::Proactive));
+    }
+
+    #[test]
+    fn wake_and_checkpoint_metadata_are_typed_internal_rows() {
+        for (kind, source) in [
+            (RawMessageKind::Wake, "wake"),
+            (RawMessageKind::Checkpoint, "tool_loop"),
+        ] {
+            let value = raw_metadata_value(MessageVisibility::Internal, kind, source);
+            let metadata = MessageMetadata::from_value(Some(&value));
+
+            assert!(metadata.is_internal());
+            assert_eq!(raw_message_kind(Some(&value)), Some(kind));
+        }
+    }
+
+    #[test]
+    fn checkpoint_kind_fails_closed_without_an_explicit_visibility() {
+        let value = json!({"lethe_message_kind": "checkpoint"});
+        let metadata = MessageMetadata::from_value(Some(&value));
+
+        assert!(metadata.is_internal());
+        assert_eq!(
+            raw_message_kind(Some(&value)),
+            Some(RawMessageKind::Checkpoint)
+        );
+    }
+
+    #[test]
+    fn reaction_history_content_never_uses_the_private_model_prompt() {
+        let metadata = json!({
+            "lethe_message_kind": "telegram_reaction",
+            "reaction_new": ["👍"],
+            "message_id": 77,
+        });
+        let private_prompt = "SECRET transport instructions and copied assistant text";
+
+        let visible = user_visible_history_content(private_prompt, Some(&metadata));
+
+        assert_eq!(visible, "[Telegram reaction added: 👍 on message 77]");
+        assert!(!visible.contains("SECRET"));
+        assert_eq!(user_visible_history_content("hello", None), "hello");
+    }
+
+    #[test]
+    fn explicit_combined_history_content_overrides_last_wins_chat_metadata() {
+        let metadata = json!({
+            "lethe_message_kind": "chat",
+            (HISTORY_CONTENT_KEY): "visible text\n\n[Telegram reaction added]",
+        });
+
+        assert_eq!(
+            user_visible_history_content("private combined model prompt", Some(&metadata)),
+            "visible text\n\n[Telegram reaction added]"
+        );
     }
 }

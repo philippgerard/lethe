@@ -24,6 +24,8 @@ pub use runtime::{
 
 use helpers::short_id;
 
+const ACTOR_TURN_DISPOSITION_KEY: &str = "_lethe_actor_turn_disposition";
+
 #[cfg(test)]
 mod tests;
 
@@ -37,9 +39,91 @@ pub enum ModelTier {
     Deep,
 }
 
+/// Backward-compatible completed-text actor turn API.
 pub type ActorTurnFuture = Pin<Box<dyn Future<Output = ActorResult<String>> + Send + 'static>>;
 pub type ActorTurnExecutor =
     Arc<dyn Fn(ActorRunSpec, ActorRuntime) -> ActorTurnFuture + Send + Sync + 'static>;
+
+/// Typed production actor turn API. Checkpoint-aware callers install this via
+/// [`ActorRuntime::install_typed_turn_executor`].
+pub type TypedActorTurnFuture =
+    Pin<Box<dyn Future<Output = ActorResult<ActorTurnResult>> + Send + 'static>>;
+pub type TypedActorTurnExecutor =
+    Arc<dyn Fn(ActorRunSpec, ActorRuntime) -> TypedActorTurnFuture + Send + Sync + 'static>;
+
+/// Typed result of one resident actor turn.
+///
+/// Checkpoint text is resumable actor-private state, not a completed result.
+/// Keeping that distinction typed prevents a max-turn handoff or lifecycle
+/// event from accidentally relaying the raw checkpoint to the parent cortex.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActorTurnResult {
+    Complete(String),
+    Checkpointed(String),
+}
+
+impl ActorTurnResult {
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Complete(text) | Self::Checkpointed(text) => text,
+        }
+    }
+
+    pub fn into_text(self) -> String {
+        match self {
+            Self::Complete(text) | Self::Checkpointed(text) => text,
+        }
+    }
+
+    pub fn is_checkpointed(&self) -> bool {
+        matches!(self, Self::Checkpointed(_))
+    }
+}
+
+impl From<String> for ActorTurnResult {
+    fn from(text: String) -> Self {
+        Self::Complete(text)
+    }
+}
+
+impl From<&str> for ActorTurnResult {
+    fn from(text: &str) -> Self {
+        Self::Complete(text.to_string())
+    }
+}
+
+/// Provenance retained on an actor's private self-message and in the actor
+/// store so a checkpoint remains typed after a process restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorTurnDisposition {
+    Complete,
+    Checkpointed,
+}
+
+impl ActorTurnDisposition {
+    fn from_result(result: &ActorTurnResult) -> Self {
+        if result.is_checkpointed() {
+            Self::Checkpointed
+        } else {
+            Self::Complete
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Checkpointed => "checkpointed",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "checkpointed" => Self::Checkpointed,
+            _ => Self::Complete,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +315,20 @@ impl ActorMessage {
             reply,
             self.content
         )
+    }
+
+    fn set_turn_disposition(&mut self, disposition: ActorTurnDisposition) {
+        self.metadata.insert(
+            ACTOR_TURN_DISPOSITION_KEY.to_string(),
+            Value::String(disposition.as_str().to_string()),
+        );
+    }
+
+    fn turn_disposition(&self) -> Option<ActorTurnDisposition> {
+        self.metadata
+            .get(ACTOR_TURN_DISPOSITION_KEY)
+            .and_then(Value::as_str)
+            .map(ActorTurnDisposition::from_str)
     }
 }
 

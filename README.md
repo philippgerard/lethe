@@ -508,13 +508,14 @@ other HTTP route and the browser WebSocket require
 Combined event vocabulary for `/chat` and `/events` follows. Not every event is
 emitted on both streams: `/chat` owns the live turn, while `/events` carries the
 durable/background mirror used by reloaded or secondary clients.
+Raw provider reasoning is deliberately not exposed by the built-in HTTP API;
+clients should use the turn and typing events for progress indication.
 
 | Event | Payload | Meaning |
 |-------|---------|---------|
 | `turn.start` | `{chat_id}` | A new agent turn has begun. |
 | `turn.active` | `{active}` | Durable activity state for reloaded or secondary clients. |
 | `assistant.delta` | `{content}` | Streamed assistant token chunk (Anthropic + OpenAI OAuth). |
-| `assistant.reasoning` | `{content}` | Streamed reasoning chunk when the selected provider exposes one. |
 | `text` | `{content, parse_mode, message_id}` | Complete (sub-)message; submessage boundaries follow the `---` rule from `interfaces/telegram/formatting.rs`. |
 | `message` | `{role, content}` | Durable mirror of a completed assistant reply. |
 | `tool.start` | `{call_id, name, args_preview}` | Tool execution started. |

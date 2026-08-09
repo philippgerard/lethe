@@ -1693,6 +1693,7 @@ pub struct TelegramTurnGuard {
     pending_reactions: Vec<PendingReaction>,
     forced_channel: Option<VisibleTelegramChannel>,
     visible_messages_sent: usize,
+    visible_texts: Vec<String>,
 }
 
 impl TelegramTurnGuard {
@@ -1701,6 +1702,7 @@ impl TelegramTurnGuard {
             pending_reactions: Vec::new(),
             forced_channel: None,
             visible_messages_sent: 0,
+            visible_texts: Vec::new(),
         }
     }
 
@@ -1709,6 +1711,7 @@ impl TelegramTurnGuard {
             pending_reactions: Vec::new(),
             forced_channel: Some(channel),
             visible_messages_sent: 0,
+            visible_texts: Vec::new(),
         }
     }
 
@@ -1721,8 +1724,23 @@ impl TelegramTurnGuard {
         self.visible_messages_sent += 1;
     }
 
+    /// Record confirmed visible text as well as the delivery count. `/wake`
+    /// uses this to persist only what actually reached Telegram after its
+    /// scheduler prompt was intentionally excluded from conversation history.
+    pub fn record_visible_text(&mut self, text: &str) {
+        self.record_visible_message();
+        let text = text.trim();
+        if !text.is_empty() {
+            self.visible_texts.push(text.to_string());
+        }
+    }
+
     pub fn visible_messages_sent(&self) -> usize {
         self.visible_messages_sent
+    }
+
+    pub fn drain_visible_texts(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.visible_texts)
     }
 
     pub fn queue_pending_reaction(&mut self, chat_id: i64, message_id: i64, emoji: &str) {
@@ -1909,11 +1927,15 @@ impl TelegramToolContext {
     // final-response path can skip the redundant wrap-up text (see
     // TelegramTurnGuard::record_visible_message). dry_run counts too — it
     // models a successful send.
-    fn record_visible_message(&self) {
+    fn record_visible_message(&self, text: Option<&str>) {
         if let Some(guard) = &self.guard
             && let Ok(mut guard) = guard.lock()
         {
-            guard.record_visible_message();
+            if let Some(text) = text {
+                guard.record_visible_text(text);
+            } else {
+                guard.record_visible_message();
+            }
         }
     }
 }
@@ -1952,7 +1974,7 @@ impl TelegramToolContext {
         };
         let parse_mode = telegram_parse_mode(parse_mode);
         if self.dry_run {
-            self.record_visible_message();
+            self.record_visible_message(Some(text));
             let mut payload = json!({
                 "success": true,
                 "message_id": 0,
@@ -1973,7 +1995,7 @@ impl TelegramToolContext {
         ) {
             Ok(message_id) => {
                 self.remember_sent_message(message_id, text);
-                self.record_visible_message();
+                self.record_visible_message(Some(text));
                 if let (Some(reply_markup), Some(user_id)) = (&reply_markup, self.user_id) {
                     register_pending_reply_keyboard(
                         self.chat_id,
@@ -1999,7 +2021,7 @@ impl TelegramToolContext {
             Err(error) => return error_payload(&error),
         };
         if self.dry_run {
-            self.record_visible_message();
+            self.record_visible_message((!caption.trim().is_empty()).then_some(caption));
             return serde_json::to_string_pretty(&json!({
                 "success": true,
                 "type": plan.send_type.as_str(),
@@ -2019,7 +2041,7 @@ impl TelegramToolContext {
         match result {
             Ok(message_id) => {
                 self.remember_sent_message(message_id, caption);
-                self.record_visible_message();
+                self.record_visible_message((!caption.trim().is_empty()).then_some(caption));
                 serde_json::to_string_pretty(&json!({
                     "success": true,
                     "type": plan.send_type.as_str(),

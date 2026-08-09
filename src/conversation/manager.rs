@@ -14,6 +14,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::AbortHandle;
 
 use crate::llm::LlmAttachment;
+use crate::memory::message_metadata::{
+    HISTORY_CONTENT_KEY, MessageKind, MessageMetadata, user_visible_history_content,
+};
 
 pub const DEFAULT_DEBOUNCE_SECONDS: f64 = 5.0;
 
@@ -159,13 +162,39 @@ impl ConversationState {
         }
 
         let mut contents = Vec::with_capacity(self.pending_messages.len());
+        let mut history_contents = Vec::with_capacity(self.pending_messages.len());
         let mut metadata = serde_json::Map::new();
         let mut attachments = Vec::new();
+        let mut message_kinds = std::collections::HashSet::new();
         while let Some(message) = self.pending_messages.pop_front() {
+            // Untyped and unknown messages are ordinary chat. Counting only
+            // explicitly typed kinds lets an untyped text batched with a
+            // reaction inherit the reaction's last-wins metadata, which can
+            // silence the real request and suppress its checkpoint.
+            message_kinds.insert(
+                MessageMetadata::from_map(&message.metadata)
+                    .kind
+                    .unwrap_or(MessageKind::Chat),
+            );
+            history_contents.push(user_visible_history_content(
+                &message.content,
+                Some(&Value::Object(message.metadata.clone())),
+            ));
             contents.push(message.content);
             metadata.extend(message.metadata);
             attachments.extend(message.attachments);
         }
+        if message_kinds.len() > 1 {
+            metadata.insert(
+                "lethe_visibility".to_string(),
+                serde_json::json!("user_visible"),
+            );
+            metadata.insert("lethe_message_kind".to_string(), serde_json::json!("chat"));
+        }
+        metadata.insert(
+            HISTORY_CONTENT_KEY.to_string(),
+            Value::String(history_contents.join("\n\n")),
+        );
 
         (contents.join("\n\n"), metadata, attachments)
     }
@@ -462,6 +491,7 @@ mod tests {
 
         let (combined, metadata, attachments) = state.get_combined_message();
         assert_eq!(combined, "first\n\nsecond");
+        assert_eq!(metadata[HISTORY_CONTENT_KEY], combined);
         assert_eq!(metadata.get("a"), Some(&json!(2)));
         assert_eq!(metadata.get("b"), Some(&json!(3)));
         assert!(attachments.is_empty());
@@ -490,12 +520,63 @@ mod tests {
             }],
         );
 
-        let (combined, _metadata, attachments) = state.get_combined_message();
+        let (combined, metadata, attachments) = state.get_combined_message();
 
         assert_eq!(combined, "first\n\nsecond");
+        assert_eq!(metadata[HISTORY_CONTENT_KEY], combined);
         assert_eq!(attachments.len(), 2);
         assert_eq!(attachments[0].name.as_deref(), Some("one.png"));
         assert_eq!(attachments[1].name.as_deref(), Some("two.jpg"));
+    }
+
+    #[test]
+    fn mixed_reaction_batches_preserve_each_history_message_in_both_orders() {
+        fn metadata(kind: &str) -> serde_json::Map<String, Value> {
+            serde_json::Map::from_iter([
+                ("lethe_visibility".to_string(), json!("user_visible")),
+                ("lethe_message_kind".to_string(), json!(kind)),
+            ])
+        }
+
+        for reaction_first in [false, true] {
+            for typed_chat in [false, true] {
+                let mut state = ConversationState::new(1, 2);
+                let real = (
+                    "please answer this",
+                    if typed_chat {
+                        metadata("chat")
+                    } else {
+                        serde_json::Map::new()
+                    },
+                );
+                let mut reaction_metadata = metadata("telegram_reaction");
+                reaction_metadata.insert("reaction_new".to_string(), json!(["👍"]));
+                reaction_metadata.insert("message_id".to_string(), json!(77));
+                let reaction = (
+                    "[Telegram] private reaction instructions",
+                    reaction_metadata,
+                );
+                let ordered = if reaction_first {
+                    [reaction, real]
+                } else {
+                    [real, reaction]
+                };
+                for (content, metadata) in ordered {
+                    state.add_message_with_attachments(content, Some(metadata), Vec::new());
+                }
+
+                let (model, metadata, _) = state.get_combined_message();
+                let history = metadata[HISTORY_CONTENT_KEY]
+                    .as_str()
+                    .expect("combined history content");
+                assert!(model.contains("please answer this"));
+                assert!(model.contains("private reaction instructions"));
+                assert!(history.contains("please answer this"));
+                assert!(history.contains("[Telegram reaction added: 👍 on message 77]"));
+                assert!(!history.contains("private reaction instructions"));
+                assert_eq!(metadata["lethe_message_kind"], "chat");
+            }
+        }
     }
 
     #[test]

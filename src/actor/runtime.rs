@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
@@ -15,7 +16,7 @@ const ACTOR_CONTINUATION_DELAY: StdDuration = StdDuration::from_secs(2);
 pub struct ActorSupervisor {
     pub(crate) registry: ActorRegistry,
     workers: HashMap<String, ActorRef<ResidentActor>>,
-    executor: Option<ActorTurnExecutor>,
+    executor: Option<TypedActorTurnExecutor>,
 }
 
 impl ActorSupervisor {
@@ -90,7 +91,18 @@ impl ActorRuntime {
         runtime
     }
 
+    /// Backward-compatible installer for executors that only return completed text.
+    /// The production agent uses [`Self::install_typed_turn_executor`] so a
+    /// checkpoint cannot be flattened into a completed result.
     pub fn install_turn_executor(&self, executor: ActorTurnExecutor) -> ActorResult<()> {
+        let executor: TypedActorTurnExecutor = Arc::new(move |spec, runtime| {
+            let future = executor(spec, runtime);
+            Box::pin(async move { future.await.map(ActorTurnResult::Complete) })
+        });
+        self.install_typed_turn_executor(executor)
+    }
+
+    pub fn install_typed_turn_executor(&self, executor: TypedActorTurnExecutor) -> ActorResult<()> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return self
                 .supervisor
@@ -362,7 +374,7 @@ impl Message<SyncResidentActors> for ActorSupervisor {
 }
 
 struct InstallTurnExecutor {
-    executor: ActorTurnExecutor,
+    executor: TypedActorTurnExecutor,
 }
 
 impl Message<InstallTurnExecutor> for ActorSupervisor {
@@ -384,7 +396,7 @@ impl Message<InstallTurnExecutor> for ActorSupervisor {
 struct GetTurnExecutor;
 
 impl Message<GetTurnExecutor> for ActorSupervisor {
-    type Reply = Option<ActorTurnExecutor>;
+    type Reply = Option<TypedActorTurnExecutor>;
 
     async fn handle(
         &mut self,
@@ -414,7 +426,7 @@ impl Message<PrepareActorTurn> for ActorSupervisor {
 
 struct CompleteActorTurn {
     actor_id: String,
-    outcome: ActorResult<String>,
+    outcome: ActorResult<ActorTurnResult>,
 }
 
 impl Message<CompleteActorTurn> for ActorSupervisor {
@@ -427,7 +439,7 @@ impl Message<CompleteActorTurn> for ActorSupervisor {
     ) -> Self::Reply {
         let response = match message.outcome {
             Ok(response) => response,
-            Err(error) => format!("Runner error: {error}"),
+            Err(error) => ActorTurnResult::Complete(format!("Runner error: {error}")),
         };
         self.registry
             .record_actor_turn_response(&message.actor_id, response)?;

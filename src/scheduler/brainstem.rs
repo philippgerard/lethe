@@ -289,8 +289,8 @@ async fn beat_with_delivery(
         return Ok(outcome);
     }
 
-    let response = agent
-        .chat_once(
+    let result = agent
+        .chat_once_result(
             TurnRequest::new(&prompt.message)
                 .with_metadata(message_metadata_value(
                     MessageVisibility::Internal,
@@ -301,6 +301,7 @@ async fn beat_with_delivery(
                 .with_options(options.clone()),
         )
         .await?;
+    let response = result.into_complete_text().unwrap_or_default();
     let heartbeat_outcome = heartbeat.finish_response(&response, None);
     state.heartbeat = heartbeat.state();
     // Queue the DMN reflection + curator pass, then drain gated subagent/DMN
