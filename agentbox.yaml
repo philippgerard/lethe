@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://agent-box.sh/schema/agentbox.schema.json
+
+# Prepare a complete Lethe development environment. The API service is kept
+# manual because it requires provider credentials and a LETHE_API_TOKEN under
+# ~/.lethe; run `lethe init` before starting it.
+tasks:
+  toolchain:
+    cwd: /workspace
+    command: |
+      set -euo pipefail
+
+      sudo apt-get update
+      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        libprotobuf-dev \
+        libssl-dev \
+        mold \
+        pkg-config \
+        protobuf-compiler
+
+      if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+          sh -s -- -y --profile minimal --default-toolchain 1.96.0
+      fi
+
+      . "$HOME/.cargo/env"
+      rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+      rustup default 1.96.0
+      rustc --version
+      mold --version
+    run_once: true
+
+  dependencies:
+    cwd: /workspace
+    command: |
+      set -euo pipefail
+      . "$HOME/.cargo/env"
+      cargo fetch --locked
+    needs: [toolchain]
+
+services:
+  lethe-api:
+    cwd: /workspace
+    command: |
+      set -euo pipefail
+      . "$HOME/.cargo/env"
+      exec cargo run --locked --bin lethe -- api
+    needs: [dependencies]
+    autostart: false
+    restart: never
+    env:
+      LETHE_HOME: /home/vscode/.lethe
+      LETHE_API_HOST: 0.0.0.0
+      LETHE_API_PORT: "1373"
+    ready_when:
+      http: http://127.0.0.1:1373/health
+      expect_status: 200
+      timeout_ms: 600000
+    expose:
+      port: 1373
