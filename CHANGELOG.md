@@ -2,6 +2,13 @@
 
 ## 0.28.0 - Agent-id installs itself, browser CLI health probe
 
+- **Scheduled wake delivery now closes cleanly after a confirmed Telegram result.**
+  The model-facing Telegram contract now matches `/wake`: a normal final response
+  is delivered automatically when no Telegram tool message was sent, while a
+  tool-owned delivery requires the final result through Telegram plus a
+  suppressed non-empty acknowledgment. Empty-response recovery consults the
+  confirmed-delivery guard without weakening the second-empty checkpoint.
+
 - **A broken browser CLI no longer swallows the browser** (#53). The
   `alien_browser_*` tools were gated on the CLI merely existing on PATH,
   so an install whose dependency tree didn't match its imports (e.g. a

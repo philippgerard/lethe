@@ -20,6 +20,7 @@ use crate::actor::{
     ActorError, ActorRunSpec, ActorRuntime, ActorTurnResult, ModelTier, TypedActorTurnExecutor,
 };
 use crate::config::Settings;
+use crate::interfaces::telegram::SharedTelegramTurnGuard;
 use crate::llm::{LlmAttachment, LlmMessage, LlmRouter, LlmRouterConfig, build_chat_request};
 use crate::memory::MemoryStore;
 use crate::memory::MessageRole;
@@ -43,6 +44,28 @@ const MAX_TOOL_ERROR_PRESSURE: usize = 16;
 const MAX_REPEATED_TOOL_CALLS: usize = 4;
 const MAX_NO_PROGRESS_TURNS: usize = 4;
 const MAX_EMPTY_RESPONSES: usize = 2;
+const TOOL_MODEL_EMPTY_RESPONSE_NUDGE: &str =
+    "[The tool model returned an empty response. Continue the task from the tool results above.]";
+const EMPTY_RESPONSE_NUDGE: &str = "[You returned an empty response. Return a complete, non-empty final response using what you know so far.]";
+const TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE: &str = "[A Telegram delivery tool already sent user-visible content, so normal final text will be suppressed to prevent a duplicate. If that content was only progress, use Telegram now to send the final result. If the final result was already delivered, return a short non-empty internal acknowledgment such as \"Delivered.\" Do not repeat the delivered result.]";
+
+fn telegram_delivery_confirmed(guard: Option<&SharedTelegramTurnGuard>) -> bool {
+    guard
+        .and_then(|guard| guard.lock().ok())
+        .is_some_and(|guard| guard.visible_messages_sent() > 0)
+}
+
+fn empty_response_nudge(
+    telegram_delivery_confirmed: bool,
+    tool_model_fallback: bool,
+) -> &'static str {
+    match (telegram_delivery_confirmed, tool_model_fallback) {
+        (true, _) => TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE,
+        (false, true) => TOOL_MODEL_EMPTY_RESPONSE_NUDGE,
+        (false, false) => EMPTY_RESPONSE_NUDGE,
+    }
+}
+
 /// Auto-escalation thresholds: when a deep-thinking model is configured and the
 /// turn is visibly struggling — half the error-pressure budget spent, or two
 /// consecutive no-progress rounds — we escalate to the powerful model for the
@@ -827,6 +850,13 @@ pub(super) async fn complete_turn_with_tools_config_shared(
     // Read before `runtime` is moved into the registry below: a `deep`-tier
     // subagent starts already escalated onto the powerful model.
     let start_escalated = runtime.start_escalated;
+    // The shared guard remains live after `runtime` moves into the registry;
+    // empty-response recovery uses it to distinguish Telegram delivery from an
+    // ordinary empty model response without treating delivery as turn success.
+    let telegram_guard = runtime
+        .telegram
+        .as_ref()
+        .and_then(|telegram| telegram.guard.clone());
     if runtime.hosted_plugins.is_none() {
         runtime.hosted_plugins = context.hosted_plugins.clone();
     }
@@ -1028,10 +1058,11 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                     tool_model = %router.config().tool_model(),
                     "tool model returned empty; falling back to the base model for this chain"
                 );
-                request.messages.push(ChatMessage::user(
-                    "[The tool model returned an empty response. Continue the task from the tool results above.]"
-                        .to_string(),
-                ));
+                let nudge = empty_response_nudge(
+                    telegram_delivery_confirmed(telegram_guard.as_ref()),
+                    true,
+                );
+                request.messages.push(ChatMessage::user(nudge.to_string()));
                 continue;
             }
             if empty_count >= MAX_EMPTY_RESPONSES {
@@ -1045,10 +1076,9 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 break;
             }
             tracing::warn!(empty_count, "empty response, nudging model");
-            request.messages.push(ChatMessage::user(
-                "[You returned an empty response. Respond to the user with what you know so far.]"
-                    .to_string(),
-            ));
+            let nudge =
+                empty_response_nudge(telegram_delivery_confirmed(telegram_guard.as_ref()), false);
+            request.messages.push(ChatMessage::user(nudge.to_string()));
             continue;
         }
 
@@ -1910,6 +1940,42 @@ mod tests {
 
         assert_eq!(checkpoint, EMPTY_CHECKPOINT_NOTICE);
         assert!(!checkpoint.contains(pre_wrap_canary));
+    }
+
+    #[test]
+    fn empty_response_recovery_distinguishes_telegram_delivery_from_other_turns() {
+        assert_eq!(empty_response_nudge(false, false), EMPTY_RESPONSE_NUDGE);
+        assert_eq!(
+            empty_response_nudge(false, true),
+            TOOL_MODEL_EMPTY_RESPONSE_NUDGE
+        );
+        assert_eq!(
+            empty_response_nudge(true, false),
+            TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE
+        );
+        assert_eq!(
+            empty_response_nudge(true, true),
+            TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE
+        );
+        assert!(!EMPTY_RESPONSE_NUDGE.contains("Telegram"));
+        assert!(TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE.contains("only progress"));
+        assert!(
+            TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE.contains("use Telegram now to send the final")
+        );
+        assert!(TELEGRAM_DELIVERY_EMPTY_RESPONSE_NUDGE.contains("short non-empty"));
+    }
+
+    #[test]
+    fn confirmed_telegram_delivery_uses_turn_guard_state() {
+        let empty_guard = Arc::new(Mutex::new(
+            crate::interfaces::telegram::TelegramTurnGuard::new(),
+        ));
+        assert!(!telegram_delivery_confirmed(Some(&empty_guard)));
+
+        let mut delivered = crate::interfaces::telegram::TelegramTurnGuard::new();
+        delivered.record_visible_message();
+        let delivered_guard = Arc::new(Mutex::new(delivered));
+        assert!(telegram_delivery_confirmed(Some(&delivered_guard)));
     }
 
     #[test]

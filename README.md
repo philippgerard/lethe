@@ -491,7 +491,7 @@ other HTTP route and the browser WebSocket require
 |-------|--------|---------|
 | `/health` | `GET` | Process readiness check; does not probe LLMs or external tools. |
 | `/chat` | `POST` | Send a user message and receive SSE response events. |
-| `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress (`message`, optional `chat_id`). |
+| `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent (`message`, optional `chat_id`). |
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |
 | `/browser/stream` | `GET`/WebSocket | Relay the live vault-sealed browser viewport and input stream. |
 | `/cancel` | `POST` | Cancel active work for a chat. |
@@ -504,6 +504,11 @@ other HTTP route and the browser WebSocket require
 | `/secure-input` | `POST` | Deliver a browser-sealed credential envelope to a pending agent-id prompt (hosted mode). |
 | `/secure-input/cancel` | `POST` | Dismiss a pending secure-input request. |
 | `/secure-input/pending` | `GET` | Live secure-input requests (with sealing envelope) for tab re-hydration. |
+
+`/wake` reports turn completion and Telegram delivery separately. A confirmed
+Telegram tool side effect can coexist with `success: false` when the turn later
+checkpoints; callers must inspect `delivered` and `delivery_status` and must not
+blindly retry an HTTP 200 response.
 
 Combined event vocabulary for `/chat` and `/events` follows. Not every event is
 emitted on both streams: `/chat` owns the live turn, while `/events` carries the

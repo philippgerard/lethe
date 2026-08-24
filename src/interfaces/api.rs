@@ -1331,8 +1331,7 @@ fn presented_api_token(headers: &HeaderMap) -> String {
 
 #[derive(Debug, Deserialize)]
 struct WakeRequest {
-    /// Prompt that drives the turn (e.g. "produce Philipp's morning brief and
-    /// telegram_send_message it").
+    /// Prompt that drives the turn (e.g. "produce Philipp's morning brief").
     message: String,
     /// Telegram chat to deliver to. Defaults to the single configured allowed
     /// user (in a private chat the chat id equals the user id).

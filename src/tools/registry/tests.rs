@@ -665,6 +665,19 @@ async fn exposes_and_executes_actor_tools_when_context_is_present() {
 }
 
 #[test]
+fn telegram_send_message_description_matches_wake_delivery_contract() {
+    let description = find_def("telegram_send_message").unwrap().description;
+
+    assert!(description.contains("normal final reply is suppressed"));
+    assert!(description.contains("if you send progress through Telegram"));
+    assert!(description.contains("send the final result through Telegram"));
+    assert!(description.contains("POST /wake"));
+    assert!(description.contains("normal final reply text is delivered automatically"));
+    assert!(description.contains("short non-empty acknowledgment"));
+    assert!(description.contains("confirmed-delivery guard suppresses"));
+}
+
+#[test]
 fn exposes_and_executes_telegram_tools_when_context_is_present() {
     use std::sync::{Arc, Mutex};
 
