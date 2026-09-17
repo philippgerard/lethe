@@ -1,5 +1,5 @@
 {
-  "_updated": "2026-05-29",
+  "_updated": "2026-09-17",
   "_note": "Curated model catalog for /model and /aux commands. Only recent models (≤5mo), tool-capable, ≥100k ctx. First entry per list is the wizard default.",
   "openrouter": {
     "main": [
@@ -39,6 +39,8 @@
   "openai": {
     "main": [
       ["GPT-5.5", "gpt-5.5", "$5/$30"],
+      ["GPT-6 Astra", "gpt-6-astra", "$10/$50"],
+      ["GPT-6 Astra (high reasoning)", "gpt-6-astra-high", "$10/$50"],
       ["GPT-5.5 Pro", "gpt-5.5-pro", "$30/$180"],
       ["GPT-5.4", "gpt-5.4", "$2.50/$15"],
       ["GPT-5.4 Pro", "gpt-5.4-pro", "$5/$30"],
