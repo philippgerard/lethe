@@ -1426,6 +1426,10 @@ fn should_use_openai_oauth(model: &str, config: &LlmRouterConfig) -> bool {
     if slash_provider(model) == Some("opencode-go") {
         return false;
     }
+    // Explicit tier providers take precedence over the primary model's provider.
+    if slash_provider(model) == Some("openai") {
+        return true;
+    }
     if normalized_provider(&config.provider).as_deref() == Some("openrouter") {
         return false;
     }
@@ -1438,8 +1442,7 @@ fn should_use_openai_oauth(model: &str, config: &LlmRouterConfig) -> bool {
     // still work — having an OAuth token doesn't override an explicit
     // OPENAI_API_KEY for openrouter or custom api_base targets, since
     // those branches return false above.
-    slash_provider(model) == Some("openai")
-        || normalized_provider(&config.provider).as_deref() == Some("openai")
+    normalized_provider(&config.provider).as_deref() == Some("openai")
 }
 
 pub fn llm_auth_mode_for_settings(settings: &Settings) -> String {
@@ -3122,6 +3125,34 @@ mod tests {
             assert_eq!(target.endpoint, OPENAI_ENDPOINT);
             assert_eq!(target.adapter, AdapterKind::OpenAIResp);
             assert_eq!(target.model_name, "gpt-6-astra-high");
+        }
+    }
+
+    #[test]
+    fn openai_deep_model_overrides_relay_provider_for_oauth() {
+        for provider in ["openrouter", "opencode-go"] {
+            let mut config = config_for("relay-model", provider);
+            assert!(!should_use_openai_oauth(&config.model, &config));
+
+            for model in ["openai/gpt-6-astra-high", "OpenAI/gpt-6-astra-high"] {
+                assert!(should_use_openai_oauth(model, &config));
+                assert!(!should_use_anthropic_oauth(model, &config));
+                let target = router_target_for_model(model, &config).unwrap();
+                assert_eq!(target.auth_env, "OPENAI_API_KEY");
+                assert_eq!(target.endpoint, OPENAI_ENDPOINT);
+                assert_eq!(target.adapter, AdapterKind::OpenAIResp);
+            }
+
+            config.provider = "openai".to_string();
+            let relayed_model = format!("{provider}/openai/gpt-6-astra-high");
+            assert!(!should_use_openai_oauth(&relayed_model, &config));
+
+            config.api_base = "http://localhost:8080/v1/".to_string();
+            let model = "openai/gpt-6-astra-high";
+            assert!(!should_use_openai_oauth(model, &config));
+            let target = router_target_for_model(model, &config).unwrap();
+            assert_eq!(target.auth_env, "OPENAI_API_KEY");
+            assert_eq!(target.endpoint, config.api_base);
         }
     }
 
