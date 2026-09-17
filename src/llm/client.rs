@@ -311,7 +311,7 @@ fn rejects_sampling_params(model: &str) -> bool {
     if name.contains('/') {
         return false;
     }
-    is_gpt5_reasoning(name) || is_o_series(name)
+    is_gpt5_reasoning(name) || name.starts_with("gpt-6-astra") || is_o_series(name)
 }
 
 #[derive(Clone)]
@@ -1256,7 +1256,7 @@ fn slash_provider(model: &str) -> Option<&str> {
     }
 }
 
-fn strip_slash_provider<'a>(model: &'a str, provider: &str) -> &'a str {
+pub(super) fn strip_slash_provider<'a>(model: &'a str, provider: &str) -> &'a str {
     let Some((prefix, rest)) = model.split_once('/') else {
         return model;
     };
@@ -1270,18 +1270,20 @@ fn strip_slash_provider<'a>(model: &'a str, provider: &str) -> &'a str {
 /// Adapter for `provider`, refined by the model where the protocol depends on
 /// it.
 ///
-/// OpenAI's gpt-5 reasoning family cannot combine function tools with reasoning
-/// on `/v1/chat/completions` — the API rejects the request outright and points
+/// OpenAI's GPT-5 reasoning family and GPT-6 Astra cannot combine function tools
+/// with reasoning on `/v1/chat/completions` — the API rejects the request and points
 /// at `/v1/responses`, which supports both. An agent request always carries
-/// tools, so those models go to the Responses adapter; otherwise every gpt-5.x
-/// turn would have to give up reasoning to keep its tools.
+/// tools, so those models go to the Responses adapter.
 ///
 /// Only the direct `openai` provider is upgraded. OpenRouter also speaks the
 /// OpenAI protocol but has no `/v1/responses`, and it has its own branch in
 /// [`router_target_for_model`] that pins `AdapterKind::OpenAI`.
 fn adapter_for(provider: &str, model_name: &str) -> Option<AdapterKind> {
     let adapter = adapter_for_provider(provider)?;
-    if provider == "openai" && adapter == AdapterKind::OpenAI && is_gpt5_reasoning(model_name) {
+    if provider == "openai"
+        && adapter == AdapterKind::OpenAI
+        && (is_gpt5_reasoning(model_name) || model_name.starts_with("gpt-6-astra"))
+    {
         return Some(AdapterKind::OpenAIResp);
     }
     Some(adapter)
@@ -1395,10 +1397,11 @@ fn should_use_anthropic_oauth(model: &str, config: &LlmRouterConfig) -> bool {
     if normalize_api_base(&config.api_base).is_some() {
         return false;
     }
-    if slash_provider(model) == Some("openrouter") {
-        return false;
-    }
-    if slash_provider(model) == Some("opencode-go") {
+    // Explicit cross-provider tiers must not inherit the primary model's OAuth.
+    if matches!(
+        slash_provider(model),
+        Some("openai" | "openrouter" | "opencode-go")
+    ) {
         return false;
     }
     if normalized_provider(&config.provider).as_deref() == Some("openrouter") {
@@ -2936,13 +2939,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_openai_gpt5_routes_to_the_responses_adapter() {
+    fn direct_openai_reasoning_models_route_to_the_responses_adapter() {
         // gpt-5 reasoning models reject function tools on /v1/chat/completions
         // and must go to /v1/responses, which supports tools + reasoning.
         for model in [
             "openai/gpt-5.6-terra",
             "openai/gpt-5.5",
             "openai/gpt-5.4-mini",
+            "openai/gpt-6-astra",
+            "openai/gpt-6-astra-high",
         ] {
             let config = config_for(model, "");
             let target = router_target_for_model(model, &config).unwrap();
@@ -2987,6 +2992,9 @@ mod tests {
             "gpt-5.5",
             "gpt-5.4-mini",
             "gpt-5",
+            "gpt-6-astra",
+            "gpt-6-astra-high",
+            "openai/gpt-6-astra-high",
             "o3-mini",
             "o1",
         ] {
@@ -3007,6 +3015,7 @@ mod tests {
             "gpt-4o",
             // Relayed ids are normalized by the relay, so they are left alone.
             "openrouter/openai/gpt-5.4",
+            "openrouter/openai/gpt-6-astra-high",
             "openrouter/anthropic/claude-opus-4.7",
         ] {
             assert_eq!(
@@ -3096,6 +3105,24 @@ mod tests {
         config.model = "openai/gpt-5.2".to_string();
         config.provider = String::new();
         assert!(should_use_openai_oauth(&config.model, &config));
+    }
+
+    #[test]
+    fn openai_deep_model_does_not_inherit_anthropic_oauth() {
+        let config = config_for("claude-opus-4-8", "anthropic");
+        assert!(should_use_anthropic_oauth(&config.model, &config));
+        assert!(!should_use_openai_oauth(&config.model, &config));
+
+        for model in ["openai/gpt-6-astra-high", "OpenAI/gpt-6-astra-high"] {
+            assert!(should_use_openai_oauth(model, &config));
+            // Without OpenAI OAuth, execution must continue to the API-key client.
+            assert!(!should_use_anthropic_oauth(model, &config));
+            let target = router_target_for_model(model, &config).unwrap();
+            assert_eq!(target.auth_env, "OPENAI_API_KEY");
+            assert_eq!(target.endpoint, OPENAI_ENDPOINT);
+            assert_eq!(target.adapter, AdapterKind::OpenAIResp);
+            assert_eq!(target.model_name, "gpt-6-astra-high");
+        }
     }
 
     #[test]

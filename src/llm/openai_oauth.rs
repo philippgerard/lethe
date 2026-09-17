@@ -25,7 +25,7 @@ use futures_util::StreamExt;
 use genai::adapter::AdapterKind;
 use genai::chat::{
     ChatOptions, ChatRequest, ChatResponse, ChatRole, ContentPart, MessageContent,
-    PromptTokensDetails, ToolCall, Usage,
+    PromptTokensDetails, ReasoningEffort, ToolCall, Usage,
 };
 use genai::{ModelIden, chat::Tool};
 use reqwest::StatusCode;
@@ -594,7 +594,7 @@ fn trim_openai_input_items(body: &mut Value) {
     }
 }
 
-fn openai_responses_body(model: &str, request: ChatRequest, _options: &ChatOptions) -> Value {
+fn openai_responses_body(model: &str, request: ChatRequest, options: &ChatOptions) -> Value {
     // System → instructions; everything else → typed input items.
     // max_tokens is intentionally not forwarded — the Codex endpoint
     // rejects token-limit params.
@@ -636,6 +636,8 @@ fn openai_responses_body(model: &str, request: ChatRequest, _options: &ChatOptio
         instructions_parts.join("\n\n")
     };
 
+    let model = super::client::strip_slash_provider(model, "openai");
+    let (model_effort, model) = ReasoningEffort::from_model_name(model);
     let mut body = json!({
         "model": model,
         "instructions": instructions,
@@ -643,6 +645,14 @@ fn openai_responses_body(model: &str, request: ChatRequest, _options: &ChatOptio
         "store": false,
         "stream": true,
     });
+    if let Some(effort) = options
+        .reasoning_effort
+        .as_ref()
+        .or(model_effort.as_ref())
+        .and_then(ReasoningEffort::as_keyword)
+    {
+        body["reasoning"] = json!({"effort": effort});
+    }
     trim_openai_input_items(&mut body);
     if let Some(tools) = request.tools
         && !tools.is_empty()
@@ -1682,6 +1692,8 @@ mod tests {
     #[test]
     fn body_extracts_instructions_and_input_items() {
         let body = openai_responses_body("gpt-5.2", make_request(), &ChatOptions::default());
+        assert_eq!(body["model"], json!("gpt-5.2"));
+        assert!(body.get("reasoning").is_none());
         assert_eq!(body["instructions"], json!("be precise"));
         assert_eq!(body["store"], json!(false));
         assert_eq!(body["stream"], json!(true));
@@ -1699,6 +1711,38 @@ mod tests {
         assert_eq!(tools[0]["type"], json!("function"));
         assert_eq!(tools[0]["name"], json!("lookup"));
         assert!(tools[0]["parameters"].is_object());
+    }
+
+    #[test]
+    fn astra_high_body_sends_reasoning_effort_with_function_tools() {
+        let options = ChatOptions::default()
+            .with_temperature(0.7)
+            .with_top_p(0.9)
+            .with_max_tokens(2048);
+        for model in [
+            "gpt-6-astra-high",
+            "openai/gpt-6-astra-high",
+            "OpenAI/gpt-6-astra-high",
+        ] {
+            let body = openai_responses_body(model, make_request(), &options);
+
+            assert_eq!(body["model"], json!("gpt-6-astra"));
+            assert_eq!(body["reasoning"], json!({"effort": "high"}));
+            assert_eq!(body["tools"][0]["type"], json!("function"));
+            assert_eq!(body["tools"][0]["name"], json!("lookup"));
+            for parameter in ["temperature", "top_p", "top_logprobs", "max_tokens"] {
+                assert!(body.get(parameter).is_none(), "unexpected {parameter}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_reasoning_effort_overrides_model_suffix() {
+        let options = ChatOptions::default().with_reasoning_effort(ReasoningEffort::Medium);
+        let body = openai_responses_body("gpt-6-astra-high", make_request(), &options);
+
+        assert_eq!(body["model"], json!("gpt-6-astra"));
+        assert_eq!(body["reasoning"], json!({"effort": "medium"}));
     }
 
     #[test]
