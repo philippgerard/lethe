@@ -61,6 +61,11 @@ jobs:
       - name: Install native dependencies
         run: ${{ matrix.deps }}
 
+      - name: Audit migrator dependencies
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file migrator/Cargo.lock --deny unsound --deny yanked
+
       - name: Build lethe-migrate
         run: cargo build --release --locked --manifest-path migrator/Cargo.toml
 
