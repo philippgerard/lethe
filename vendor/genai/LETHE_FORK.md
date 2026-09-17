@@ -59,8 +59,8 @@ Prompt-caching changes:
   Anthropic's, so both paths must agree on this mapping by construction rather
   than through a copy that can drift.
 - `src/adapter/adapters/openai_resp/adapter_impl.rs`: one added test,
-  `lethe_fork_agent_turn_on_a_gpt5_reasoning_model`. No production code touched.
-  It pins the request shape a Lethe agent turn produces for gpt-5 — the URL,
+  `lethe_fork_agent_turn_on_a_reasoning_model`. No production code touched.
+  It pins the request shape a Lethe agent turn produces for gpt-5 and Astra — the URL,
   `max_output_tokens`, tools surviving, and no `temperature` — since that route
   is the whole reason those models are sent to the Responses API.
 - `Cargo.toml`: the published crate's `[[example]]`/`[[test]]` target
@@ -132,6 +132,15 @@ recorded so nobody re-applies them:
   (`openai_resp/streamer.rs`), and Lethe now routes direct-OpenAI gpt-5
   reasoning models to `AdapterKind::OpenAIResp` (see `adapter_for()` in
   `src/llm/client.rs`). `/v1/responses` supports tools *and* reasoning together.
+
+### GPT-6 Astra
+
+Direct OpenAI Astra requests use the Responses API for tool support, including
+streaming. Lethe's model-aware request options omit unsupported sampling
+parameters for Astra. Reasoning suffixes such as
+`gpt-6-astra-high` select the bare model with `reasoning.effort=high`.
+Lethe's ChatGPT OAuth transport applies the same shorthand separately and
+accepts an explicit `openai/` prefix for mixed-provider model tiers.
 
 ## Tracking upstream
 

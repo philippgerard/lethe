@@ -2,6 +2,11 @@
 
 ## 0.28.0 - Agent-id installs itself, browser CLI health probe
 
+- **Deep thinking supports GPT-6 Astra with high reasoning effort.** Configure
+  `LLM_MODEL_DEEP=openai/gpt-6-astra-high` to keep the primary model while
+  escalating difficult work to Astra. API and ChatGPT subscription requests
+  use Responses with the bare model ID and `reasoning.effort=high`.
+
 - **Scheduled wake delivery now closes cleanly after a confirmed Telegram result.**
   The model-facing Telegram contract now matches `/wake`: a normal final response
   is delivered automatically when no Telegram tool message was sent, while a

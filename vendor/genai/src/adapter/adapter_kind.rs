@@ -321,6 +321,7 @@ impl AdapterKind {
 		// migh be a little generic on this one
 		{
 			if model.starts_with("gpt-5")
+				|| model.starts_with("gpt-6-astra")
 				|| (model.starts_with("gpt") && (model.contains("codex") || model.contains("pro")))
 			{
 				Ok(Self::OpenAIResp)
@@ -382,3 +383,19 @@ impl AdapterKind {
 }
 
 // endregion: --- Support
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn astra_uses_responses_unless_adapter_is_explicit() {
+		for model in ["gpt-6-astra", "gpt-6-astra-high", "gpt-5.6-sol"] {
+			assert_eq!(AdapterKind::from_model(model).unwrap(), AdapterKind::OpenAIResp);
+		}
+		assert_eq!(
+			AdapterKind::from_model("openai::gpt-6-astra-high").unwrap(),
+			AdapterKind::OpenAI
+		);
+	}
+}
