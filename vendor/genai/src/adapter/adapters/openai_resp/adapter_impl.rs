@@ -767,51 +767,41 @@ mod tests {
 		);
 	}
 
-	/// Lethe fork: the exact request shape a Lethe agent turn produces for a
-	/// gpt-5 reasoning model, which is why those models are routed here at all.
-	///
-	/// On /v1/chat/completions this same request is a hard 400 — "Function tools
-	/// with reasoning_effort are not supported for gpt-5.6-terra ... use
-	/// /v1/responses or set reasoning_effort to 'none'" — because an agent
-	/// always carries tools and the model's implicit default effort is not
-	/// "none". The Responses API supports tools and reasoning together, so no
-	/// effort has to be forced here.
-	///
-	/// Guards the three things that would silently break the route: the URL,
-	/// `max_output_tokens` (not `max_tokens`), and the absence of `temperature`,
-	/// which reasoning models reject and which Lethe drops in `chat_options()`.
+	/// Match Lethe's request options: sampling omitted, usage captured when streaming.
 	#[test]
-	fn lethe_fork_agent_turn_on_a_gpt5_reasoning_model() {
-		let chat_options = ChatOptions::default().with_max_tokens(64);
-		let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
-		let target = ServiceTarget {
-			model: ModelIden::new(AdapterKind::OpenAIResp, "gpt-5.6-terra"),
-			auth: AuthData::from_single("test-key"),
-			endpoint: OpenAIRespAdapter::default_endpoint(),
-		};
-		let chat_req = ChatRequest::from_user("hi").append_tool(Tool::new("get_time"));
+	fn lethe_fork_agent_turn_on_a_reasoning_model() {
+		for model_name in ["gpt-5.6-terra", "gpt-6-astra", "gpt-6-astra-high"] {
+			for service_type in [ServiceType::Chat, ServiceType::ChatStream] {
+				let chat_options = ChatOptions::default().with_max_tokens(64).with_capture_usage(true);
+				let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
+				let target = ServiceTarget {
+					model: ModelIden::new(AdapterKind::OpenAIResp, model_name),
+					auth: AuthData::from_single("test-key"),
+					endpoint: OpenAIRespAdapter::default_endpoint(),
+				};
+				let chat_req = ChatRequest::from_user("hi").append_tool(Tool::new("get_time"));
+				let web_req = OpenAIRespAdapter::to_web_request_data(target, service_type, chat_req, options_set)
+					.expect("an agent turn must build a Responses request");
 
-		let web_req = OpenAIRespAdapter::to_web_request_data(target, ServiceType::ChatStream, chat_req, options_set)
-			.expect("a gpt-5 agent turn must build a Responses request");
-
-		assert!(
-			web_req.url.ends_with("/responses"),
-			"must target /v1/responses, got {}",
-			web_req.url
-		);
-		assert_eq!(web_req.payload["model"], json!("gpt-5.6-terra"));
-		assert_eq!(web_req.payload["stream"], json!(true));
-		assert!(web_req.payload["tools"].is_array(), "tools must survive");
-		assert_eq!(
-			web_req.payload["max_output_tokens"],
-			json!(64),
-			"the Responses API takes max_output_tokens, not max_tokens"
-		);
-		assert!(web_req.payload.get("max_tokens").is_none());
-		assert!(
-			web_req.payload.get("temperature").is_none(),
-			"reasoning models reject temperature; Lethe must not send one"
-		);
+				assert_eq!(web_req.url, "https://api.openai.com/v1/responses");
+				if matches!(service_type, ServiceType::ChatStream) {
+					assert_eq!(web_req.payload["stream"], true);
+				}
+				assert_eq!(web_req.payload["tools"][0]["type"], "function");
+				assert_eq!(web_req.payload["tools"][0]["name"], "get_time");
+				assert_eq!(web_req.payload["max_output_tokens"], 64);
+				for parameter in ["max_tokens", "temperature", "top_p", "top_logprobs", "stream_options"] {
+					assert!(web_req.payload.get(parameter).is_none(), "unexpected {parameter}");
+				}
+				if model_name.ends_with("-high") {
+					assert_eq!(web_req.payload["model"], "gpt-6-astra");
+					assert_eq!(web_req.payload["reasoning"]["effort"], "high");
+				} else {
+					assert_eq!(web_req.payload["model"], model_name);
+					assert!(web_req.payload.get("reasoning").is_none());
+				}
+			}
+		}
 	}
 }
 
