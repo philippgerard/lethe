@@ -45,6 +45,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      - name: Install dependency auditor
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit dependency lockfiles
+        run: |
+          cargo audit --file Cargo.lock --deny unsound --deny yanked
+          cargo audit --no-fetch --file vendor/genai/Cargo.lock --deny unsound --deny yanked
+          cargo audit --no-fetch --file migrator/Cargo.lock --deny unsound --deny yanked
+
       - name: Check release scripts
         run: >-
           bash -n install.sh update.sh scripts/package-release
