@@ -334,6 +334,25 @@ For [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) wit
 
 `lethe login openai` runs a device-code flow against `auth.openai.com`; tokens land in `~/.lethe/credentials/openai_oauth_tokens.json`. Calls then go to the Codex Responses API at `chatgpt.com/backend-api/codex/responses` using your ChatGPT Plus/Pro session — no `OPENAI_API_KEY` needed. Override the token file with `LETHE_OPENAI_OAUTH_TOKENS` or supply a raw token via `OPENAI_AUTH_TOKEN`.
 
+For a running Telegram deployment, the first configured allowed user can send
+`/login openai` in their private chat with the bot. Open the OpenAI link, enter
+the one-time code, and approve in your browser within 15 minutes. Enable device-code
+login in ChatGPT security settings if necessary. Lethe confirms completion and
+updates its running clients without a restart. `/login cancel` cancels pending
+sign-in; only one sign-in can run at a time. Passwords and access/refresh tokens
+must never be sent to the bot. Login commands bypass the model and transcript;
+reaction previews omit the sign-in code.
+
+File-backed subscription credentials renew automatically, with refresh serialized
+within the process and atomic file replacement. Run one Lethe process per token
+file. An access-token rejection gets one refresh-and-retry;
+a revoked session produces an actionable Telegram reply. `/status` reports the
+cached authentication state without calling the provider. Keep the credentials
+directory on a persistent, writable volume. A nonempty `OPENAI_AUTH_TOKEN` is a
+static override: it cannot renew, and `/login openai` refuses to save credentials
+that would be ignored. Remove that override from deployment configuration and
+restart before reconnecting. An empty override falls back to the token file.
+
 `lethe login anthropic` runs a PKCE browser flow against `claude.ai/oauth/authorize`; tokens land in `~/.lethe/credentials/anthropic_oauth_tokens.json`. Override with `LETHE_ANTHROPIC_OAUTH_TOKENS` or `ANTHROPIC_AUTH_TOKEN`.
 
 ### Prompt caching

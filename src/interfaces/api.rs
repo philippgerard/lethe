@@ -24,7 +24,8 @@ use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use crate::interfaces::telegram::{
     PendingReaction, SharedTelegramTurnGuard, TelegramClient, TelegramToolContext,
-    TelegramTurnGuard, TelegramTypingObserver, llm_limit_reply, split_telegram_messages,
+    TelegramTurnGuard, TelegramTypingObserver, llm_auth_reply, llm_limit_reply,
+    split_telegram_messages,
 };
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
@@ -2054,21 +2055,30 @@ async fn wake(
         }
         Ok(Err(error)) => {
             let error = anyhow::Error::new(error);
-            let (status, failure_kind, user_message, error_message) = match llm_limit_reply(&error)
-            {
-                Some(message) => (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "limit",
-                    message,
-                    message.to_string(),
-                ),
-                None => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "turn_failed",
-                    WAKE_TURN_FAILURE_MESSAGE,
-                    format!("turn failed: {error}"),
-                ),
-            };
+            let (status, failure_kind, user_message, error_message) =
+                if let Some(message) = llm_auth_reply(&error) {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "authentication",
+                        message,
+                        message.to_string(),
+                    )
+                } else {
+                    match llm_limit_reply(&error) {
+                        Some(message) => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "limit",
+                            message,
+                            message.to_string(),
+                        ),
+                        None => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "turn_failed",
+                            WAKE_TURN_FAILURE_MESSAGE,
+                            format!("turn failed: {error}"),
+                        ),
+                    }
+                };
             let progress = Arc::new(WakeDeliveryProgress::new(
                 tool_messages_sent,
                 pending_reactions.len(),

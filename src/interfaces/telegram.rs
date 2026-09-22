@@ -25,6 +25,30 @@ pub const OUT_OF_CREDITS_MESSAGE: &str =
     "You're out of credits. Top up to keep chatting with Lethe.";
 pub const USAGE_LIMIT_MESSAGE: &str =
     "The AI provider's usage limit has been reached. Please try again after it resets.";
+pub const OPENAI_LOGIN_MESSAGE: &str = "My OpenAI connection needs you to sign in again. Use /login openai in our private chat to reconnect.";
+pub const OPENAI_STATIC_TOKEN_MESSAGE: &str = "OPENAI_AUTH_TOKEN is configured as a static override and cannot renew itself. Remove that override from your deployment configuration, restart Lethe, then use /login openai in our private chat.";
+pub const LLM_FAILURE_MESSAGE: &str = "I couldn't complete that request because the AI service failed. Please try again. Use /status to check the connection.";
+
+pub fn llm_auth_reply(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::llm::openai_oauth::OpenAiAuthRequired>())
+        .map(|error| {
+            if error.static_token {
+                OPENAI_STATIC_TOKEN_MESSAGE
+            } else {
+                OPENAI_LOGIN_MESSAGE
+            }
+        })
+}
+
+/// Every failed interactive turn gets a safe reply; provider response bodies
+/// and credentials must never be forwarded to Telegram.
+pub fn llm_failure_reply(error: &anyhow::Error) -> &'static str {
+    llm_auth_reply(error)
+        .or_else(|| llm_limit_reply(error))
+        .unwrap_or(LLM_FAILURE_MESSAGE)
+}
 
 /// Map billing and provider usage-limit failures to a reply suitable for every
 /// Telegram turn path (queued conversations, direct turns, `/wake`, and actor
@@ -127,6 +151,8 @@ pub struct TelegramClient {
     on_lock: Option<FirstUserLockCallback>,
     http: reqwest::Client,
     sent_messages: SharedSentMessageLog,
+    #[cfg(test)]
+    test_api_base: Option<String>,
 }
 
 const TELEGRAM_ALLOWED_UPDATES: &str = "[\"message\",\"message_reaction\",\"callback_query\"]";
@@ -179,6 +205,8 @@ impl TelegramClient {
             on_lock: None,
             http: reqwest::Client::new(),
             sent_messages: Arc::new(Mutex::new(SentMessageLog::default())),
+            #[cfg(test)]
+            test_api_base: None,
         })
     }
 
@@ -209,6 +237,17 @@ impl TelegramClient {
             return true;
         }
         allowed.contains(&user_id)
+    }
+
+    /// Global provider credentials may only be changed by the first configured
+    /// owner in their private chat. An empty/open chat allowlist grants no admin rights.
+    pub fn is_private_owner(&self, chat_id: i64, user_id: i64) -> bool {
+        chat_id > 0
+            && chat_id == user_id
+            && self
+                .allowed_user_ids
+                .lock()
+                .is_ok_and(|allowed| allowed.first() == Some(&user_id))
     }
 
     /// A shared handle to this client's outgoing-message log, so other send
@@ -257,6 +296,16 @@ impl TelegramClient {
     pub async fn send_message(&self, chat_id: i64, text: &str) -> TelegramResult<i64> {
         self.send_message_with_reply_markup(chat_id, text, None)
             .await
+    }
+
+    /// Send native sign-in instructions without retaining their code in the
+    /// reaction cache, which may later be copied into conversation metadata.
+    pub async fn send_sign_in_message(&self, chat_id: i64, text: &str) -> TelegramResult<i64> {
+        let message_id = self
+            .send_message_with_mode(chat_id, text, None, None)
+            .await?;
+        self.remember_sent_message(chat_id, message_id, "Sign-in instructions (code omitted).");
+        Ok(message_id)
     }
 
     pub async fn send_message_with_reply_markup(
@@ -453,6 +502,10 @@ impl TelegramClient {
     }
 
     fn method_url(&self, method: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.test_api_base {
+            return format!("{base}/{method}");
+        }
         format!("https://api.telegram.org/bot{}/{}", self.token, method)
     }
 }
@@ -2364,6 +2417,24 @@ mod tests {
     }
 
     #[test]
+    fn provider_login_requires_the_configured_owner_in_private_chat() {
+        let client = TelegramClient::new("token", vec![7, 8]).unwrap();
+        assert!(client.is_private_owner(7, 7));
+        assert!(!client.is_private_owner(8, 8));
+        assert!(!client.is_private_owner(-123, 7));
+        assert!(!client.is_private_owner(7, 9));
+        let open = TelegramClient::new("token", Vec::new()).unwrap();
+        assert!(open.user_allowed(7));
+        assert!(!open.is_private_owner(7, 7));
+    }
+
+    #[test]
+    fn unknown_provider_failure_never_exposes_raw_error_to_chat() {
+        let error = anyhow::anyhow!("connection reset; secret=DO_NOT_EXPOSE");
+        assert_eq!(llm_failure_reply(&error), LLM_FAILURE_MESSAGE);
+    }
+
+    #[test]
     fn power_mode_notice_uses_friendly_or_custom_model_name() {
         assert_eq!(
             power_mode_notice("claude-opus-4-8"),
@@ -2569,6 +2640,54 @@ mod tests {
 
         // message_id is matched per-chat.
         assert!(client.recent_sent_message(101, 5).is_none());
+    }
+
+    #[tokio::test]
+    async fn sign_in_code_is_delivered_but_omitted_from_reaction_metadata() {
+        use axum::{Json, Router, routing::post};
+        let received = Arc::new(Mutex::new(String::new()));
+        let captured = received.clone();
+        let app = Router::new().route(
+            "/sendMessage",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = body["text"].as_str().unwrap().to_string();
+                    Json(serde_json::json!({"ok": true, "result": {"message_id": 5}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TelegramClient::new("test-token", vec![7]).unwrap();
+        client.test_api_base = Some(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let message_id = client
+            .send_sign_in_message(7, "Enter one-time code SECRET-1234")
+            .await
+            .unwrap();
+        server.abort();
+        assert!(received.lock().unwrap().contains("SECRET-1234"));
+        let sent = client.recent_sent_message(7, message_id).unwrap();
+        let reaction = IncomingTelegramReaction {
+            update_id: 1,
+            chat_id: 7,
+            user_id: 7,
+            message_id,
+            emojis: vec!["👍".to_string()],
+        };
+        assert!(!sent.text.contains("SECRET-1234"));
+        assert!(sent.text.contains("code omitted"));
+        assert!(
+            !reaction
+                .self_message_prompt(&sent.text)
+                .contains("SECRET-1234")
+        );
+        assert!(
+            !reaction
+                .self_message_metadata(&sent.text)
+                .to_string()
+                .contains("SECRET-1234")
+        );
     }
 
     #[test]
