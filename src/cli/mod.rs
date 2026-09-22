@@ -11,6 +11,7 @@ pub mod init;
 pub mod model;
 pub mod prompts;
 pub mod service;
+mod telegram_login;
 pub mod telegram_loop;
 pub mod transport;
 pub mod transport_supervisor;

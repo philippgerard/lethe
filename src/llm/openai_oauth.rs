@@ -12,10 +12,12 @@
 //! and the wire response is SSE that we have to aggregate and translate
 //! back into a genai `ChatResponse`.
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,7 +42,6 @@ use crate::llm::client::DeltaCallback;
 
 // --- Endpoints / constants ---------------------------------------------------
 
-const OPENAI_OAUTH_ISSUER: &str = "https://auth.openai.com";
 const OPENAI_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_DEVICE_USERCODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const OPENAI_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
@@ -66,6 +67,8 @@ pub struct OpenAiOAuthClient {
     tokens: Arc<Mutex<OpenAiOAuthTokens>>,
     request_gate: Arc<Semaphore>,
     rate_limit_until: Arc<Mutex<Option<Instant>>>,
+    token_url: String,
+    responses_url: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -76,10 +79,47 @@ struct OpenAiOAuthTokens {
     account_id: Option<String>,
     #[serde(skip)]
     env_access_token: bool,
+    #[serde(skip)]
+    reauth_required: bool,
+    #[serde(skip)]
+    persistence_pending: bool,
 }
 
+/// A provider authentication failure, safe to present without its HTTP body.
 #[derive(Debug, Error)]
+#[error("OpenAI subscription sign-in is required")]
+pub struct OpenAiAuthRequired {
+    pub static_token: bool,
+}
+
+type TokenState = Arc<Mutex<OpenAiOAuthTokens>>;
+type TokenStates = std::sync::Mutex<HashMap<PathBuf, Weak<Mutex<OpenAiOAuthTokens>>>>;
+
+fn shared_token_state(path: &Path, tokens: OpenAiOAuthTokens) -> TokenState {
+    static STATES: OnceLock<TokenStates> = OnceLock::new();
+    let mut states = STATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    states.retain(|_, state| state.strong_count() > 0);
+    if let Some(state) = states.get(path).and_then(Weak::upgrade) {
+        return state;
+    }
+    let state = Arc::new(Mutex::new(tokens));
+    states.insert(path.to_path_buf(), Arc::downgrade(&state));
+    state
+}
+
+pub fn openai_static_token_configured() -> bool {
+    env::var("OPENAI_AUTH_TOKEN").is_ok_and(|token| !token.trim().is_empty())
+}
+
+#[derive(Error)]
 enum OpenAiOAuthError {
+    #[error("{0}")]
+    Authentication(#[from] OpenAiAuthRequired),
+    #[error("OpenAI rejected the access token")]
+    Unauthorized { rejected_token: String },
     #[error("{message}")]
     RateLimited {
         message: String,
@@ -94,14 +134,19 @@ enum OpenAiOAuthError {
     Other(#[from] anyhow::Error),
 }
 
+impl std::fmt::Debug for OpenAiOAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // In particular, never include Unauthorized.rejected_token in logs.
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl OpenAiOAuthClient {
     pub fn from_env() -> Option<Self> {
         let token_file = openai_oauth_token_file();
-        let tokens = if let Ok(access_token) = env::var("OPENAI_AUTH_TOKEN") {
-            let access_token = access_token.trim().to_string();
-            if access_token.is_empty() {
-                None
-            } else {
+        let tokens = if openai_static_token_configured() {
+            if let Ok(access_token) = env::var("OPENAI_AUTH_TOKEN") {
+                let access_token = access_token.trim().to_string();
                 let account_id = parse_jwt_claims(&access_token)
                     .as_ref()
                     .and_then(extract_account_id_from_claims);
@@ -111,6 +156,8 @@ impl OpenAiOAuthClient {
                     env_access_token: true,
                     ..Default::default()
                 })
+            } else {
+                None
             }
         } else {
             read_openai_oauth_tokens(&token_file)
@@ -121,10 +168,16 @@ impl OpenAiOAuthClient {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .ok()?,
-            token_file,
-            tokens: Arc::new(Mutex::new(tokens)),
+            token_file: token_file.clone(),
+            tokens: if tokens.env_access_token {
+                Arc::new(Mutex::new(tokens))
+            } else {
+                shared_token_state(&token_file, tokens)
+            },
             request_gate: Arc::new(Semaphore::new(oauth_max_concurrency())),
             rate_limit_until: Arc::new(Mutex::new(None)),
+            token_url: OPENAI_OAUTH_TOKEN_URL.to_string(),
+            responses_url: OPENAI_RESPONSES_URL.to_string(),
         })
     }
 
@@ -135,12 +188,20 @@ impl OpenAiOAuthClient {
         options: &ChatOptions,
     ) -> Result<ChatResponse> {
         let mut last_error = None;
+        let mut refreshed = false;
         for attempt in 0..3 {
             match self
                 .call_messages_once(model, request.clone(), options)
                 .await
             {
                 Ok(response) => return Ok(response),
+                Err(OpenAiOAuthError::Unauthorized { rejected_token }) => {
+                    if refreshed {
+                        return Err(self.require_login(&rejected_token).await.into());
+                    }
+                    self.refresh_access(Some(&rejected_token)).await?;
+                    refreshed = true;
+                }
                 Err(error @ OpenAiOAuthError::RateLimited { retry_after, .. }) => {
                     last_error = Some(error);
                     if !openai_rate_limit_is_retryable(retry_after) {
@@ -171,11 +232,22 @@ impl OpenAiOAuthClient {
         options: &ChatOptions,
         on_delta: DeltaCallback<'_>,
     ) -> Result<ChatResponse> {
-        match self
+        let result = self
             .call_messages_stream(model, request.clone(), options, on_delta)
-            .await
-        {
+            .await;
+        let result = match result {
+            Err(OpenAiOAuthError::Unauthorized { rejected_token }) => {
+                self.refresh_access(Some(&rejected_token)).await?;
+                self.call_messages_stream(model, request.clone(), options, on_delta)
+                    .await
+            }
+            other => other,
+        };
+        match result {
             Ok(response) => Ok(response),
+            Err(OpenAiOAuthError::Unauthorized { rejected_token }) => {
+                Err(self.require_login(&rejected_token).await.into())
+            }
             Err(error) if openai_stream_error_is_retryable(&error) => {
                 let response = self.exec_chat_request(model, request, options).await?;
                 if let Some(text) = response.first_text() {
@@ -221,7 +293,7 @@ impl OpenAiOAuthClient {
 
         let response = self
             .http
-            .post(OPENAI_RESPONSES_URL)
+            .post(&self.responses_url)
             .headers(headers)
             .json(&body)
             .send()
@@ -269,6 +341,11 @@ impl OpenAiOAuthClient {
             }),
         );
 
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(OpenAiOAuthError::Unauthorized {
+                rejected_token: access_token,
+            });
+        }
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after = retry_after_from_headers(&resp_headers);
             self.set_rate_limit(retry_after).await;
@@ -349,7 +426,7 @@ impl OpenAiOAuthClient {
 
         let response = self
             .http
-            .post(OPENAI_RESPONSES_URL)
+            .post(&self.responses_url)
             .headers(headers)
             .json(&body)
             .send()
@@ -360,6 +437,11 @@ impl OpenAiOAuthClient {
             })?;
 
         let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(OpenAiOAuthError::Unauthorized {
+                rejected_token: access_token,
+            });
+        }
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after = retry_after_from_headers(response.headers());
             self.set_rate_limit(retry_after).await;
@@ -415,18 +497,80 @@ impl OpenAiOAuthClient {
         openai_response_to_chat_response(data, model).map_err(Into::into)
     }
 
-    async fn ensure_access(&self) -> Result<(), OpenAiOAuthError> {
-        let refresh_token = {
-            let tokens = self.tokens.lock().await;
-            if tokens.env_access_token || !tokens.needs_refresh() {
-                return Ok(());
-            }
-            tokens.refresh_token.clone()
-        };
-        let Some(refresh_token) = refresh_token else {
-            return Ok(());
-        };
+    pub async fn auth_status(&self) -> &'static str {
+        let tokens = self.tokens.lock().await;
+        if tokens.reauth_required {
+            "sign-in required; use /login openai"
+        } else if tokens.persistence_pending {
+            "credential save failed; check persistent volume permissions and free space"
+        } else if tokens.env_access_token {
+            "static OPENAI_AUTH_TOKEN (automatic renewal unavailable)"
+        } else if tokens.needs_refresh() {
+            "automatic refresh due on next request"
+        } else {
+            "credentials available (last authentication failure: none)"
+        }
+    }
 
+    async fn require_login(&self, rejected_token: &str) -> OpenAiAuthRequired {
+        let mut tokens = self.tokens.lock().await;
+        if tokens.access_token.as_deref() == Some(rejected_token) {
+            tokens.reauth_required = true;
+        }
+        OpenAiAuthRequired {
+            static_token: tokens.env_access_token,
+        }
+    }
+
+    async fn ensure_access(&self) -> Result<(), OpenAiOAuthError> {
+        self.refresh_access(None).await
+    }
+
+    async fn refresh_access(&self, rejected_token: Option<&str>) -> Result<(), OpenAiOAuthError> {
+        // All clients using this file share this lock, including reconstructed
+        // routers and device login. Hold it through refresh and atomic persistence
+        // so a rotated refresh token is never submitted twice concurrently.
+        let mut tokens = self.tokens.lock().await;
+        if tokens.persistence_pending {
+            // A provider may already have rotated the refresh token before a
+            // disk failure. Retry saving that session before reading the stale
+            // file or attempting another provider refresh.
+            write_openai_oauth_tokens(&self.token_file, &tokens)?;
+            tokens.persistence_pending = false;
+        }
+        if !tokens.env_access_token
+            && let Some(saved) = read_openai_oauth_tokens(&self.token_file)
+            && (saved.access_token != tokens.access_token
+                || saved.refresh_token != tokens.refresh_token)
+        {
+            *tokens = saved;
+        }
+        if let Some(rejected) = rejected_token
+            && tokens.access_token.as_deref() != Some(rejected)
+        {
+            return Ok(());
+        }
+        if tokens.reauth_required {
+            return Err(OpenAiAuthRequired {
+                static_token: tokens.env_access_token,
+            }
+            .into());
+        }
+        if rejected_token.is_none() && (tokens.env_access_token || !tokens.needs_refresh()) {
+            return Ok(());
+        }
+        let refresh_token = tokens
+            .refresh_token
+            .clone()
+            .filter(|token| !token.is_empty());
+        if tokens.env_access_token || refresh_token.is_none() {
+            tokens.reauth_required = true;
+            return Err(OpenAiAuthRequired {
+                static_token: tokens.env_access_token,
+            }
+            .into());
+        }
+        let refresh_token = refresh_token.expect("checked above");
         let form = [
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.as_str()),
@@ -434,61 +578,51 @@ impl OpenAiOAuthClient {
         ];
         let response = self
             .http
-            .post(OPENAI_OAUTH_TOKEN_URL)
-            .header("content-type", "application/x-www-form-urlencoded")
+            .post(&self.token_url)
+            .timeout(Duration::from_secs(30))
             .form(&form)
             .send()
             .await
-            .map_err(|error| OpenAiOAuthError::Transient {
-                message: format!("OpenAI OAuth token refresh failed: {error}"),
+            .map_err(|_| OpenAiOAuthError::Transient {
+                message: "OpenAI token renewal is temporarily unavailable".to_string(),
                 retry_after: Duration::from_secs(5),
             })?;
-
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|error| anyhow!("OpenAI OAuth token refresh response read failed: {error}"))?;
+        let data: Value = response.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
-            return Err(anyhow!(
-                "OpenAI OAuth token refresh failed: {} {}",
-                status.as_u16(),
-                truncate_err(&text)
-            )
-            .into());
+            let code = data["error"]["code"]
+                .as_str()
+                .or_else(|| data["error"].as_str())
+                .unwrap_or_default();
+            if !status.is_server_error()
+                && status != StatusCode::TOO_MANY_REQUESTS
+                && (matches!(status.as_u16(), 401 | 403)
+                    || matches!(
+                        code,
+                        "invalid_grant"
+                            | "refresh_token_expired"
+                            | "refresh_token_reused"
+                            | "refresh_token_invalidated"
+                    ))
+            {
+                tokens.reauth_required = true;
+                return Err(OpenAiAuthRequired {
+                    static_token: false,
+                }
+                .into());
+            }
+            // OAuth error bodies can contain credentials. Never propagate them.
+            return Err(OpenAiOAuthError::Transient {
+                message: format!("OpenAI token renewal failed temporarily ({status})"),
+                retry_after: Duration::from_secs(5),
+            });
         }
-
-        let data: Value = serde_json::from_str(&text).with_context(|| {
-            format!("invalid OpenAI OAuth refresh JSON: {}", truncate_err(&text))
-        })?;
-        let access_token = data
-            .get("access_token")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("OpenAI OAuth refresh response is missing access_token"))?
-            .to_string();
-        let refresh_token = data
-            .get("refresh_token")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let expires_in = data
-            .get("expires_in")
-            .and_then(Value::as_f64)
-            .unwrap_or(3600.0);
-        let new_account_id = extract_account_id_from_token_payload(&data);
-
-        let snapshot = {
-            let mut tokens = self.tokens.lock().await;
-            tokens.access_token = Some(access_token);
-            if let Some(refresh_token) = refresh_token {
-                tokens.refresh_token = Some(refresh_token);
-            }
-            tokens.expires_at = Some(unix_now_seconds() + expires_in);
-            if let Some(account_id) = new_account_id {
-                tokens.account_id = Some(account_id);
-            }
-            tokens.clone()
-        };
-        write_openai_oauth_tokens(&self.token_file, &snapshot)?;
+        let mut renewed = tokens_from_response(&data, tokens.refresh_token.clone())?;
+        renewed.account_id = renewed.account_id.or_else(|| tokens.account_id.clone());
+        renewed.persistence_pending = true;
+        *tokens = renewed;
+        write_openai_oauth_tokens(&self.token_file, &tokens)?;
+        tokens.persistence_pending = false;
         Ok(())
     }
 
@@ -1347,14 +1481,25 @@ fn write_openai_oauth_tokens(path: &Path, tokens: &OpenAiOAuthTokens) -> Result<
         bail!("OpenAI OAuth token path has no parent: {}", path.display());
     };
     fs::create_dir_all(parent)?;
-    let text = serde_json::to_string_pretty(tokens)?;
-    fs::write(path, text)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let temporary = parent.join(format!(".openai-{}.tmp", Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(serde_json::to_string_pretty(tokens)?.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 pub fn openai_oauth_available() -> bool {
@@ -1378,119 +1523,149 @@ pub fn openai_oauth_available() -> bool {
 /// callers that want LLM_PROVIDER set automatically should call
 /// `update_env_for_openai_oauth` after this returns.
 pub async fn run_device_login() -> Result<()> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .context("building HTTP client for OpenAI device flow")?;
-
-    println!();
-    println!("OpenAI OAuth login (ChatGPT Plus/Pro Codex)");
-    println!("──────────────────────────────────────────────");
-    println!("Device-code flow. Approve in your browser, then return here.");
-    println!();
-
-    let device = start_device_flow(&http)
-        .await
-        .context("starting device flow")?;
-    let device_auth_id = device
-        .get("device_auth_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("device flow response missing device_auth_id"))?
-        .to_string();
-    let user_code = device
-        .get("user_code")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("device flow response missing user_code"))?
-        .to_string();
-    let interval = device
-        .get("interval")
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
-        })
-        .unwrap_or(5);
-    let verification_uri = device
-        .get("verification_uri_complete")
-        .or_else(|| device.get("verification_uri"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{OPENAI_OAUTH_ISSUER}/codex/device"));
-
-    println!("Open this URL in a browser:");
-    println!("    {verification_uri}");
-    println!();
-    println!("Enter this code if prompted: {user_code}");
-    println!();
-    best_effort_open(&verification_uri);
+    let login = OpenAiDeviceLogin::start().await?;
+    println!("OpenAI subscription login: {}", login.verification_url());
+    println!("Enter this code: {}", login.user_code());
+    best_effort_open(login.verification_url());
     println!("Waiting for authorization (Ctrl-C to cancel)...");
-
-    let auth = poll_for_authorization_code(&http, &device_auth_id, &user_code, interval)
-        .await
-        .context("polling device auth endpoint")?;
-    let authorization_code = auth
-        .get("authorization_code")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("polling response missing authorization_code"))?
-        .to_string();
-    let code_verifier = auth
-        .get("code_verifier")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("polling response missing code_verifier"))?
-        .to_string();
-
-    println!("Exchanging authorization code for tokens...");
-    let token_data = exchange_authorization_code(&http, &authorization_code, &code_verifier)
-        .await
-        .context("token exchange")?;
-
-    let access_token = token_data
-        .get("access_token")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("token exchange response missing access_token"))?
-        .to_string();
-    let refresh_token = token_data
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let expires_in = token_data
-        .get("expires_in")
-        .and_then(Value::as_f64)
-        .unwrap_or(3600.0);
-    let account_id = extract_account_id_from_token_payload(&token_data).or_else(|| {
-        parse_jwt_claims(&access_token)
-            .as_ref()
-            .and_then(extract_account_id_from_claims)
-    });
-
-    let tokens = OpenAiOAuthTokens {
-        access_token: Some(access_token.clone()),
-        refresh_token: refresh_token.clone(),
-        expires_at: Some(unix_now_seconds() + expires_in),
-        account_id: account_id.clone(),
-        env_access_token: false,
-    };
-    let token_file = openai_oauth_token_file();
-    write_openai_oauth_tokens(&token_file, &tokens)
-        .with_context(|| format!("writing OpenAI OAuth tokens to {}", token_file.display()))?;
-
-    println!();
-    println!("OAuth tokens saved to {}", token_file.display());
-    println!(
-        "Refresh token: {}",
-        if refresh_token.is_some() { "yes" } else { "no" }
-    );
-    println!("Expires in: {expires_in:.0}s");
-    println!(
-        "Account id: {}",
-        account_id.as_deref().unwrap_or("(not found)")
-    );
+    login.finish().await?;
+    println!("OpenAI subscription connected. Tokens saved securely.");
     Ok(())
 }
 
-async fn start_device_flow(http: &reqwest::Client) -> Result<Value> {
+/// Transport-independent device login. Credentials never leave this module.
+/// Dropping the finish future cancels polling; the whole flow expires in 15 minutes.
+pub struct OpenAiDeviceLogin {
+    http: reqwest::Client,
+    device_auth_id: String,
+    user_code: String,
+    interval: u64,
+    token_file: PathBuf,
+    state: TokenState,
+    deadline: tokio::time::Instant,
+    poll_url: String,
+    token_url: String,
+}
+
+impl OpenAiDeviceLogin {
+    pub async fn start() -> Result<Self> {
+        Self::start_at(
+            openai_oauth_token_file(),
+            OPENAI_DEVICE_USERCODE_URL,
+            OPENAI_DEVICE_TOKEN_URL,
+            OPENAI_OAUTH_TOKEN_URL,
+        )
+        .await
+    }
+
+    async fn start_at(
+        token_file: PathBuf,
+        start_url: &str,
+        poll_url: &str,
+        token_url: &str,
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+        let device = start_device_flow(&http, start_url).await?;
+        let state = shared_token_state(
+            &token_file,
+            read_openai_oauth_tokens(&token_file).unwrap_or_default(),
+        );
+        Ok(Self {
+            http,
+            device_auth_id: required_token_field(&device, "device_auth_id")?,
+            user_code: required_token_field(&device, "user_code")?,
+            interval: device["interval"]
+                .as_u64()
+                .or_else(|| {
+                    device["interval"]
+                        .as_str()
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or(5)
+                .clamp(1, 60),
+            token_file,
+            state,
+            deadline: tokio::time::Instant::now() + Duration::from_secs(DEVICE_AUTH_TIMEOUT_SECS),
+            poll_url: poll_url.to_string(),
+            token_url: token_url.to_string(),
+        })
+    }
+
+    pub fn verification_url(&self) -> &'static str {
+        // Do not forward arbitrary provider-supplied URLs into the owner's chat.
+        "https://auth.openai.com/codex/device"
+    }
+
+    pub fn user_code(&self) -> &str {
+        &self.user_code
+    }
+
+    pub async fn finish(self) -> Result<()> {
+        tokio::time::timeout_at(self.deadline, async {
+            let auth = poll_for_authorization_code(
+                &self.http,
+                &self.poll_url,
+                &self.device_auth_id,
+                &self.user_code,
+                self.interval,
+            )
+            .await?;
+            let code = required_token_field(&auth, "authorization_code")?;
+            let verifier = required_token_field(&auth, "code_verifier")?;
+            let data =
+                exchange_authorization_code(&self.http, &self.token_url, &code, &verifier).await?;
+            let tokens = tokens_from_response(&data, None)?;
+            // This shares the refresh lock; an in-flight refresh cannot overwrite
+            // the newly authorized session after login completes.
+            let mut state = self.state.lock().await;
+            write_openai_oauth_tokens(&self.token_file, &tokens)?;
+            *state = tokens;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow!("OpenAI sign-in timed out. Start /login openai again."))?
+    }
+}
+
+fn required_token_field(data: &Value, field: &str) -> Result<String> {
+    data[field]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("OpenAI authentication response is missing {field}"))
+}
+
+fn tokens_from_response(
+    data: &Value,
+    previous_refresh: Option<String>,
+) -> Result<OpenAiOAuthTokens> {
+    let access_token = required_token_field(data, "access_token")?;
+    let refresh_token = data["refresh_token"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or(previous_refresh)
+        .ok_or_else(|| anyhow!("OpenAI authentication response is missing refresh_token"))?;
+    let expires_in = data["expires_in"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(3600.0);
+    Ok(OpenAiOAuthTokens {
+        access_token: Some(access_token),
+        refresh_token: Some(refresh_token),
+        expires_at: Some(unix_now_seconds() + expires_in),
+        account_id: extract_account_id_from_token_payload(data),
+        env_access_token: false,
+        reauth_required: false,
+        persistence_pending: false,
+    })
+}
+
+async fn start_device_flow(http: &reqwest::Client, url: &str) -> Result<Value> {
     let response = http
-        .post(OPENAI_DEVICE_USERCODE_URL)
+        .post(url)
         .header("content-type", "application/json")
         .header("user-agent", "lethe-oauth-login")
         .json(&json!({"client_id": OPENAI_OAUTH_CLIENT_ID}))
@@ -1500,17 +1675,16 @@ async fn start_device_flow(http: &reqwest::Client) -> Result<Value> {
     let text = response.text().await?;
     if !status.is_success() {
         bail!(
-            "device auth start failed: {} {}",
-            status.as_u16(),
-            truncate_err(&text)
+            "OpenAI device sign-in could not start (HTTP {}). Enable device-code login in ChatGPT security settings and try again.",
+            status.as_u16()
         );
     }
-    serde_json::from_str(&text)
-        .with_context(|| format!("invalid device auth response JSON: {}", truncate_err(&text)))
+    serde_json::from_str(&text).with_context(|| "invalid OpenAI device sign-in response")
 }
 
 async fn poll_for_authorization_code(
     http: &reqwest::Client,
+    url: &str,
     device_auth_id: &str,
     user_code: &str,
     interval_seconds: u64,
@@ -1519,7 +1693,7 @@ async fn poll_for_authorization_code(
     let deadline = Instant::now() + Duration::from_secs(DEVICE_AUTH_TIMEOUT_SECS);
     loop {
         let response = http
-            .post(OPENAI_DEVICE_TOKEN_URL)
+            .post(url)
             .header("content-type", "application/json")
             .header("user-agent", "lethe-oauth-login")
             .json(&json!({
@@ -1531,9 +1705,8 @@ async fn poll_for_authorization_code(
         let status = response.status();
         let text = response.text().await?;
         if status.is_success() {
-            return serde_json::from_str(&text).with_context(|| {
-                format!("invalid device token response: {}", truncate_err(&text))
-            });
+            return serde_json::from_str(&text)
+                .with_context(|| "invalid OpenAI device authorization response");
         }
         // 403 and 404 are the pending-auth status codes in the current
         // OpenAI device endpoint.
@@ -1549,15 +1722,15 @@ async fn poll_for_authorization_code(
             continue;
         }
         bail!(
-            "device authorization polling failed: {} {}",
-            status.as_u16(),
-            truncate_err(&text)
+            "OpenAI device authorization failed (HTTP {})",
+            status.as_u16()
         );
     }
 }
 
 async fn exchange_authorization_code(
     http: &reqwest::Client,
+    url: &str,
     authorization_code: &str,
     code_verifier: &str,
 ) -> Result<Value> {
@@ -1569,7 +1742,7 @@ async fn exchange_authorization_code(
         ("code_verifier", code_verifier),
     ];
     let response = http
-        .post(OPENAI_OAUTH_TOKEN_URL)
+        .post(url)
         .header("content-type", "application/x-www-form-urlencoded")
         .form(&form)
         .send()
@@ -1577,14 +1750,9 @@ async fn exchange_authorization_code(
     let status = response.status();
     let text = response.text().await?;
     if !status.is_success() {
-        bail!(
-            "token exchange failed: {} {}",
-            status.as_u16(),
-            truncate_err(&text)
-        );
+        bail!("OpenAI token exchange failed (HTTP {})", status.as_u16());
     }
-    serde_json::from_str(&text)
-        .with_context(|| format!("invalid token exchange response: {}", truncate_err(&text)))
+    serde_json::from_str(&text).with_context(|| "invalid OpenAI token exchange response")
 }
 
 fn best_effort_open(url: &str) {
@@ -1640,7 +1808,9 @@ fn openai_stream_error_is_retryable(error: &OpenAiOAuthError) -> bool {
             openai_rate_limit_is_retryable(*retry_after)
         }
         OpenAiOAuthError::Transient { .. } => true,
-        OpenAiOAuthError::Other(_) => false,
+        OpenAiOAuthError::Other(_)
+        | OpenAiOAuthError::Unauthorized { .. }
+        | OpenAiOAuthError::Authentication(_) => false,
     }
 }
 
@@ -1669,6 +1839,10 @@ fn truncate_log(text: &str) -> String {
 }
 
 // --- Tests -------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "openai_oauth_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1959,6 +2133,8 @@ mod tests {
             tokens: Arc::new(Mutex::new(OpenAiOAuthTokens::default())),
             request_gate: Arc::new(Semaphore::new(1)),
             rate_limit_until: Arc::new(Mutex::new(None)),
+            token_url: OPENAI_OAUTH_TOKEN_URL.to_string(),
+            responses_url: OPENAI_RESPONSES_URL.to_string(),
         };
 
         client.set_rate_limit(Duration::from_secs(3600)).await;
@@ -1976,6 +2152,8 @@ mod tests {
             expires_at: Some(1_700_000_000.0),
             account_id: Some("acct".to_string()),
             env_access_token: false,
+            reauth_required: false,
+            persistence_pending: false,
         };
         write_openai_oauth_tokens(&path, &tokens).unwrap();
         let loaded = read_openai_oauth_tokens(&path).unwrap();

@@ -27,7 +27,8 @@ use lethe::interfaces::telegram::{
     FirstUserLockCallback, IncomingTelegramCallback, IncomingTelegramText, SharedTelegramTurnGuard,
     TelegramClient, TelegramToolContext, TelegramTurnGuard, TelegramTypingObserver,
     VisibleTelegramChannel, forget_pending_reply_keyboard_match, image_mime_type_from_path,
-    is_emoji_only_reply, llm_limit_reply, pending_reply_keyboard_matches, split_telegram_messages,
+    is_emoji_only_reply, llm_failure_reply, pending_reply_keyboard_matches,
+    split_telegram_messages,
 };
 use lethe::memory::MessageRole;
 use lethe::memory::message_metadata::{
@@ -91,6 +92,7 @@ pub enum TelegramRuntimeCommand {
     Model(Option<String>),
     Aux(Option<String>),
     Deep(Option<String>),
+    Login(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,13 +359,14 @@ pub fn parse_telegram_runtime_command(text: &str) -> Option<TelegramRuntimeComma
         "model" => Some(TelegramRuntimeCommand::Model(args)),
         "aux" => Some(TelegramRuntimeCommand::Aux(args)),
         "deep" => Some(TelegramRuntimeCommand::Deep(args)),
+        "login" => Some(TelegramRuntimeCommand::Login(args)),
         _ => None,
     }
 }
 
 pub fn telegram_help_text(settings: &Settings) -> String {
     format!(
-        "Hello. I'm {}.\n\nSend me any message and I'll help.\n\nCommands:\n/status - Check runtime status\n/stop - Cancel current processing when supported\n/heartbeat - Force a check-in\n/model [model-id] - Show or change the main model\n/aux [model-id] - Show or change the auxiliary model\n/deep [model-id] - Show or change the deep-thinking model",
+        "Hello. I'm {}.\n\nSend me any message and I'll help.\n\nCommands:\n/status - Check runtime status\n/login openai - Reconnect OpenAI in your browser (owner only)\n/login cancel - Cancel pending sign-in\n/stop - Cancel current processing when supported\n/heartbeat - Force a check-in\n/model [model-id] - Show or change the main model\n/aux [model-id] - Show or change the auxiliary model\n/deep [model-id] - Show or change the deep-thinking model",
         settings.agent_name
     )
 }
@@ -377,8 +380,12 @@ pub async fn telegram_status_text(agent: &Agent, settings: &Settings) -> Result<
         "disabled".to_string()
     };
 
+    let auth = match lethe::llm::openai_oauth::OpenAiOAuthClient::from_env() {
+        Some(client) => client.auth_status().await,
+        None => "not configured; use /login openai for subscription sign-in",
+    };
     Ok(format!(
-        "Status: ready\nMemory: {} blocks, {} archival, {} messages, {} notes\nModel: {}\nAux model: {}\nHeartbeat: {}, interval={}s\nActors: {}",
+        "Status: running\nOpenAI subscription: {auth}\nMemory: {} blocks, {} archival, {} messages, {} notes\nModel: {}\nAux model: {}\nHeartbeat: {}, interval={}s\nActors: {}",
         stats.memory_blocks,
         stats.archival_memories,
         stats.message_history,
@@ -562,16 +569,15 @@ fn metadata_map_from_value(
     }
 }
 
-async fn send_llm_limit_reply(
+async fn send_llm_failure_reply(
     client: &TelegramClient,
     chat_id: i64,
     error: &anyhow::Error,
-) -> Result<Option<&'static str>> {
-    let Some(message) = llm_limit_reply(error) else {
-        return Ok(None);
-    };
+) -> Result<&'static str> {
+    let message = llm_failure_reply(error);
+    tracing::warn!("Telegram LLM turn failed; sending a safe failure notice");
     client.send_message(chat_id, message).await?;
-    Ok(Some(message))
+    Ok(message)
 }
 
 fn telegram_process_callback(
@@ -646,20 +652,17 @@ fn telegram_process_callback(
                     Ok(result) => result,
                     Err(error) => {
                         let error = anyhow::Error::new(error);
-                        if let Some(message) =
-                            send_llm_limit_reply(&client, context.chat_id, &error).await?
-                        {
-                            agent.emit_conversation_event(
-                                "message",
-                                serde_json::json!({
-                                    "role": "assistant",
-                                    "content": message,
-                                    "source": "telegram",
-                                }),
-                            );
-                            return Ok(());
-                        }
-                        return Err(error);
+                        let message =
+                            send_llm_failure_reply(&client, context.chat_id, &error).await?;
+                        agent.emit_conversation_event(
+                            "message",
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": message,
+                                "source": "telegram",
+                            }),
+                        );
+                        return Ok(());
                     }
                 };
             let response = telegram_turn_public_text(
@@ -708,6 +711,9 @@ async fn handle_telegram_runtime_command(
     };
 
     match command {
+        TelegramRuntimeCommand::Login(argument) => {
+            super::telegram_login::handle_login(client, incoming, argument.as_deref()).await?;
+        }
         TelegramRuntimeCommand::Start | TelegramRuntimeCommand::Help => {
             client
                 .send_message(incoming.chat_id, &telegram_help_text(settings))
@@ -758,7 +764,7 @@ async fn handle_telegram_runtime_command(
                 }
                 Err(error) => {
                     client
-                        .send_message(incoming.chat_id, &format!("Heartbeat failed: {error}"))
+                        .send_message(incoming.chat_id, llm_failure_reply(&error))
                         .await?;
                 }
             }
@@ -848,13 +854,8 @@ async fn handle_telegram_turn(
         Ok(result) => result,
         Err(error) => {
             let error = anyhow::Error::new(error);
-            if send_llm_limit_reply(client, chat_id, &error)
-                .await?
-                .is_some()
-            {
-                return Ok(());
-            }
-            return Err(error);
+            send_llm_failure_reply(client, chat_id, &error).await?;
+            return Ok(());
         }
     };
     let response = telegram_turn_public_text(result, result_metadata.as_ref());
@@ -964,10 +965,12 @@ fn spawn_telegram_actor_update_monitor(
             )
             .await;
             acknowledge_actor_update_batch(&mut processed_event_ids, &fresh_events, result.is_ok());
+            drop(_turn_lease);
             if let Err(error) = result {
                 // Leave the ids unacknowledged so a transient model,
                 // network, or Telegram failure before delivery can be retried.
                 tracing::warn!(error = %error, "actor update cortex turn failed");
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         }
     }))
@@ -1001,6 +1004,27 @@ async fn telegram_conversation_is_busy(
         || conversation_manager.is_debouncing(chat_id).await
 }
 
+fn background_failure_notices() -> &'static Mutex<HashMap<(i64, &'static str), Instant>> {
+    static NOTICES: OnceLock<Mutex<HashMap<(i64, &'static str), Instant>>> = OnceLock::new();
+    NOTICES.get_or_init(Default::default)
+}
+
+fn background_failure_notice_due(chat_id: i64, message: &'static str) -> bool {
+    let mut notices = background_failure_notices()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    notices.retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(300));
+    !notices.contains_key(&(chat_id, message))
+}
+
+fn remember_background_failure_notice(chat_id: i64, message: &'static str) {
+    background_failure_notices()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert((chat_id, message), Instant::now());
+}
+
 async fn process_telegram_actor_updates(
     client: &TelegramClient,
     agent: &Agent,
@@ -1029,11 +1053,9 @@ async fn process_telegram_actor_updates(
         Ok(result) => result,
         Err(error) => {
             let error = anyhow::Error::new(error);
-            if send_llm_limit_reply(client, chat_id, &error)
-                .await?
-                .is_some()
-            {
-                return Ok(());
+            if background_failure_notice_due(chat_id, llm_failure_reply(&error)) {
+                let message = send_llm_failure_reply(client, chat_id, &error).await?;
+                remember_background_failure_notice(chat_id, message);
             }
             return Err(error);
         }
@@ -1821,13 +1843,40 @@ mod tests {
         let err = anyhow::anyhow!("LLM streaming chat request failed")
             .context("Status: 402 Payment Required Body: {\"message\":\"Out of credits\"}");
         assert_eq!(
-            llm_limit_reply(&err),
+            lethe::interfaces::telegram::llm_limit_reply(&err),
             Some(lethe::interfaces::telegram::OUT_OF_CREDITS_MESSAGE)
         );
         assert_eq!(
-            llm_limit_reply(&anyhow::anyhow!("429 Too Many Requests")),
+            lethe::interfaces::telegram::llm_limit_reply(&anyhow::anyhow!("429 Too Many Requests")),
             Some(lethe::interfaces::telegram::USAGE_LIMIT_MESSAGE)
         );
+    }
+
+    #[test]
+    fn login_and_cancel_are_native_commands_even_when_the_model_is_unavailable() {
+        assert_eq!(
+            parse_telegram_runtime_command("/login@lethe_bot openai"),
+            Some(TelegramRuntimeCommand::Login(Some("openai".to_string())))
+        );
+        assert_eq!(
+            parse_telegram_runtime_command("/login cancel"),
+            Some(TelegramRuntimeCommand::Login(Some("cancel".to_string())))
+        );
+        assert_eq!(
+            parse_telegram_runtime_command("/login"),
+            Some(TelegramRuntimeCommand::Login(None))
+        );
+    }
+
+    #[test]
+    fn repeated_background_failures_notify_once_per_chat_and_failure_kind() {
+        assert!(background_failure_notice_due(8675309, "login"));
+        // Failed delivery leaves the notice eligible for the next attempt.
+        assert!(background_failure_notice_due(8675309, "login"));
+        remember_background_failure_notice(8675309, "login");
+        assert!(!background_failure_notice_due(8675309, "login"));
+        assert!(background_failure_notice_due(8675309, "network"));
+        assert!(background_failure_notice_due(8675310, "login"));
     }
 
     #[test]
@@ -1959,7 +2008,8 @@ mod tests {
 
         let status = telegram_status_text(&agent, &settings).await.unwrap();
 
-        assert!(status.contains("Status: ready"));
+        assert!(status.contains("Status: running"));
+        assert!(status.contains("OpenAI subscription:"));
         assert!(status.contains("Memory:"));
         assert!(status.contains("Model: openai/gpt-5"));
         assert!(status.contains("Heartbeat: enabled"));

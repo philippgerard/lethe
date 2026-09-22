@@ -1,8 +1,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -319,14 +319,17 @@ pub struct LlmRouter {
     client: Client,
     config: LlmRouterConfig,
     anthropic_oauth: Option<AnthropicOAuthClient>,
-    openai_oauth: Option<crate::llm::openai_oauth::OpenAiOAuthClient>,
+    openai_oauth: Arc<OnceLock<crate::llm::openai_oauth::OpenAiOAuthClient>>,
 }
 
 impl LlmRouter {
     pub fn new(config: LlmRouterConfig) -> Self {
         let client = build_client(&config);
         let anthropic_oauth = AnthropicOAuthClient::from_env();
-        let openai_oauth = crate::llm::openai_oauth::OpenAiOAuthClient::from_env();
+        let openai_oauth = Arc::new(OnceLock::new());
+        if let Some(oauth) = crate::llm::openai_oauth::OpenAiOAuthClient::from_env() {
+            let _ = openai_oauth.set(oauth);
+        }
         Self {
             client,
             config,
@@ -337,6 +340,16 @@ impl LlmRouter {
 
     pub fn config(&self) -> &LlmRouterConfig {
         &self.config
+    }
+
+    fn openai_oauth_client(&self) -> Option<crate::llm::openai_oauth::OpenAiOAuthClient> {
+        if self.openai_oauth.get().is_none() {
+            let oauth = crate::llm::openai_oauth::OpenAiOAuthClient::from_env()?;
+            let _ = self.openai_oauth.set(oauth);
+        }
+        // Retain the winning client across requests and router clones, including
+        // its concurrency gate and failure state after the first Telegram login.
+        self.openai_oauth.get().cloned()
     }
 
     pub async fn complete(&self, messages: Vec<LlmMessage>, use_aux: bool) -> Result<String> {
@@ -383,8 +396,8 @@ impl LlmRouter {
         }
         let use_aux = model != self.config.model.trim();
         let options = self.config.chat_options(model);
-        if let Some(oauth) = &self.openai_oauth
-            && should_use_openai_oauth(model, &self.config)
+        if should_use_openai_oauth(model, &self.config)
+            && let Some(oauth) = self.openai_oauth_client()
         {
             return oauth
                 .exec_chat_request_stream(model, request, &options, on_delta)
@@ -536,8 +549,8 @@ impl LlmRouter {
         let use_aux = model != self.config.model.trim();
 
         let options = self.config.chat_options(model);
-        if let Some(oauth) = &self.openai_oauth
-            && should_use_openai_oauth(model, &self.config)
+        if should_use_openai_oauth(model, &self.config)
+            && let Some(oauth) = self.openai_oauth_client()
         {
             return oauth
                 .exec_chat_request(model, request, &options)
