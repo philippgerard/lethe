@@ -1,5 +1,5 @@
-use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
-use crate::adapter::anthropic::parse_cache_creation_details;
+use crate::adapter::adapters::support::{MAX_CAPTURED_STREAM_BYTES, StreamerCapturedData, StreamerOptions};
+use crate::adapter::anthropic::{anthropic_replay_marker, parse_cache_creation_details};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::chat::{ChatOptionsSet, PromptTokensDetails, StopReason, ToolCall, Usage};
 use crate::webc::{Event, EventSourceStream};
@@ -19,6 +19,9 @@ pub struct AnthropicStreamer {
 
 	captured_data: StreamerCapturedData,
 	in_progress_block: InProgressBlock,
+	raw_blocks: Vec<Value>,
+	active_block_index: Option<usize>,
+	replay_bytes: usize,
 }
 
 enum InProgressBlock {
@@ -35,7 +38,38 @@ impl AnthropicStreamer {
 			options: StreamerOptions::new(model_iden, options_set),
 			captured_data: Default::default(),
 			in_progress_block: InProgressBlock::Text,
+			raw_blocks: Vec::new(),
+			active_block_index: None,
+			replay_bytes: 0,
 		}
+	}
+
+	fn record_replay_bytes(&mut self, bytes: usize) -> Result<()> {
+		let next = self.replay_bytes.checked_add(bytes).ok_or(Error::StreamLimitExceeded {
+			resource: "Anthropic assistant replay content",
+			limit: MAX_CAPTURED_STREAM_BYTES,
+		})?;
+		if next > MAX_CAPTURED_STREAM_BYTES {
+			return Err(Error::StreamLimitExceeded {
+				resource: "Anthropic assistant replay content",
+				limit: MAX_CAPTURED_STREAM_BYTES,
+			});
+		}
+		self.replay_bytes = next;
+		Ok(())
+	}
+
+	fn append_raw_field(&mut self, field: &str, fragment: &str) -> Result<()> {
+		self.record_replay_bytes(fragment.len())?;
+		if let Some(block) = self.active_block_index.and_then(|index| self.raw_blocks.get_mut(index))
+			&& let Some(object) = block.as_object_mut()
+		{
+			let entry = object.entry(field).or_insert_with(|| Value::String(String::new()));
+			if let Value::String(text) = entry {
+				text.push_str(fragment);
+			}
+		}
+		Ok(())
 	}
 }
 
@@ -70,11 +104,28 @@ impl futures::Stream for AnthropicStreamer {
 							continue;
 						}
 						"content_block_start" => {
+							if self.active_block_index.is_some() {
+								return Poll::Ready(Some(Err(Error::InvalidJsonResponseElement {
+									info: "Anthropic content block started before previous block closed",
+								})));
+							}
 							let mut data: Value =
 								serde_json::from_str(&message.data).map_err(|serde_error| Error::StreamParse {
 									model_iden: self.options.model_iden.clone(),
 									serde_error,
 								})?;
+							let index: usize = data.x_get("/index")?;
+							if index >= 512 {
+								return Poll::Ready(Some(Err(Error::StreamLimitExceeded {
+									resource: "Anthropic assistant content blocks",
+									limit: 512,
+								})));
+							}
+							let block: Value = data.x_get("/content_block")?;
+							self.record_replay_bytes(block.to_string().len())?;
+							self.raw_blocks.resize(index + 1, Value::Null);
+							self.raw_blocks[index] = block;
+							self.active_block_index = Some(index);
 
 							match data.x_get_str("/content_block/type") {
 								Ok("text") => self.in_progress_block = InProgressBlock::Text,
@@ -116,6 +167,25 @@ impl futures::Stream for AnthropicStreamer {
 									model_iden: self.options.model_iden.clone(),
 									serde_error,
 								})?;
+							let index: usize = data.x_get("/index")?;
+							if self.active_block_index != Some(index) {
+								return Poll::Ready(Some(Err(Error::InvalidJsonResponseElement {
+									info: "Anthropic content delta has invalid block index",
+								})));
+							}
+							match data.x_get_str("/delta/type")? {
+								"text_delta" => self.append_raw_field("text", data.x_get_str("/delta/text")?)?,
+								"thinking_delta" => {
+									self.append_raw_field("thinking", data.x_get_str("/delta/thinking")?)?
+								}
+								"signature_delta" => {
+									self.append_raw_field("signature", data.x_get_str("/delta/signature")?)?
+								}
+								"input_json_delta" => {
+									self.record_replay_bytes(data.x_get_str("/delta/partial_json")?.len())?
+								}
+								_ => {}
+							}
 
 							if matches!(self.in_progress_block, InProgressBlock::ToolUse { .. }) {
 								let partial_json_len = data.x_get_str("/delta/partial_json")?.len();
@@ -171,6 +241,14 @@ impl futures::Stream for AnthropicStreamer {
 							}
 						}
 						"content_block_stop" => {
+							let data: Value = serde_json::from_str(&message.data)?;
+							let index: usize = data.x_get("/index")?;
+							if self.active_block_index != Some(index) {
+								return Poll::Ready(Some(Err(Error::InvalidJsonResponseElement {
+									info: "Anthropic content block stop has invalid index",
+								})));
+							}
+							let block_index = self.active_block_index.take();
 							match std::mem::replace(&mut self.in_progress_block, InProgressBlock::Text) {
 								InProgressBlock::ToolUse { id, name, input } if self.options.capture_tool_calls => {
 									// ToolCallChunks were already emitted incrementally
@@ -181,6 +259,11 @@ impl futures::Stream for AnthropicStreamer {
 									} else {
 										serde_json::from_str(&input)?
 									};
+									if let Some(block) = block_index.and_then(|index| self.raw_blocks.get_mut(index))
+										&& let Some(object) = block.as_object_mut()
+									{
+										object.insert("input".to_string(), fn_arguments.clone());
+									}
 
 									let tc = ToolCall {
 										call_id: id,
@@ -200,6 +283,12 @@ impl futures::Stream for AnthropicStreamer {
 						}
 						// -- END MESSAGE
 						"message_stop" => {
+							if self.active_block_index.is_some() {
+								self.done = true;
+								return Poll::Ready(Some(Err(Error::InvalidJsonResponseElement {
+									info: "Anthropic message stopped with an open content block",
+								})));
+							}
 							// Ensure we do not poll the EventSource anymore on the next poll.
 							// NOTE: This way, the last MessageStop event is still sent,
 							//       but then, on the next poll, it will be stopped.
@@ -220,12 +309,20 @@ impl futures::Stream for AnthropicStreamer {
 								None
 							};
 
+							let mut captured_tool_calls = self.captured_data.take_tool_calls();
+							if let Some(calls) = captured_tool_calls.as_mut()
+								&& let Some(first) = calls.first_mut()
+								&& let Some(marker) =
+									anthropic_replay_marker(&self.options.model_iden.model_name, &self.raw_blocks)?
+							{
+								first.thought_signatures = Some(vec![marker]);
+							}
 							let inter_stream_end = InterStreamEnd {
 								captured_usage,
 								captured_stop_reason: self.captured_data.stop_reason.take().map(StopReason::from),
 								captured_text_content: self.captured_data.take_content(),
 								captured_reasoning_content: self.captured_data.take_reasoning_content(),
-								captured_tool_calls: self.captured_data.take_tool_calls(),
+								captured_tool_calls,
 								captured_thought_signatures: None,
 								captured_response_id: None,
 							};
@@ -234,6 +331,15 @@ impl futures::Stream for AnthropicStreamer {
 							return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));
 						}
 
+						"error" => {
+							self.done = true;
+							let body =
+								serde_json::from_str(&message.data).unwrap_or_else(|_| Value::String(message.data));
+							return Poll::Ready(Some(Err(Error::ChatResponse {
+								model_iden: self.options.model_iden.clone(),
+								body,
+							})));
+						}
 						"ping" => continue, // Loop to the next event
 						other => tracing::warn!("UNKNOWN MESSAGE TYPE: {other}"),
 					}
@@ -246,7 +352,12 @@ impl futures::Stream for AnthropicStreamer {
 						error: err,
 					})));
 				}
-				None => return Poll::Ready(None),
+				None => {
+					self.done = true;
+					return Poll::Ready(Some(Err(Error::Internal(
+						"Anthropic stream ended before message_stop".to_string(),
+					))));
+				}
 			}
 		}
 		Poll::Pending
@@ -338,5 +449,68 @@ impl AnthropicStreamer {
 			model_iden: self.options.model_iden.clone(),
 			serde_error,
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use futures::StreamExt;
+	use std::io::{Read, Write};
+	use std::net::TcpListener;
+
+	fn local_sse(body: &'static str) -> (EventSourceStream, std::thread::JoinHandle<()>) {
+		let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener should bind");
+		let address = listener.local_addr().expect("listener should have an address");
+		let server = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().expect("test client should connect");
+			let mut request = [0_u8; 4096];
+			let _ = socket.read(&mut request);
+			let headers = format!(
+				"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+				body.len()
+			);
+			socket.write_all(headers.as_bytes()).unwrap();
+			socket.write_all(body.as_bytes()).unwrap();
+		});
+		let client = reqwest::Client::builder().no_proxy().build().unwrap();
+		(
+			EventSourceStream::new(client.get(format!("http://{address}/messages"))),
+			server,
+		)
+	}
+
+	async fn stream_error(body: &'static str) -> Error {
+		let (inner, server) = local_sse(body);
+		let stream = AnthropicStreamer::new(
+			inner,
+			ModelIden::new(crate::adapter::AdapterKind::Anthropic, "claude-opus-5-5"),
+			ChatOptionsSet::default(),
+		);
+		let mut stream = Box::pin(stream);
+		assert!(matches!(stream.next().await, Some(Ok(InterStreamEvent::Start))));
+		let error = stream
+			.next()
+			.await
+			.expect("stream must report an error")
+			.expect_err("stream must not succeed");
+		server.join().expect("test server should exit");
+		error
+	}
+
+	#[tokio::test]
+	async fn provider_error_frame_fails_the_stream() {
+		let error =
+			stream_error("event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}\n\n").await;
+		assert!(matches!(error, Error::ChatResponse { .. }));
+	}
+
+	#[tokio::test]
+	async fn premature_eof_and_open_block_stop_fail_the_stream() {
+		let start = "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\n";
+		let eof_error = stream_error(start).await;
+		assert!(matches!(eof_error, Error::Internal(_)));
+		let stop_error = stream_error("event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}}\n\nevent: message_stop\ndata: {}\n\n").await;
+		assert!(matches!(stop_error, Error::InvalidJsonResponseElement { .. }));
 	}
 }

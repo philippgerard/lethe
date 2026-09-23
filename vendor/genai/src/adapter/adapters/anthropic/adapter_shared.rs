@@ -1,5 +1,4 @@
-use crate::Result;
-use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::adapters::support::{MAX_CAPTURED_STREAM_BYTES, get_api_key};
 use crate::adapter::anthropic::AnthropicAdapter;
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
@@ -9,6 +8,7 @@ use crate::chat::{
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::WebResponse;
+use crate::{Error, Result};
 use crate::{Headers, ModelIden};
 use serde_json::{Map, Value, json};
 use std::sync::OnceLock;
@@ -17,6 +17,147 @@ use tracing::warn;
 use value_ext::JsonValueExt;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(in crate::adapter::adapters) const ANTHROPIC_REPLAY_PREFIX: &str = "lethe:anthropic-content:v1:";
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Carry the exact assistant content on a tool call through genai and Lethe's
+/// existing `thought_signatures` field. Lethe strips the marker before
+/// history persistence because it may include hidden text and reasoning.
+pub(in crate::adapter::adapters) fn anthropic_replay_marker(
+	model_name: &str,
+	blocks: &[Value],
+) -> Result<Option<String>> {
+	let has_thinking = blocks.iter().any(|block| {
+		matches!(
+			block.get("type").and_then(Value::as_str),
+			Some("thinking" | "redacted_thinking")
+		)
+	});
+	let has_tool = blocks
+		.iter()
+		.any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+	if !has_thinking || !has_tool {
+		return Ok(None);
+	}
+	if blocks.len() > 512
+		|| blocks.iter().any(|block| match block.get("type").and_then(Value::as_str) {
+			Some("thinking") => {
+				!block.get("thinking").is_some_and(Value::is_string)
+					|| !block
+						.get("signature")
+						.and_then(Value::as_str)
+						.is_some_and(|sig| !sig.is_empty())
+			}
+			Some("redacted_thinking") => {
+				!block.get("data").and_then(Value::as_str).is_some_and(|data| !data.is_empty())
+			}
+			Some("text") => !block.get("text").is_some_and(Value::is_string),
+			Some("tool_use") => {
+				!block.get("id").is_some_and(Value::is_string)
+					|| !block.get("name").is_some_and(Value::is_string)
+					|| !block.get("input").is_some_and(Value::is_object)
+			}
+			_ => true,
+		}) {
+		return Err(Error::InvalidJsonResponseElement {
+			info: "invalid Anthropic signed tool content",
+		});
+	}
+	let encoded = serde_json::to_string(&json!({"model": model_name, "content": blocks}))?;
+	if encoded.len() > MAX_CAPTURED_STREAM_BYTES {
+		return Err(Error::StreamLimitExceeded {
+			resource: "Anthropic assistant replay content",
+			limit: MAX_CAPTURED_STREAM_BYTES,
+		});
+	}
+	Ok(Some(format!("{ANTHROPIC_REPLAY_PREFIX}{encoded}")))
+}
+
+fn replay_model_compatible(source: &str, target: &str) -> bool {
+	let source = source.strip_prefix("anthropic/").unwrap_or(source);
+	let target = target.strip_prefix("anthropic/").unwrap_or(target);
+	let earlier_opus_sonnet_haiku = source == "claude-opus-5"
+		|| source == "claude-sonnet-5"
+		|| source.starts_with("claude-opus-4-")
+		|| source.starts_with("claude-sonnet-4-")
+		|| source.starts_with("claude-haiku-4-");
+	source == target
+		|| (target == "claude-opus-5-5" && earlier_opus_sonnet_haiku)
+		|| (target == "claude-fable-5-1"
+			&& (earlier_opus_sonnet_haiku || source == "claude-opus-5-5" || source == "claude-fable-5"))
+}
+
+fn replay_anthropic_content(model_name: &str, parts: &[ContentPart]) -> Result<Option<Vec<Value>>> {
+	let invalid = || Error::InvalidJsonResponseElement {
+		info: "invalid Anthropic signed tool replay",
+	};
+	let expected_calls: Vec<_> = parts
+		.iter()
+		.filter_map(|part| match part {
+			ContentPart::ToolCall(call) => Some(call),
+			_ => None,
+		})
+		.collect();
+	let Some(encoded) = parts.iter().find_map(|part| match part {
+		ContentPart::ToolCall(call) => call
+			.thought_signatures
+			.as_ref()?
+			.iter()
+			.find_map(|value| value.strip_prefix(ANTHROPIC_REPLAY_PREFIX)),
+		_ => None,
+	}) else {
+		return Ok(None);
+	};
+	if encoded.len() > MAX_CAPTURED_STREAM_BYTES {
+		return Err(invalid());
+	}
+	let marker: Value = serde_json::from_str(encoded).map_err(|_| invalid())?;
+	let source = marker.get("model").and_then(Value::as_str).ok_or_else(invalid)?;
+	if !replay_model_compatible(source, model_name) {
+		// Anthropic drops unreadable cross-model thinking blocks. Keep the
+		// ordinary tool_use/result pair when switching to such a model.
+		return Ok(None);
+	}
+	let blocks = marker.get("content").and_then(Value::as_array).ok_or_else(invalid)?.clone();
+	if blocks.is_empty() || blocks.len() > 512 {
+		return Err(invalid());
+	}
+	let mut actual_calls = Vec::new();
+	for block in &blocks {
+		match block.get("type").and_then(Value::as_str) {
+			Some("thinking")
+				if block.get("thinking").is_some_and(Value::is_string)
+					&& block
+						.get("signature")
+						.and_then(Value::as_str)
+						.is_some_and(|sig| !sig.is_empty()) => {}
+			Some("redacted_thinking")
+				if block.get("data").and_then(Value::as_str).is_some_and(|data| !data.is_empty()) => {}
+			Some("text") if block.get("text").is_some_and(Value::is_string) => {}
+			Some("tool_use")
+				if block.get("name").is_some_and(Value::is_string)
+					&& block.get("input").is_some_and(Value::is_object) =>
+			{
+				actual_calls.push(block);
+			}
+			_ => return Err(invalid()),
+		}
+	}
+	let calls_match = actual_calls.len() == expected_calls.len()
+		&& actual_calls.iter().zip(expected_calls).all(|(raw, call)| {
+			raw.get("id").and_then(Value::as_str) == Some(call.call_id.as_str())
+				&& raw.get("name").and_then(Value::as_str) == Some(call.fn_name.as_str())
+				&& raw.get("input") == Some(&call.fn_arguments)
+		});
+	if !calls_match {
+		return Err(invalid());
+	}
+	Ok(Some(blocks))
+}
+
+fn uses_preserved_thinking(model_name: &str) -> bool {
+	model_name.starts_with("claude-opus-5-5") || model_name.starts_with("claude-fable-5-1")
+}
 
 // NOTE: For Anthropic, the max_tokens must be specified.
 //       To avoid surprises, the default value for genai is the maximum for a given model.
@@ -108,6 +249,7 @@ impl AnthropicAdapter {
 	/// - Will push the `ChatRequest.system` and system message to `AnthropicRequestParts.system`
 	pub(in crate::adapter::adapters) fn into_anthropic_request_parts(
 		chat_req: ChatRequest,
+		replay_model_name: Option<&str>,
 	) -> Result<AnthropicRequestParts> {
 		let mut messages: Vec<Value> = Vec::new();
 		// (content, cache_control)
@@ -122,8 +264,37 @@ impl AnthropicAdapter {
 			systems.push((system, None));
 		}
 
+		// Signed blocks from completed turns are deliberately omitted. Keep the
+		// unbroken run of signed tool replies after the latest ordinary user turn.
+		let last_user_turn = chat_req.messages.iter().rposition(|msg| {
+			msg.role == ChatRole::User
+				&& !msg
+					.content
+					.parts()
+					.iter()
+					.any(|part| matches!(part, ContentPart::ToolResponse(_)))
+		});
+		let replayable: Vec<bool> = chat_req
+			.messages
+			.iter()
+			.enumerate()
+			.map(|(index, msg)| {
+				msg.role == ChatRole::Assistant
+					&& last_user_turn.is_none_or(|user_index| index > user_index)
+					&& chat_req.messages.get(index + 1).is_some_and(|next| {
+						next.role == ChatRole::Tool
+							|| (next.role == ChatRole::User
+								&& next
+									.content
+									.parts()
+									.iter()
+									.any(|part| matches!(part, ContentPart::ToolResponse(_))))
+					})
+			})
+			.collect();
+
 		// -- Process the messages
-		for msg in chat_req.messages {
+		for (index, msg) in chat_req.messages.into_iter().enumerate() {
 			let cache_control = msg.options.and_then(|o| o.cache_control);
 
 			// Check TTL ordering constraint
@@ -236,6 +407,14 @@ impl AnthropicAdapter {
 
 				// Assistant can mix text and tool_use entries.
 				ChatRole::Assistant => {
+					if replayable[index] {
+						if let Some(name) = replay_model_name
+							&& let Some(values) = replay_anthropic_content(name, msg.content.parts())?
+						{
+							messages.push(json!({"role": "assistant", "content": values}));
+							continue;
+						}
+					}
 					let mut values: Vec<Value> = Vec::new();
 					let mut has_tool_use = false;
 					let mut has_text = false;
@@ -372,7 +551,7 @@ impl AnthropicAdapter {
 		let url = Self::get_service_url(&model, service_type, endpoint)?;
 
 		// -- headers
-		let headers = Headers::from(vec![
+		let mut headers = Headers::from(vec![
 			("x-api-key".to_string(), api_key),
 			("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
 		]);
@@ -382,7 +561,7 @@ impl AnthropicAdapter {
 			system,
 			messages,
 			tools,
-		} = Self::into_anthropic_request_parts(chat_req)?;
+		} = Self::into_anthropic_request_parts(chat_req, Some(&model.model_name))?;
 
 		// -- Extract Model Name and Reasoning
 		let (_, raw_model_name) = model.model_name.namespace_and_name();
@@ -415,6 +594,9 @@ impl AnthropicAdapter {
 			// If reasoning effort, turn the low, medium, budget ones into Budget
 			(model, Some(effort)) => (model, Some(effort.clone())),
 		};
+		if uses_preserved_thinking(model_name) {
+			headers.merge(("anthropic-beta", THINKING_BINDING_BETA));
+		}
 
 		// -- Build the basic payload
 		let stream = matches!(service_type, ServiceType::ChatStream);
@@ -442,6 +624,15 @@ impl AnthropicAdapter {
 
 		if let Some(computed_reasoning_effort) = computed_reasoning_effort {
 			insert_anthropic_reasoning(&mut payload, &mut output_config, model_name, &computed_reasoning_effort)?;
+		}
+		if uses_preserved_thinking(model_name) {
+			payload.x_insert(
+				"thinking",
+				json!({
+					"type": "adaptive",
+					"block_binding": {"prefix_mismatch_behavior": "drop_block"}
+				}),
+			)?;
 		}
 
 		if let Some(cache_control) = options_set.cache_control() {
@@ -514,6 +705,8 @@ impl AnthropicAdapter {
 		//       genai MessageContent::Text. This is more in line with the OpenAI API style,
 		//       but loses the fact that they were originally separate items.
 		let json_content_items: Vec<Value> = body.x_take("content")?;
+		let replay_marker = anthropic_replay_marker(&model_iden.model_name, &json_content_items)?;
+		let mut replay_marker = replay_marker;
 
 		let mut reasoning_content: Vec<String> = Vec::new();
 
@@ -534,7 +727,7 @@ impl AnthropicAdapter {
 						call_id,
 						fn_name,
 						fn_arguments,
-						thought_signatures: None,
+						thought_signatures: replay_marker.take().map(|marker| vec![marker]),
 					};
 
 					let part = ContentPart::ToolCall(tool_call);
@@ -682,10 +875,32 @@ const REASONING_HIGH: u32 = 24000;
 
 // NOTE: These are opt-ins for now and can become defaults once support is broader.
 // See effort doc: https://platform.claude.com/docs/en/build-with-claude/effort
-const SUPPORT_EFFORT_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"];
-const SUPPORT_REASONING_MAX_MODELS: &[&str] = &["claude-opus-4-6"];
+const SUPPORT_EFFORT_MODELS: &[&str] = &[
+	"claude-opus-4-6",
+	"claude-sonnet-4-6",
+	"claude-opus-4-5",
+	"claude-opus-5",
+	"claude-fable-5",
+	"claude-fable-5-1",
+	"claude-sonnet-5",
+];
+const SUPPORT_REASONING_MAX_MODELS: &[&str] = &[
+	"claude-opus-4-6",
+	"claude-opus-5",
+	"claude-fable-5",
+	"claude-fable-5-1",
+	"claude-sonnet-5",
+];
+const SUPPORT_XHIGH_MODELS: &[&str] = &["claude-opus-5", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-5"];
 // See adaptive thinking doc: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-const SUPPORT_ADAPTIVE_THINK_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6"];
+const SUPPORT_ADAPTIVE_THINK_MODELS: &[&str] = &[
+	"claude-opus-4-6",
+	"claude-sonnet-4-6",
+	"claude-opus-5",
+	"claude-fable-5",
+	"claude-fable-5-1",
+	"claude-sonnet-5",
+];
 
 fn has_model(model_prefixes: &[&str], model_name: &str) -> bool {
 	model_prefixes.iter().any(|prefix| model_name.contains(prefix))
@@ -701,7 +916,7 @@ fn insert_anthropic_reasoning(
 	let support_effort = supports_anthropic_effort(model_name);
 	let support_reasoning_max = supports_anthropic_reasoning_max(model_name);
 	let support_adaptive = supports_anthropic_adaptive_thinking(model_name);
-	let support_xhigh = is_opus_4_7_or_higher(model_name);
+	let support_xhigh = has_model(SUPPORT_XHIGH_MODELS, model_name) || is_opus_4_7_or_higher(model_name);
 
 	// Models that support effort use it as the primary reasoning control.
 	if support_effort {
@@ -917,8 +1132,9 @@ mod tests {
 	use super::*;
 	use crate::ServiceTarget;
 	use crate::adapter::{Adapter, ServiceType};
-	use crate::chat::{ChatOptions, ChatRequest, JsonSpec, Tool, ToolChoice};
+	use crate::chat::{ChatMessage, ChatOptions, ChatRequest, JsonSpec, Tool, ToolChoice, ToolResponse};
 	use crate::resolver::AuthData;
+	use crate::webc::WebResponse;
 
 	/// Regression guard: when both `reasoning_effort` and `JsonSpec` response format are set
 	/// on a model that uses the `output_config` effort API (e.g. `claude-sonnet-4-6`), both
@@ -987,6 +1203,161 @@ mod tests {
 
 		assert_eq!(web_req.payload["thinking"], json!({"type": "adaptive"}));
 		assert_eq!(web_req.payload["output_config"]["effort"], json!("medium"));
+	}
+
+	#[test]
+	fn test_latest_claude_models_use_adaptive_thinking_with_xhigh_effort() {
+		for model in [
+			"claude-opus-5-5",
+			"claude-opus-5",
+			"claude-fable-5-1",
+			"claude-fable-5",
+			"claude-sonnet-5",
+		] {
+			let chat_options = ChatOptions {
+				reasoning_effort: Some(ReasoningEffort::XHigh),
+				..Default::default()
+			};
+			let options_set = ChatOptionsSet::default().with_chat_options(Some(&chat_options));
+			let target = ServiceTarget {
+				endpoint: AnthropicAdapter::default_endpoint(),
+				auth: AuthData::from_single("test-key"),
+				model: ModelIden::new(AdapterKind::Anthropic, model),
+			};
+
+			let web_req = AnthropicAdapter::to_web_request_data(
+				target,
+				ServiceType::Chat,
+				ChatRequest::from_user("hello"),
+				options_set,
+			)
+			.expect("to_web_request_data should succeed");
+
+			let expected_thinking = if uses_preserved_thinking(model) {
+				json!({"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
+			} else {
+				json!({"type": "adaptive"})
+			};
+			assert_eq!(web_req.payload["thinking"], expected_thinking, "{model}");
+			assert_eq!(web_req.payload["output_config"]["effort"], json!("xhigh"), "{model}");
+		}
+	}
+
+	#[test]
+	fn test_signed_thinking_round_trips_through_tool_continuation() {
+		let model = "claude-fable-5-1";
+		let blocks = vec![
+			json!({"type": "thinking", "thinking": "first", "signature": "sig-1"}),
+			json!({"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"key": 1}}),
+			json!({"type": "redacted_thinking", "data": "redacted-1"}),
+			json!({"type": "thinking", "thinking": "second", "signature": "sig-2"}),
+			json!({"type": "text", "text": "Checking both."}),
+			json!({"type": "tool_use", "id": "call-2", "name": "lookup", "input": {"key": 2}}),
+		];
+		let response = AnthropicAdapter::build_chat_response(
+			ModelIden::new(AdapterKind::Anthropic, model),
+			WebResponse {
+				status: reqwest::StatusCode::OK,
+				body: json!({"content": blocks, "model": model}),
+			},
+		)
+		.expect("response parses");
+		let assistant = ChatMessage::assistant(response.content);
+		let request = ChatRequest::from_messages(vec![
+			ChatMessage::user("find both"),
+			assistant.clone(),
+			ChatMessage::tool(MessageContent::from_tool_responses(vec![
+				ToolResponse::new("call-1", "one"),
+				ToolResponse::new("call-2", "two"),
+			])),
+		]);
+		let target = ServiceTarget {
+			endpoint: AnthropicAdapter::default_endpoint(),
+			auth: AuthData::from_single("test-key"),
+			model: ModelIden::new(AdapterKind::Anthropic, model),
+		};
+		let web_req =
+			AnthropicAdapter::to_web_request_data(target, ServiceType::Chat, request, ChatOptionsSet::default())
+				.expect("continuation renders");
+		assert_eq!(web_req.payload["messages"][1]["content"], json!(blocks));
+		assert_eq!(
+			web_req.payload["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+			"drop_block"
+		);
+		assert!(
+			web_req
+				.headers
+				.iter()
+				.any(|(name, value)| name == "anthropic-beta" && value == THINKING_BINDING_BETA)
+		);
+
+		let old_turn = ChatRequest::from_messages(vec![
+			ChatMessage::user("find both"),
+			assistant,
+			ChatMessage::tool(MessageContent::from_tool_responses(vec![
+				ToolResponse::new("call-1", "one"),
+				ToolResponse::new("call-2", "two"),
+			])),
+			ChatMessage::user("new question"),
+		]);
+		let old_parts =
+			AnthropicAdapter::into_anthropic_request_parts(old_turn, Some(model)).expect("old turn renders");
+		assert!(
+			old_parts.messages[1]["content"]
+				.as_array()
+				.unwrap()
+				.iter()
+				.all(|block| block["type"] != "thinking" && block["type"] != "redacted_thinking")
+		);
+	}
+
+	#[test]
+	fn test_signed_thinking_replay_rejects_model_or_tool_mismatch() {
+		assert!(replay_model_compatible("claude-sonnet-5", "claude-opus-5-5"));
+		assert!(replay_model_compatible("claude-fable-5", "claude-fable-5-1"));
+		assert!(!replay_model_compatible("claude-fable-5-1", "claude-opus-5-5"));
+		assert!(
+			anthropic_replay_marker(
+				"claude-opus-5-5",
+				&[
+					json!({"type": "thinking", "thinking": "", "signature": ""}),
+					json!({"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}}),
+				]
+			)
+			.is_err()
+		);
+		let raw = vec![
+			json!({"type": "thinking", "thinking": "thought", "signature": "sig"}),
+			json!({"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"key": 1}}),
+		];
+		let marker = anthropic_replay_marker("claude-opus-5-5", &raw).unwrap().unwrap();
+		let call = ToolCall {
+			call_id: "call-1".into(),
+			fn_name: "lookup".into(),
+			fn_arguments: json!({"key": 1}),
+			thought_signatures: Some(vec![marker]),
+		};
+		assert!(
+			replay_anthropic_content("claude-sonnet-5", &[ContentPart::ToolCall(call.clone())])
+				.unwrap()
+				.is_none()
+		);
+		assert!(
+			replay_anthropic_content("claude-fable-5-1", &[ContentPart::ToolCall(call.clone())])
+				.unwrap()
+				.is_some()
+		);
+		let mut changed = call;
+		changed.fn_arguments = json!({"key": 2});
+		assert!(replay_anthropic_content("claude-opus-5-5", &[ContentPart::ToolCall(changed.clone())]).is_err());
+		let request = ChatRequest::from_messages(vec![
+			ChatMessage::user("lookup"),
+			ChatMessage::assistant(MessageContent::from_parts(vec![ContentPart::ToolCall(changed)])),
+			ChatMessage::tool(MessageContent::from_tool_responses(vec![ToolResponse::new(
+				"call-1", "one",
+			)])),
+		]);
+		assert!(AnthropicAdapter::into_anthropic_request_parts(request, Some("claude-opus-5-5")).is_err());
 	}
 
 	#[test]

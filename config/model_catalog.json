@@ -1,9 +1,14 @@
 {
-  "_updated": "2026-09-17",
+  "_updated": "2026-09-23",
   "_note": "Curated model catalog for /model and /aux commands. Only recent models (≤5mo), tool-capable, ≥100k ctx. First entry per list is the wizard default.",
   "openrouter": {
     "main": [
       ["Kimi K2.6", "openrouter/moonshotai/kimi-k2.6", "$0.60/$2.80"],
+      ["Claude Opus 5.5", "openrouter/anthropic/claude-opus-5.5", "$4/$20"],
+      ["Claude Opus 5", "openrouter/anthropic/claude-opus-5", "$5/$25"],
+      ["Claude Fable 5.1", "openrouter/anthropic/claude-fable-5.1", "$10/$50"],
+      ["Claude Fable 5", "openrouter/anthropic/claude-fable-5", "$10/$50"],
+      ["Claude Sonnet 5", "openrouter/anthropic/claude-sonnet-5", "$2/$10"],
       ["Claude Opus 4.7", "openrouter/anthropic/claude-opus-4.7", "$5/$25"],
       ["Claude Sonnet 4.6", "openrouter/anthropic/claude-sonnet-4.6", "$3/$15"],
       ["Gemini 3.1 Pro", "openrouter/google/gemini-3.1-pro-preview", "$2/$12"],
@@ -25,6 +30,11 @@
   },
   "anthropic": {
     "main": [
+      ["Claude Opus 5.5", "claude-opus-5-5", "$4/$20"],
+      ["Claude Opus 5", "claude-opus-5", "$5/$25"],
+      ["Claude Fable 5.1", "claude-fable-5-1", "$10/$50"],
+      ["Claude Fable 5", "claude-fable-5", "$10/$50"],
+      ["Claude Sonnet 5", "claude-sonnet-5", "$2/$10"],
       ["Claude Opus 4.8", "claude-opus-4-8", "$5/$25"],
       ["Claude Opus 4.7", "claude-opus-4-7", "$5/$25"],
       ["Claude Sonnet 4.6", "claude-sonnet-4-6", "$3/$15"],
@@ -33,6 +43,7 @@
     ],
     "aux": [
       ["Claude Haiku 4.5", "claude-haiku-4-5", "$1/$5"],
+      ["Claude Sonnet 5", "claude-sonnet-5", "$2/$10"],
       ["Claude Sonnet 4.6", "claude-sonnet-4-6", "$3/$15"]
     ]
   },
@@ -41,6 +52,8 @@
       ["GPT-5.5", "gpt-5.5", "$5/$30"],
       ["GPT-6 Astra", "gpt-6-astra", "$10/$50"],
       ["GPT-6 Astra (high reasoning)", "gpt-6-astra-high", "$10/$50"],
+      ["GPT-6 Sol", "gpt-6-sol", "$2/$10"],
+      ["GPT-6 Luna", "gpt-6-luna", "$0.10/$0.50"],
       ["GPT-5.5 Pro", "gpt-5.5-pro", "$30/$180"],
       ["GPT-5.4", "gpt-5.4", "$2.50/$15"],
       ["GPT-5.4 Pro", "gpt-5.4-pro", "$5/$30"],
@@ -49,6 +62,7 @@
     ],
     "aux": [
       ["GPT-5.4 Mini", "gpt-5.4-mini", "$0.75/$4.50"],
+      ["GPT-6 Luna", "gpt-6-luna", "$0.10/$0.50"],
       ["GPT-5.4 Nano", "gpt-5.4-nano", "$0.20/$1.25"],
       ["GPT-4.1 Nano", "gpt-4.1-nano", "$0.10/$0.40"]
     ]

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add Claude Opus 5/5.5, Fable 5/5.1, and Sonnet 5 to the model catalog, and
+  preserve signed thinking blocks through tool calls on the new models.
+- Add GPT-6 Sol and Luna to the OpenAI catalog and route GPT-6 agent turns
+  through Responses so reasoning and function tools work together. Recognize
+  the `gpt-6-terra` ID in routing for future availability; OpenAI does not
+  currently list it in its model catalog.
+
 ## 0.28.0 - Agent-id installs itself, browser CLI health probe
 
 - **Deep thinking supports GPT-6 Astra with high reasoning effort.** Configure

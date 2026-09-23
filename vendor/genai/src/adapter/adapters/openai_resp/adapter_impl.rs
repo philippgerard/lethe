@@ -1,4 +1,5 @@
 use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::anthropic::ANTHROPIC_REPLAY_PREFIX;
 use crate::adapter::openai::OpenAIAdapter;
 use crate::adapter::openai_resp::OpenAIRespStreamer;
 use crate::adapter::openai_resp::resp_types::RespResponse;
@@ -495,7 +496,9 @@ impl OpenAIRespAdapter {
 					// `ToolCall::thought_signatures` (rust-genai's streamer stashes
 					// captured blobs there when there are tool calls).
 					for part in msg.content.iter() {
-						if let ContentPart::ThoughtSignature(blob) = part {
+						if let ContentPart::ThoughtSignature(blob) = part
+							&& !blob.starts_with(ANTHROPIC_REPLAY_PREFIX)
+						{
 							input_items.push(json!({
 								"type": "reasoning",
 								"encrypted_content": blob,
@@ -507,7 +510,7 @@ impl OpenAIRespAdapter {
 						if let ContentPart::ToolCall(tool_call) = part
 							&& let Some(sigs) = tool_call.thought_signatures.as_ref()
 						{
-							for blob in sigs {
+							for blob in sigs.iter().filter(|blob| !blob.starts_with(ANTHROPIC_REPLAY_PREFIX)) {
 								input_items.push(json!({
 									"type": "reasoning",
 									"encrypted_content": blob,
@@ -669,7 +672,39 @@ struct OpenAIRespRequestParts {
 mod tests {
 	use super::*;
 	use crate::adapter::AdapterKind;
-	use crate::chat::{ChatMessage, ChatOptions, Tool, ToolChoice};
+	use crate::chat::{ChatMessage, ChatOptions, Tool, ToolCall, ToolChoice, ToolResponse};
+
+	#[test]
+	fn lethe_fork_anthropic_replay_marker_never_enters_openai_reasoning() {
+		let marker = format!("{ANTHROPIC_REPLAY_PREFIX}{{\"model\":\"claude-opus-5-5\"}}");
+		let request = ChatRequest::from_messages(vec![
+			ChatMessage::user("read"),
+			ChatMessage::assistant(MessageContent::from_parts(vec![
+				ContentPart::ThoughtSignature(marker.clone()),
+				ContentPart::ToolCall(ToolCall {
+					call_id: "call-1".into(),
+					fn_name: "read_file".into(),
+					fn_arguments: json!({"path": "a"}),
+					thought_signatures: Some(vec![marker, "openai-encrypted".into()]),
+				}),
+			])),
+			ChatMessage::tool(MessageContent::from_tool_responses(vec![ToolResponse::new(
+				"call-1", "one",
+			)])),
+		]);
+		let parts = OpenAIRespAdapter::into_openai_request_parts(
+			&ModelIden::new(AdapterKind::OpenAIResp, "gpt-6-sol"),
+			request,
+		)
+		.expect("OpenAI request renders");
+		assert!(!json!(parts.input_items).to_string().contains(ANTHROPIC_REPLAY_PREFIX));
+		assert!(
+			parts
+				.input_items
+				.iter()
+				.any(|item| item["encrypted_content"] == "openai-encrypted")
+		);
+	}
 
 	#[test]
 	fn test_extra_body_merged_into_response_payload() {

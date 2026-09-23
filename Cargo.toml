@@ -93,10 +93,8 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
-# Local fork of genai 0.6.5 carrying a single patch: per-message cache_control
-# forwarded through the OpenAI adapter, so prompt caching reaches Anthropic /
-# Gemini / Qwen via OpenRouter. Upstream only does request-level cache_control
-# (OpenAI's native prompt_cache_retention), which does not cover that route.
-# See vendor/genai/LETHE_FORK.md.
+# Local fork of genai 0.6.5. It forwards per-message cache_control through
+# OpenRouter and preserves Anthropic adaptive-thinking/tool-use contracts.
+# Keep the patch surface documented in vendor/genai/LETHE_FORK.md.
 [patch.crates-io]
 genai = { path = "vendor/genai" }
