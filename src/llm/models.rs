@@ -261,6 +261,55 @@ mod tests {
     }
 
     #[test]
+    fn latest_anthropic_and_openai_models_are_selectable_with_context_limits() {
+        let models = [
+            ("anthropic", "claude-opus-5-5", "Claude Opus 5.5"),
+            ("anthropic", "claude-opus-5", "Claude Opus 5"),
+            ("anthropic", "claude-fable-5-1", "Claude Fable 5.1"),
+            ("anthropic", "claude-fable-5", "Claude Fable 5"),
+            ("anthropic", "claude-sonnet-5", "Claude Sonnet 5"),
+            (
+                "openrouter",
+                "openrouter/anthropic/claude-opus-5.5",
+                "Claude Opus 5.5",
+            ),
+            (
+                "openrouter",
+                "openrouter/anthropic/claude-opus-5",
+                "Claude Opus 5",
+            ),
+            (
+                "openrouter",
+                "openrouter/anthropic/claude-fable-5.1",
+                "Claude Fable 5.1",
+            ),
+            (
+                "openrouter",
+                "openrouter/anthropic/claude-fable-5",
+                "Claude Fable 5",
+            ),
+            (
+                "openrouter",
+                "openrouter/anthropic/claude-sonnet-5",
+                "Claude Sonnet 5",
+            ),
+            ("openai", "gpt-6-sol", "GPT-6 Sol"),
+            ("openai", "gpt-6-luna", "GPT-6 Luna"),
+        ];
+
+        for (provider, id, name) in models {
+            assert!(
+                model_catalog()[provider]["main"]
+                    .iter()
+                    .any(|entry| entry.model_id() == id),
+                "{id} must be selectable for {provider}"
+            );
+            assert_eq!(model_display_name(id), name);
+            assert_eq!(context_limit_for_model(id), Some(128_000));
+        }
+    }
+
+    #[test]
     fn model_display_name_uses_catalog_and_falls_back_to_trimmed_id() {
         assert_eq!(model_display_name("claude-opus-4-8"), "Claude Opus 4.8");
         assert_eq!(
@@ -280,6 +329,8 @@ mod tests {
             context_limit_for_model("  openai/gpt-5.6-terra  "),
             Some(128_000)
         );
+        assert_eq!(context_limit_for_model("gpt-6-terra"), Some(128_000));
+        assert_eq!(context_limit_for_model("openai/gpt-6-terra"), Some(128_000));
     }
 
     #[test]

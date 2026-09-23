@@ -95,7 +95,7 @@ impl Adapter for OpenCodeGoAdapter {
 					system,
 					messages,
 					tools,
-				} = AnthropicAdapter::into_anthropic_request_parts(chat_req)?;
+				} = AnthropicAdapter::into_anthropic_request_parts(chat_req, None)?;
 
 				let stream = matches!(service_type, ServiceType::ChatStream);
 				let mut payload = json!({

@@ -67,6 +67,34 @@ Prompt-caching changes:
   declarations are removed — the `examples/` and `tests/` directories are not
   vendored, and the phantom targets break `cargo test` inside the fork.
 
+Model compatibility change:
+
+- `src/adapter/adapters/anthropic/adapter_shared.rs`: recognize Claude Opus 5,
+  Fable 5 and 5.1, and Sonnet 5 as adaptive-thinking models for explicit
+  reasoning effort, including `xhigh` and `max`, instead of sending the
+  rejected manual-thinking payload. Opus 5.5 uses the existing Opus version
+  check. `test_latest_claude_models_use_adaptive_thinking_with_xhigh_effort`
+  guards all five request shapes.
+
+Signed Anthropic tool continuation:
+
+- `src/adapter/adapters/anthropic/adapter_shared.rs` and `streamer.rs` retain
+  the ordered `thinking`, `redacted_thinking`, text, and tool-use blocks in a
+  bounded internal tool-call marker. Lethe strips that marker before storing
+  user-visible history metadata. The Anthropic adapter replays it only for
+  immediate pending tool results on a compatible model, after validating tool
+  IDs, names, and inputs. The streamer rejects provider error frames, open
+  content blocks at message stop, and premature EOF. Opus 5.5 and Fable 5.1
+  use Anthropic's documented prefix-mismatch `drop_block` control so dynamic tool lists do not reject
+  otherwise valid continuations.
+- `src/adapter/adapters/opencode_go/adapter_impl.rs` and
+  `src/adapter/adapters/vertex/adapter_impl.rs` pass `None` to the shared
+  formatter's replay-model argument, preventing the marker from reaching those
+  routes.
+- `src/adapter/adapters/openai_resp/adapter_impl.rs` filters the Anthropic
+  marker from OpenAI encrypted reasoning inputs after a model switch, while
+  retaining OpenAI's own encrypted reasoning blobs.
+
 Resource-bound changes:
 
 - `src/error.rs` and `src/webc/error.rs`: add explicit resource-limit and

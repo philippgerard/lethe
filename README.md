@@ -314,10 +314,10 @@ Lethe routes chat through `genai`. The runtime supports both API-key and subscri
 
 | Provider | Auth | Example `LLM_MODEL` |
 |----------|------|---------------------|
-| Anthropic (API key) | `ANTHROPIC_API_KEY` | `claude-opus-4-7` |
-| Anthropic (Claude Pro/Max) | `lethe login anthropic` → token file | `claude-opus-4-7` |
-| OpenAI (API key) | `OPENAI_API_KEY` | `gpt-5.5` |
-| OpenAI (ChatGPT Plus/Pro) | `lethe login openai` → token file | `gpt-5.5` |
+| Anthropic (API key) | `ANTHROPIC_API_KEY` | `claude-opus-5-5` |
+| Anthropic (Claude Pro/Max) | `lethe login anthropic` → token file | `claude-sonnet-5` |
+| OpenAI (API key) | `OPENAI_API_KEY` | `gpt-6-sol` |
+| OpenAI (ChatGPT Plus/Pro) | `lethe login openai` → token file | `gpt-6-sol` |
 | OpenRouter | `OPENROUTER_API_KEY` | `openrouter/moonshotai/kimi-k2.6` |
 | OpenCode Go | `OPENCODE_GO_API_KEY` | `opencode-go/kimi-k2.6` |
 | Local OpenAI-compatible | `LLM_API_BASE` + `OPENAI_API_KEY=local` | `openai/gemma-4-31B-it-Q8_0.gguf` |
@@ -329,6 +329,8 @@ Lethe routes chat through `genai`. The runtime supports both API-key and subscri
 Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX` (defaults to the main model) handles lightweight/background calls (summarizer, curator, heartbeat). Two optional tiers let a turn change models mid-flight: `LLM_MODEL_TOOL` is a stronger reasoner a turn switches to the moment a tool is used, and `LLM_MODEL_DEEP` is a powerful "deep thinking" model the agent **escalates to on demand** for hard tasks — by calling the `think_deeply` tool (self-recognition), automatically when a turn is visibly struggling, or for a subagent spawned on the `deep` tier. Both reset to `LLM_MODEL` on the next turn; deep escalation outranks the tool switch. The deep tier can also be changed at runtime via `POST /model` (`model_deep`) or Telegram `/deep <model-id>`; the tool tier is environment/config only.
 
 For [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) with high reasoning effort, set `LLM_MODEL_DEEP=gpt-6-astra-high` in the runtime environment, or use `/deep gpt-6-astra-high` over Telegram for the current process. This requires OpenAI authentication (an API key or ChatGPT login) and the native OpenAI endpoint. When keeping an Anthropic primary model, use `LLM_MODEL_DEEP=openai/gpt-6-astra-high` to select OpenAI explicitly. The `-high` suffix is Lethe's configuration shorthand: requests use `model: "gpt-6-astra"` and `reasoning: {"effort": "high"}` through the Responses API. Astra retains Lethe's 128k compaction budget.
+
+GPT-6 Sol and Luna use the Responses API for agent turns with function tools. Lethe also recognizes `gpt-6-terra` in its routing for when OpenAI makes that model ID available; it is not currently listed in the [OpenAI model catalog](https://developers.openai.com/api/docs/models). The current Anthropic catalog includes Claude Opus 5.5, Fable 5.1, and Sonnet 5.
 
 ### Subscription OAuth
 
@@ -365,7 +367,7 @@ Lethe stamps cache breakpoints on the system prompt — a 1h-TTL prefix (identit
 - **OpenRouter → Gemini / Qwen** — explicit breakpoints too, but 5min only: the 1h TTL is Anthropic-only.
 - **Everything else** — no explicit marker. OpenAI, Grok, Moonshot/Kimi, Groq, DeepSeek and Z.AI/GLM cache automatically, so a breakpoint buys nothing.
 
-See [OpenRouter's prompt-caching docs](https://openrouter.ai/docs/features/prompt-caching) for the per-vendor rules. Upstream `genai` only supports request-level `cache_control` (OpenAI's native `prompt_cache_retention`), which does not cover the OpenRouter route — forwarding it per-message is the one patch our vendored fork carries. See [`vendor/genai/LETHE_FORK.md`](vendor/genai/LETHE_FORK.md).
+See [OpenRouter's prompt-caching docs](https://openrouter.ai/docs/features/prompt-caching) for the per-vendor rules. Upstream `genai` only supports request-level `cache_control` (OpenAI's native `prompt_cache_retention`), which does not cover the OpenRouter route. The vendored fork forwards markers per message and handles Claude's signed thinking blocks in tool loops. See [`vendor/genai/LETHE_FORK.md`](vendor/genai/LETHE_FORK.md).
 
 ## Configuration
 

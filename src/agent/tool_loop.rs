@@ -1549,13 +1549,21 @@ pub(super) fn tool_calls_metadata(tool_calls: &[ToolCall]) -> Vec<Value> {
                 "fn_name": call.fn_name,
                 "fn_arguments": call.fn_arguments,
             });
-            // Carry thought_signatures (Gemini thinking) through history so
-            // multi-turn reasoning chains stay connected across persistence.
+            // Anthropic replay markers contain signed reasoning and may contain
+            // hidden assistant text. History metadata is user-visible, so keep
+            // those markers only in the active in-memory request. Other provider
+            // signatures still survive persistence.
             if let Some(signatures) = &call.thought_signatures
                 && !signatures.is_empty()
                 && let Some(map) = entry.as_object_mut()
             {
-                map.insert("thought_signatures".to_string(), json!(signatures));
+                let persistable: Vec<_> = signatures
+                    .iter()
+                    .filter(|signature| !signature.starts_with(crate::llm::ANTHROPIC_REPLAY_PREFIX))
+                    .collect();
+                if !persistable.is_empty() {
+                    map.insert("thought_signatures".to_string(), json!(persistable));
+                }
             }
             entry
         })
@@ -1878,6 +1886,36 @@ mod tests {
 
         assert!(recording.assistant_deltas.lock().unwrap().is_empty());
         assert_eq!(assistant_history_content(canary, &calls), "");
+    }
+
+    #[test]
+    fn anthropic_signed_replay_stays_out_of_user_visible_history_metadata() {
+        let canary = "GOAL — private internal task details";
+        let marker = format!(
+            "{}{{\"thinking\":\"{}\"}}",
+            crate::llm::ANTHROPIC_REPLAY_PREFIX,
+            canary
+        );
+        let calls = vec![ToolCall {
+            call_id: "call-1".to_string(),
+            fn_name: "read_file".to_string(),
+            fn_arguments: json!({"path": "a"}),
+            thought_signatures: Some(vec![marker, "gemini-signature".to_string()]),
+        }];
+
+        assert_eq!(assistant_history_content(canary, &calls), "");
+        let stored = json!({"tool_calls": tool_calls_metadata(&calls)});
+        assert!(!stored.to_string().contains(canary));
+        assert!(
+            !stored
+                .to_string()
+                .contains(crate::llm::ANTHROPIC_REPLAY_PREFIX)
+        );
+        assert_eq!(
+            stored["tool_calls"][0]["thought_signatures"],
+            json!(["gemini-signature"])
+        );
+        assert!(calls[0].thought_signatures.as_ref().unwrap()[0].contains(canary));
     }
 
     #[test]

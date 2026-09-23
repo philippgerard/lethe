@@ -39,6 +39,10 @@ const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/";
 const OPENCODE_GO_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/";
 pub(crate) const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+pub(crate) const ANTHROPIC_REPLAY_PREFIX: &str = "lethe:anthropic-content:v1:";
+const MAX_ANTHROPIC_REPLAY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ANTHROPIC_REPLAY_BLOCKS: usize = 512;
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 /// Keep ordinary burst throttles retryable without letting subscription-window
 /// limits pin a turn (and the shared request gate) for minutes or hours.
 const MAX_ANTHROPIC_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
@@ -288,6 +292,26 @@ fn is_gpt5_reasoning(model_name: &str) -> bool {
     name.starts_with("gpt-5") && !name.starts_with("gpt-5-chat")
 }
 
+fn is_gpt6_reasoning(model_name: &str) -> bool {
+    ["gpt-6-astra", "gpt-6-sol", "gpt-6-terra", "gpt-6-luna"]
+        .iter()
+        .any(|prefix| model_name.starts_with(prefix))
+}
+
+fn is_claude_without_sampling_params(model_name: &str) -> bool {
+    [
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-opus-5-5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-sonnet-5",
+    ]
+    .iter()
+    .any(|prefix| model_name.starts_with(prefix))
+}
+
 /// The o-series: `o1`, `o3-mini`, `o4-mini`, … but not `olive` or `o200k`.
 fn is_o_series(model_name: &str) -> bool {
     let bytes = model_name.trim().as_bytes();
@@ -297,21 +321,23 @@ fn is_o_series(model_name: &str) -> bool {
 
 /// Whether `model` rejects a non-default `temperature`/`top_p`.
 ///
-/// OpenAI's reasoning models accept only the default sampling params and 400 on
-/// anything else — on Chat Completions and the Responses API alike. This is why
-/// the option is dropped here rather than inside the genai adapter: silently
-/// swapping a caller's 0.7 for the default is the adapter lying about what it
-/// sent, and only the caller knows the request is headed somewhere that cannot
-/// honour it.
+/// OpenAI's reasoning models and recent Claude models reject non-default
+/// sampling params. Drop the option here because the caller knows whether
+/// the selected model can honour the configured value.
 ///
 /// Relayed ids (`openrouter/…`, `opencode-go/…`) are left alone: the relay
 /// normalizes params for the upstream model, and those routes are unaffected.
 fn rejects_sampling_params(model: &str) -> bool {
-    let name = strip_slash_provider(model.trim(), "openai");
+    let model = model.trim();
+    let claude_name = strip_slash_provider(model, "anthropic");
+    if !claude_name.contains('/') && is_claude_without_sampling_params(claude_name) {
+        return true;
+    }
+    let name = strip_slash_provider(model, "openai");
     if name.contains('/') {
         return false;
     }
-    is_gpt5_reasoning(name) || name.starts_with("gpt-6-astra") || is_o_series(name)
+    is_gpt5_reasoning(name) || is_gpt6_reasoning(name) || is_o_series(name)
 }
 
 #[derive(Clone)]
@@ -817,14 +843,14 @@ impl AnthropicOAuthClient {
                 .clone()
                 .ok_or_else(|| anyhow!("Anthropic OAuth access token is missing"))?
         };
-        let body = anthropic_request_body(model, request, options);
+        let body = anthropic_request_body(model, request, options)?;
         let request_log = json!({
             "auth": "anthropic_oauth",
             "endpoint": format!("{ANTHROPIC_MESSAGES_URL}?beta=true"),
             "model": model,
             "body": body.clone(),
         });
-        let headers = anthropic_oauth_headers(&access_token);
+        let headers = anthropic_oauth_headers(&access_token, model);
 
         let _permit = self
             .request_gate
@@ -955,11 +981,11 @@ impl AnthropicOAuthClient {
         // Same body as the non-streaming path, with stream:true. The API
         // returns SSE frames; everything else (system prompt cache, tools,
         // message merge) is unchanged.
-        let mut body = anthropic_request_body(model, request, options);
+        let mut body = anthropic_request_body(model, request, options)?;
         if let Some(obj) = body.as_object_mut() {
             obj.insert("stream".to_string(), json!(true));
         }
-        let mut headers = anthropic_oauth_headers(&access_token);
+        let mut headers = anthropic_oauth_headers(&access_token, model);
         headers.insert("accept", "text/event-stream".parse().unwrap());
 
         let _permit = self
@@ -1018,12 +1044,12 @@ impl AnthropicOAuthClient {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            state.apply(&payload, on_delta);
+            state.apply(&payload, on_delta)?;
             if state.done {
                 break;
             }
         }
-        Ok(state.into_response())
+        Ok(state.into_response()?)
     }
 
     async fn ensure_access(&self) -> Result<(), AnthropicOAuthError> {
@@ -1234,6 +1260,17 @@ fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<
         });
     }
 
+    // genai infers GPT-6 Sol/Luna as Chat Completions for bare ids. Pin the
+    // direct provider to Responses so reasoning and function tools work together.
+    if provider == "openai" && is_gpt6_reasoning(model) {
+        return Some(RouterTarget {
+            endpoint: OPENAI_ENDPOINT.to_string(),
+            auth_env: "OPENAI_API_KEY".to_string(),
+            adapter: AdapterKind::OpenAIResp,
+            model_name: model.to_string(),
+        });
+    }
+
     None
 }
 
@@ -1283,7 +1320,7 @@ pub(super) fn strip_slash_provider<'a>(model: &'a str, provider: &str) -> &'a st
 /// Adapter for `provider`, refined by the model where the protocol depends on
 /// it.
 ///
-/// OpenAI's GPT-5 reasoning family and GPT-6 Astra cannot combine function tools
+/// OpenAI's GPT-5 and GPT-6 reasoning models cannot combine function tools
 /// with reasoning on `/v1/chat/completions` — the API rejects the request and points
 /// at `/v1/responses`, which supports both. An agent request always carries
 /// tools, so those models go to the Responses adapter.
@@ -1295,7 +1332,7 @@ fn adapter_for(provider: &str, model_name: &str) -> Option<AdapterKind> {
     let adapter = adapter_for_provider(provider)?;
     if provider == "openai"
         && adapter == AdapterKind::OpenAI
-        && (is_gpt5_reasoning(model_name) || model_name.starts_with("gpt-6-astra"))
+        && (is_gpt5_reasoning(model_name) || is_gpt6_reasoning(model_name))
     {
         return Some(AdapterKind::OpenAIResp);
     }
@@ -1597,15 +1634,190 @@ fn truncate_error(text: &str) -> String {
     format!("{}...", &text[..MAX])
 }
 
-fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptions) -> Value {
+fn uses_preserved_thinking(model: &str) -> bool {
+    let model = normalize_anthropic_model(model);
+    model.starts_with("claude-opus-5-5") || model.starts_with("claude-fable-5-1")
+}
+
+fn anthropic_replay_marker(model: &str, blocks: &[Value]) -> Result<Option<String>> {
+    let has_thinking = blocks.iter().any(|block| {
+        matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+    });
+    let has_tool = blocks
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    if !has_thinking || !has_tool {
+        return Ok(None);
+    }
+    if blocks.len() > MAX_ANTHROPIC_REPLAY_BLOCKS
+        || blocks
+            .iter()
+            .any(|block| match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    !block.get("thinking").is_some_and(Value::is_string)
+                        || !block
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .is_some_and(|sig| !sig.is_empty())
+                }
+                Some("redacted_thinking") => !block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty()),
+                Some("text") => !block.get("text").is_some_and(Value::is_string),
+                Some("tool_use") => {
+                    !block.get("id").is_some_and(Value::is_string)
+                        || !block.get("name").is_some_and(Value::is_string)
+                        || !block.get("input").is_some_and(Value::is_object)
+                }
+                _ => true,
+            })
+    {
+        bail!("invalid Anthropic signed tool content");
+    }
+    let encoded = serde_json::to_string(&json!({
+        "model": normalize_anthropic_model(model),
+        "content": blocks,
+    }))?;
+    if encoded.len() > MAX_ANTHROPIC_REPLAY_BYTES {
+        bail!("Anthropic assistant replay content exceeds size limit");
+    }
+    Ok(Some(format!("{ANTHROPIC_REPLAY_PREFIX}{encoded}")))
+}
+
+fn replay_model_compatible(source: &str, target: &str) -> bool {
+    let source = normalize_anthropic_model(source);
+    let target = normalize_anthropic_model(target);
+    let earlier_opus_sonnet_haiku = source == "claude-opus-5"
+        || source == "claude-sonnet-5"
+        || source.starts_with("claude-opus-4-")
+        || source.starts_with("claude-sonnet-4-")
+        || source.starts_with("claude-haiku-4-");
+    source == target
+        || (target == "claude-opus-5-5" && earlier_opus_sonnet_haiku)
+        || (target == "claude-fable-5-1"
+            && (earlier_opus_sonnet_haiku
+                || source == "claude-opus-5-5"
+                || source == "claude-fable-5"))
+}
+
+fn replay_anthropic_content(model: &str, parts: &[ContentPart]) -> Result<Option<Vec<Value>>> {
+    let expected_calls: Vec<_> = parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall(call) => Some(call),
+            _ => None,
+        })
+        .collect();
+    let Some(encoded) = expected_calls.iter().find_map(|call| {
+        call.thought_signatures
+            .as_ref()?
+            .iter()
+            .find_map(|value| value.strip_prefix(ANTHROPIC_REPLAY_PREFIX))
+    }) else {
+        return Ok(None);
+    };
+    if encoded.len() > MAX_ANTHROPIC_REPLAY_BYTES {
+        bail!("Anthropic signed tool replay exceeds size limit");
+    }
+    let marker: Value =
+        serde_json::from_str(encoded).context("invalid Anthropic signed tool replay")?;
+    let source = marker
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("invalid Anthropic signed tool replay model"))?;
+    if !replay_model_compatible(source, model) {
+        // Anthropic drops unreadable thinking across incompatible model
+        // switches; continue with the ordinary tool_use/result pair.
+        return Ok(None);
+    }
+    let blocks = marker
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("invalid Anthropic signed tool replay content"))?
+        .clone();
+    if blocks.is_empty() || blocks.len() > MAX_ANTHROPIC_REPLAY_BLOCKS {
+        bail!("invalid Anthropic signed tool replay content");
+    }
+    let mut actual_calls = Vec::new();
+    for block in &blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("thinking")
+                if block.get("thinking").is_some_and(Value::is_string)
+                    && block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|sig| !sig.is_empty()) => {}
+            Some("redacted_thinking")
+                if block
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty()) => {}
+            Some("text") if block.get("text").is_some_and(Value::is_string) => {}
+            Some("tool_use")
+                if block.get("name").is_some_and(Value::is_string)
+                    && block.get("input").is_some_and(Value::is_object) =>
+            {
+                actual_calls.push(block);
+            }
+            _ => bail!("invalid Anthropic signed tool replay block"),
+        }
+    }
+    let calls_match = actual_calls.len() == expected_calls.len()
+        && actual_calls.iter().zip(expected_calls).all(|(raw, call)| {
+            raw.get("id").and_then(Value::as_str) == Some(call.call_id.as_str())
+                && raw.get("name").and_then(Value::as_str)
+                    == Some(map_tool_name_to_claude(&call.fn_name).as_str())
+                && raw.get("input") == Some(&call.fn_arguments)
+        });
+    if !calls_match {
+        bail!("Anthropic signed tool replay does not match current tool calls");
+    }
+    Ok(Some(blocks))
+}
+
+fn anthropic_request_body(
+    model: &str,
+    request: ChatRequest,
+    options: &ChatOptions,
+) -> Result<Value> {
     let max_tokens = options.max_tokens.unwrap_or(8000);
     let mut system_blocks: Vec<Value> = Vec::new();
     if let Some(system) = request.system.filter(|system| !system.trim().is_empty()) {
         system_blocks.push(json!({"type": "text", "text": system}));
     }
 
+    let last_user_turn = request.messages.iter().rposition(|message| {
+        message.role == ChatRole::User
+            && !message
+                .content
+                .parts()
+                .iter()
+                .any(|part| matches!(part, ContentPart::ToolResponse(_)))
+    });
+    let replayable: Vec<bool> = request
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            message.role == ChatRole::Assistant
+                && last_user_turn.is_none_or(|user_index| index > user_index)
+                && request.messages.get(index + 1).is_some_and(|next| {
+                    next.role == ChatRole::Tool
+                        || (next.role == ChatRole::User
+                            && next
+                                .content
+                                .parts()
+                                .iter()
+                                .any(|part| matches!(part, ContentPart::ToolResponse(_))))
+                })
+        })
+        .collect();
     let mut messages = Vec::new();
-    for message in request.messages {
+    for (index, message) in request.messages.into_iter().enumerate() {
         match message.role {
             ChatRole::System => {
                 // Stamp cache_control on the LAST emitted block for this
@@ -1635,7 +1847,8 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
                 "content": anthropic_user_content(message.content),
             })),
             ChatRole::Assistant => {
-                let content = anthropic_assistant_content(message.content);
+                let content =
+                    anthropic_assistant_content(model, message.content, replayable[index])?;
                 if !content.is_empty() {
                     messages.push(json!({"role": "assistant", "content": content}));
                 }
@@ -1692,13 +1905,20 @@ fn anthropic_request_body(model: &str, request: ChatRequest, options: &ChatOptio
         .map(anthropic_tool_schema)
         .collect();
 
-    json!({
+    let mut body = json!({
         "model": normalize_anthropic_model(model),
         "max_tokens": max_tokens,
         "system": system_blocks,
         "messages": messages,
         "tools": tools,
-    })
+    });
+    if uses_preserved_thinking(model) {
+        body["thinking"] = json!({
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        });
+    }
+    Ok(body)
 }
 
 /// Map genai's cache marker onto Anthropic's wire format for the hand-rolled
@@ -1784,7 +2004,14 @@ fn anthropic_user_content(content: MessageContent) -> Vec<Value> {
     blocks
 }
 
-fn anthropic_assistant_content(content: MessageContent) -> Vec<Value> {
+fn anthropic_assistant_content(
+    model: &str,
+    content: MessageContent,
+    allow_replay: bool,
+) -> Result<Vec<Value>> {
+    if allow_replay && let Some(blocks) = replay_anthropic_content(model, content.parts())? {
+        return Ok(blocks);
+    }
     let mut blocks = Vec::new();
     for part in content.into_parts() {
         match part {
@@ -1799,13 +2026,12 @@ fn anthropic_assistant_content(content: MessageContent) -> Vec<Value> {
                 "name": map_tool_name_to_claude(&call.fn_name),
                 "input": call.fn_arguments,
             })),
-            // Reasoning is dropped rather than replayed: Anthropic only accepts a
-            // thinking block back with its signature, and we don't carry those.
+            // Unsigned reasoning cannot be replayed to Anthropic.
             ContentPart::ThoughtSignature(_) | ContentPart::ReasoningContent(_) => {}
             ContentPart::Binary(_) | ContentPart::ToolResponse(_) | ContentPart::Custom(_) => {}
         }
     }
-    blocks
+    Ok(blocks)
 }
 
 fn anthropic_tool_result_content(content: MessageContent) -> Vec<Value> {
@@ -2026,6 +2252,9 @@ struct AnthropicStreamState {
     requested_model: String,
     provider_model: Option<String>,
     blocks: Vec<StreamBlock>,
+    raw_blocks: Vec<Value>,
+    active_block_index: Option<usize>,
+    replay_bytes: usize,
     usage: Usage,
     done: bool,
 }
@@ -2045,12 +2274,41 @@ impl AnthropicStreamState {
             requested_model: model.to_string(),
             provider_model: None,
             blocks: Vec::new(),
+            raw_blocks: Vec::new(),
+            active_block_index: None,
+            replay_bytes: 0,
             usage: Usage::default(),
             done: false,
         }
     }
 
-    fn apply(&mut self, payload: &Value, on_delta: DeltaCallback<'_>) {
+    fn record_replay_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.replay_bytes = self
+            .replay_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_ANTHROPIC_REPLAY_BYTES)
+            .ok_or_else(|| anyhow!("Anthropic assistant replay content exceeds size limit"))?;
+        Ok(())
+    }
+
+    fn append_raw_field(&mut self, index: usize, field: &str, fragment: &str) -> Result<()> {
+        self.record_replay_bytes(fragment.len())?;
+        if let Some(object) = self
+            .raw_blocks
+            .get_mut(index)
+            .and_then(Value::as_object_mut)
+        {
+            let entry = object
+                .entry(field)
+                .or_insert_with(|| Value::String(String::new()));
+            if let Value::String(text) = entry {
+                text.push_str(fragment);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply(&mut self, payload: &Value, on_delta: DeltaCallback<'_>) -> Result<()> {
         let event_type = payload
             .get("type")
             .and_then(Value::as_str)
@@ -2069,7 +2327,17 @@ impl AnthropicStreamState {
             }
             "content_block_start" => {
                 let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if self.active_block_index.is_some() {
+                    bail!("Anthropic content block started before prior block closed");
+                }
                 let block = payload.get("content_block").cloned().unwrap_or(Value::Null);
+                if index >= MAX_ANTHROPIC_REPLAY_BLOCKS {
+                    bail!("Anthropic assistant content has too many blocks");
+                }
+                self.record_replay_bytes(block.to_string().len())?;
+                self.raw_blocks.resize(index + 1, Value::Null);
+                self.raw_blocks[index] = block.clone();
+                self.active_block_index = Some(index);
                 let kind = block
                     .get("type")
                     .and_then(Value::as_str)
@@ -2112,6 +2380,12 @@ impl AnthropicStreamState {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if index >= MAX_ANTHROPIC_REPLAY_BLOCKS
+                    || index >= self.raw_blocks.len()
+                    || self.active_block_index != Some(index)
+                {
+                    bail!("Anthropic assistant content delta has invalid block index");
+                }
                 self.ensure_block(index);
                 match delta_type {
                     "text_delta" => {
@@ -2119,8 +2393,9 @@ impl AnthropicStreamState {
                             .get("text")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        self.append_raw_field(index, "text", text)?;
                         if text.is_empty() {
-                            return;
+                            return Ok(());
                         }
                         if let StreamBlock::Text(buffer) = &mut self.blocks[index] {
                             buffer.push_str(text);
@@ -2134,11 +2409,42 @@ impl AnthropicStreamState {
                             .get("partial_json")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
+                        self.record_replay_bytes(partial.len())?;
                         if let StreamBlock::Tool { json, .. } = &mut self.blocks[index] {
                             json.push_str(partial);
                         }
                     }
+                    "thinking_delta" => {
+                        if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                            self.append_raw_field(index, "thinking", thinking)?;
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                            self.append_raw_field(index, "signature", signature)?;
+                        }
+                    }
                     _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if self.active_block_index.take() != Some(index) {
+                    bail!("Anthropic content block stop has invalid index");
+                }
+                if let Some(StreamBlock::Tool { json, .. }) = self.blocks.get(index) {
+                    let input = if json.trim().is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(json).context("invalid Anthropic tool input")?
+                    };
+                    if let Some(object) = self
+                        .raw_blocks
+                        .get_mut(index)
+                        .and_then(Value::as_object_mut)
+                    {
+                        object.insert("input".to_string(), input);
+                    }
                 }
             }
             "message_delta" => {
@@ -2146,12 +2452,21 @@ impl AnthropicStreamState {
                     self.merge_usage(usage);
                 }
             }
-            "message_stop" => self.done = true,
+            "message_stop" => {
+                if self.active_block_index.is_some() {
+                    bail!("Anthropic message stopped with an open content block");
+                }
+                self.done = true;
+            }
             "error" => {
-                tracing::warn!(payload = %payload, "anthropic stream error frame");
+                bail!(
+                    "Anthropic stream error frame: {}",
+                    truncate_error(&payload.to_string())
+                );
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn ensure_block(&mut self, index: usize) {
@@ -2199,8 +2514,12 @@ impl AnthropicStreamState {
         self.usage.compact_details();
     }
 
-    fn into_response(self) -> ChatResponse {
+    fn into_response(self) -> Result<ChatResponse> {
+        if !self.done {
+            bail!("Anthropic stream ended before message_stop");
+        }
         let mut parts = Vec::new();
+        let mut replay_marker = anthropic_replay_marker(&self.requested_model, &self.raw_blocks)?;
         for block in self.blocks {
             match block {
                 StreamBlock::Text(text) => {
@@ -2218,14 +2537,14 @@ impl AnthropicStreamState {
                         call_id: id,
                         fn_name: name,
                         fn_arguments,
-                        thought_signatures: None,
+                        thought_signatures: replay_marker.take().map(|marker| vec![marker]),
                     }));
                 }
             }
         }
         let requested = normalize_anthropic_model(&self.requested_model);
         let provider = self.provider_model.unwrap_or_else(|| requested.clone());
-        ChatResponse {
+        Ok(ChatResponse {
             content: MessageContent::from_parts(parts),
             reasoning_content: None,
             model_iden: ModelIden::new(AdapterKind::Anthropic, requested),
@@ -2234,13 +2553,14 @@ impl AnthropicStreamState {
             response_id: None,
             usage: self.usage,
             captured_raw_body: None,
-        }
+        })
     }
 }
 
 fn anthropic_response_to_chat_response(data: Value, requested_model: &str) -> Result<ChatResponse> {
     let mut parts = Vec::new();
     if let Some(blocks) = data.get("content").and_then(Value::as_array) {
+        let mut replay_marker = anthropic_replay_marker(requested_model, blocks)?;
         for block in blocks {
             match block.get("type").and_then(Value::as_str).unwrap_or("") {
                 "text" => {
@@ -2266,7 +2586,7 @@ fn anthropic_response_to_chat_response(data: Value, requested_model: &str) -> Re
                         call_id,
                         fn_name,
                         fn_arguments,
-                        thought_signatures: None,
+                        thought_signatures: replay_marker.take().map(|marker| vec![marker]),
                     }));
                 }
                 _ => {}
@@ -2326,7 +2646,7 @@ fn anthropic_response_to_chat_response(data: Value, requested_model: &str) -> Re
     })
 }
 
-fn anthropic_oauth_headers(access_token: &str) -> HeaderMap {
+fn anthropic_oauth_headers(access_token: &str, model: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "application/json".parse().unwrap());
     headers.insert("accept", "application/json".parse().unwrap());
@@ -2354,12 +2674,13 @@ fn anthropic_oauth_headers(access_token: &str) -> HeaderMap {
     headers.insert("x-stainless-runtime-version", "v24.3.0".parse().unwrap());
     headers.insert("x-stainless-retry-count", "0".parse().unwrap());
     headers.insert("x-stainless-timeout", "600".parse().unwrap());
-    headers.insert(
-        "anthropic-beta",
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
-            .parse()
-            .unwrap(),
-    );
+    let mut betas =
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14".to_string();
+    if uses_preserved_thinking(model) {
+        betas.push(',');
+        betas.push_str(THINKING_BINDING_BETA);
+    }
+    headers.insert("anthropic-beta", betas.parse().unwrap());
     headers
 }
 
@@ -2855,7 +3176,8 @@ mod tests {
                 }]),
             ]),
             &ChatOptions::default(),
-        );
+        )
+        .unwrap();
         let messages = body["messages"].as_array().unwrap();
         let tool_result = messages
             .iter()
@@ -2867,13 +3189,254 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_signed_blocks_survive_active_tool_continuation() {
+        assert!(replay_model_compatible(
+            "claude-sonnet-5",
+            "claude-opus-5-5"
+        ));
+        assert!(replay_model_compatible(
+            "claude-fable-5",
+            "claude-fable-5-1"
+        ));
+        assert!(
+            anthropic_replay_marker(
+                "claude-fable-5-1",
+                &[
+                    json!({"type": "thinking", "thinking": "", "signature": ""}),
+                    json!({"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}),
+                ]
+            )
+            .is_err()
+        );
+        let model = "claude-fable-5-1";
+        let blocks = vec![
+            json!({"type": "thinking", "thinking": "first", "signature": "sig-1"}),
+            json!({"type": "tool_use", "id": "call-1", "name": "Read", "input": {"path": "a"}}),
+            json!({"type": "redacted_thinking", "data": "secret-1"}),
+            json!({"type": "thinking", "thinking": "second", "signature": "sig-2"}),
+            json!({"type": "text", "text": "Reading both."}),
+            json!({"type": "tool_use", "id": "call-2", "name": "Read", "input": {"path": "b"}}),
+        ];
+        let response =
+            anthropic_response_to_chat_response(json!({"model": model, "content": blocks}), model)
+                .unwrap();
+        let calls: Vec<HistoricalToolCall> = response
+            .content
+            .parts()
+            .iter()
+            .filter_map(|part| {
+                if let ContentPart::ToolCall(call) = part {
+                    Some(HistoricalToolCall {
+                        call_id: call.call_id.clone(),
+                        fn_name: call.fn_name.clone(),
+                        fn_arguments: call.fn_arguments.clone(),
+                        thought_signatures: call.thought_signatures.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let history = vec![
+            LlmMessage::user("read both"),
+            LlmMessage::assistant_with_tool_calls(response.first_text().unwrap_or_default(), calls),
+            LlmMessage::tool_results(vec![
+                HistoricalToolResponse {
+                    call_id: "call-1".into(),
+                    content: "one".into(),
+                    source_message_id: None,
+                },
+                HistoricalToolResponse {
+                    call_id: "call-2".into(),
+                    content: "two".into(),
+                    source_message_id: None,
+                },
+            ]),
+        ];
+        let active = history;
+        let body = anthropic_request_body(
+            model,
+            build_chat_request(active.clone()),
+            &ChatOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(body["messages"][1]["content"], json!(blocks));
+        assert_eq!(
+            body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            "drop_block"
+        );
+        assert!(
+            anthropic_oauth_headers("test", model)["anthropic-beta"]
+                .to_str()
+                .unwrap()
+                .contains(THINKING_BINDING_BETA)
+        );
+        assert!(!body.to_string().contains(ANTHROPIC_REPLAY_PREFIX));
+
+        let second_blocks = vec![
+            json!({"type": "thinking", "thinking": "third", "signature": "sig-3"}),
+            json!({"type": "tool_use", "id": "call-3", "name": "Read", "input": {"path": "c"}}),
+        ];
+        let second_marker = anthropic_replay_marker(model, &second_blocks)
+            .unwrap()
+            .unwrap();
+        let mut multi_call = active.clone();
+        multi_call.push(LlmMessage::assistant_with_tool_calls(
+            "",
+            vec![HistoricalToolCall {
+                call_id: "call-3".into(),
+                fn_name: "read_file".into(),
+                fn_arguments: json!({"path": "c"}),
+                thought_signatures: Some(vec![second_marker]),
+            }],
+        ));
+        multi_call.push(LlmMessage::tool_results(vec![HistoricalToolResponse {
+            call_id: "call-3".into(),
+            content: "three".into(),
+            source_message_id: None,
+        }]));
+        let multi_body = anthropic_request_body(
+            model,
+            build_chat_request(multi_call),
+            &ChatOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(multi_body["messages"][1]["content"], json!(blocks));
+        assert_eq!(multi_body["messages"][3]["content"], json!(second_blocks));
+
+        let switched = anthropic_request_body(
+            "claude-sonnet-5",
+            build_chat_request(active.clone()),
+            &ChatOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            switched["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "thinking" && block["type"] != "redacted_thinking")
+        );
+
+        let mut completed = active.clone();
+        completed.push(LlmMessage::user("next question"));
+        let completed_body = anthropic_request_body(
+            model,
+            build_chat_request(completed),
+            &ChatOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            completed_body["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "thinking" && block["type"] != "redacted_thinking")
+        );
+
+        let mut changed = active;
+        changed[1].tool_calls[0].fn_arguments = json!({"path": "tampered"});
+        assert!(
+            anthropic_request_body(model, build_chat_request(changed), &ChatOptions::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_preserves_interleaved_signed_blocks() {
+        let mut state = AnthropicStreamState::new("claude-opus-5-5");
+        let on_delta = |_: &str| {};
+        for frame in [
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "step"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig-1"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":\"a\"}"}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "content_block_start", "index": 2, "content_block": {"type": "redacted_thinking", "data": "opaque"}}),
+            json!({"type": "content_block_stop", "index": 2}),
+            json!({"type": "message_stop"}),
+        ] {
+            state.apply(&frame, &on_delta).unwrap();
+        }
+        let response = state.into_response().unwrap();
+        let call = response
+            .content
+            .parts()
+            .iter()
+            .find_map(|part| {
+                if let ContentPart::ToolCall(call) = part {
+                    Some(call.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let request = ChatRequest::from_messages(vec![
+            ChatMessage::user("read"),
+            ChatMessage::assistant(MessageContent::from_parts(vec![ContentPart::ToolCall(
+                call,
+            )])),
+            ChatMessage::tool(MessageContent::from_tool_responses(vec![
+                ToolResponse::new("call-1", "one"),
+            ])),
+        ]);
+        let compatible =
+            anthropic_request_body("claude-fable-5-1", request.clone(), &ChatOptions::default())
+                .unwrap();
+        let body =
+            anthropic_request_body("claude-opus-5-5", request, &ChatOptions::default()).unwrap();
+        assert_eq!(
+            compatible["messages"][1]["content"],
+            body["messages"][1]["content"]
+        );
+        assert_eq!(
+            body["messages"][1]["content"],
+            json!([
+                {"type": "thinking", "thinking": "step", "signature": "sig-1"},
+                {"type": "tool_use", "id": "call-1", "name": "Read", "input": {"path": "a"}},
+                {"type": "redacted_thinking", "data": "opaque"},
+            ])
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_rejects_error_frame_and_incomplete_tool_use() {
+        let mut state = AnthropicStreamState::new("claude-opus-5-5");
+        let on_delta = |_: &str| {};
+        state.apply(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}), &on_delta).unwrap();
+        state.apply(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}), &on_delta).unwrap();
+        state
+            .apply(
+                &json!({"type": "content_block_stop", "index": 0}),
+                &on_delta,
+            )
+            .unwrap();
+        state.apply(&json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}}), &on_delta).unwrap();
+        state.apply(&json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}), &on_delta).unwrap();
+        assert!(state.into_response().is_err());
+
+        let mut error_state = AnthropicStreamState::new("claude-opus-5-5");
+        assert!(
+            error_state
+                .apply(
+                    &json!({"type": "error", "error": {"message": "stopped"}}),
+                    &on_delta
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn anthropic_body_drops_leading_assistant_instead_of_inserting_continue() {
         let request = build_chat_request(vec![
             LlmMessage::assistant("orphaned prior assistant"),
             LlmMessage::user("real user message"),
         ]);
 
-        let body = anthropic_request_body("claude-opus-4-6", request, &ChatOptions::default());
+        let body =
+            anthropic_request_body("claude-opus-4-6", request, &ChatOptions::default()).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages[0]["role"], "user");
@@ -2905,7 +3468,8 @@ mod tests {
             LlmMessage::user("real user message"),
         ]);
 
-        let body = anthropic_request_body("claude-opus-4-6", request, &ChatOptions::default());
+        let body =
+            anthropic_request_body("claude-opus-4-6", request, &ChatOptions::default()).unwrap();
         let messages = body["messages"].as_array().unwrap();
 
         assert_eq!(messages.len(), 1);
@@ -2956,7 +3520,7 @@ mod tests {
 
     #[test]
     fn direct_openai_reasoning_models_route_to_the_responses_adapter() {
-        // gpt-5 reasoning models reject function tools on /v1/chat/completions
+        // Reasoning models reject function tools on /v1/chat/completions
         // and must go to /v1/responses, which supports tools + reasoning.
         for model in [
             "openai/gpt-5.6-terra",
@@ -2964,6 +3528,9 @@ mod tests {
             "openai/gpt-5.4-mini",
             "openai/gpt-6-astra",
             "openai/gpt-6-astra-high",
+            "openai/gpt-6-sol",
+            "openai/gpt-6-terra",
+            "openai/gpt-6-luna",
         ] {
             let config = config_for(model, "");
             let target = router_target_for_model(model, &config).unwrap();
@@ -2972,6 +3539,17 @@ mod tests {
                 AdapterKind::OpenAIResp,
                 "{model} must use the Responses API"
             );
+            assert_eq!(target.endpoint, OPENAI_ENDPOINT);
+        }
+    }
+
+    #[test]
+    fn bare_gpt6_tiers_use_the_openai_responses_adapter() {
+        for model in ["gpt-6-sol", "gpt-6-terra", "gpt-6-luna"] {
+            let config = config_for(model, "openai");
+            let target = router_target_for_model(model, &config).unwrap();
+            assert_eq!(target.adapter, AdapterKind::OpenAIResp);
+            assert_eq!(target.model_name, model);
             assert_eq!(target.endpoint, OPENAI_ENDPOINT);
         }
     }
@@ -3011,6 +3589,12 @@ mod tests {
             "gpt-6-astra",
             "gpt-6-astra-high",
             "openai/gpt-6-astra-high",
+            "gpt-6-sol",
+            "openai/gpt-6-sol",
+            "gpt-6-terra",
+            "openai/gpt-6-terra",
+            "gpt-6-luna",
+            "openai/gpt-6-luna",
             "o3-mini",
             "o1",
         ] {
@@ -3023,16 +3607,41 @@ mod tests {
     }
 
     #[test]
+    fn recent_direct_claude_models_drop_temperature() {
+        let config = config_for("claude-opus-5-5", "anthropic");
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "anthropic/claude-opus-5",
+            "claude-opus-5-5",
+            "anthropic/claude-opus-5-5",
+            "claude-fable-5",
+            "anthropic/claude-fable-5",
+            "claude-fable-5-1",
+            "anthropic/claude-fable-5-1",
+            "claude-sonnet-5",
+            "anthropic/claude-sonnet-5",
+        ] {
+            assert!(
+                config.chat_options(model).temperature.is_none(),
+                "{model} rejects a non-default temperature"
+            );
+        }
+    }
+
+    #[test]
     fn everything_else_keeps_its_temperature() {
         let config = config_for("claude-opus-4-8", "anthropic");
         for model in [
-            "claude-opus-4-8",
+            "claude-sonnet-4-6",
             "gpt-5-chat-latest",
             "gpt-4o",
             // Relayed ids are normalized by the relay, so they are left alone.
             "openrouter/openai/gpt-5.4",
             "openrouter/openai/gpt-6-astra-high",
             "openrouter/anthropic/claude-opus-4.7",
+            "openrouter/anthropic/claude-opus-5.5",
         ] {
             assert_eq!(
                 config.chat_options(model).temperature,
