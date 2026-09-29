@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Refresh compatible Rust dependencies across Lethe, the vendored provider
+  library, and the legacy migrator. FastEmbed moves to 5.17.4 with ONNX Runtime
+  bindings 2.0.0-rc.13; HTTP/TLS, compression, Unicode, and Arrow dependencies
+  receive maintenance updates. Keep existing major-version constraints and
+  the provider fork's behavior unchanged.
+- Refresh SHA-pinned release actions and upgrade the Linux mold linker to
+  2.42.1. Dependency audits still reject vulnerabilities, unsoundness, and
+  yanked crates; existing upstream unmaintained-crate warnings remain visible.
+
 - Add Claude Opus 5/5.5, Fable 5/5.1, and Sonnet 5 to the model catalog, and
   preserve signed thinking blocks through tool calls on the new models.
 - Add GPT-6 Sol and Luna to the OpenAI catalog and route GPT-6 agent turns
