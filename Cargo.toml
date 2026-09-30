@@ -37,6 +37,7 @@ genai = "0.6.5"
 glob = "0.3"
 hf-hub = { version = "0.5", optional = true }
 hkdf = "0.12"
+hmac = "0.12"
 kameo = "0.20"
 libc = "0.2"
 native-tls = { version = "0.2", optional = true }

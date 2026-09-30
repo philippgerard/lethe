@@ -139,6 +139,7 @@ pub struct ActorToolContext {
 pub struct ToolRuntime {
     pub telegram: Option<TelegramToolContext>,
     pub client: Option<ClientToolContext>,
+    pub actions: Option<crate::tools::actions::ActionToolContext>,
     pub actor: Option<ActorToolContext>,
     pub observer: Option<SharedTurnObserver>,
     /// Present only in hosted secure-prompt mode: lets the agent-id tools raise
@@ -168,6 +169,7 @@ impl std::fmt::Debug for ToolRuntime {
         f.debug_struct("ToolRuntime")
             .field("telegram", &self.telegram.is_some())
             .field("client", &self.client.is_some())
+            .field("actions", &self.actions.is_some())
             .field("actor", &self.actor.is_some())
             .field("observer", &self.observer.is_some())
             .field("secure_prompt", &self.secure_prompt.is_some())
@@ -418,6 +420,9 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_telegram,
         ToolCategory::TransportClient => has_client && !has_telegram,
+        // Decision tools are initially loaded by an attached trusted context.
+        // They are never discoverable from an unscoped shape alone.
+        ToolCategory::Actions => false,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
         ToolCategory::Mcp => crate::tools::mcp::is_configured(),
         ToolCategory::AgentId => {
@@ -437,6 +442,7 @@ pub fn requestable_tools_directory_for_shape(shape: ToolContextShape) -> String 
         ToolCategory::ActorSubagent => is_subagent,
         ToolCategory::Transport => has_telegram,
         ToolCategory::TransportClient => has_client && !has_telegram,
+        ToolCategory::Actions => false,
         ToolCategory::KnowledgeGraph => crate::tools::knowledge_graph::is_configured(),
         ToolCategory::Mcp => crate::tools::mcp::is_configured(),
         ToolCategory::AgentId | ToolCategory::AgentIdBrowser => false,

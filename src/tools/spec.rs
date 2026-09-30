@@ -27,6 +27,8 @@ pub enum ToolCategory {
     /// Initial when a client (web/desktop chat) transport context is attached
     /// and telegram is not. Transport-neutral chat egress.
     TransportClient,
+    /// Durable human decisions, available only on a trusted scoped transport.
+    Actions,
     /// Initial when the hosted knowledge-graph backend is configured
     /// (KG_API_BASE/KG_API_TOKEN); hidden entirely otherwise.
     KnowledgeGraph,

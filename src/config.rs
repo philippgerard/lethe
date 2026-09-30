@@ -160,6 +160,47 @@ pub struct ApiServerConfig {
     pub port: u16,
 }
 
+/// Linq iMessage ingress. Disabled until an explicit sender allowlist and
+/// webhook signing secret are configured. Never auto-bind to the first sender.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImessageConfig {
+    pub enabled: bool,
+    pub api_token: String,
+    pub webhook_secret: String,
+    pub allowed_senders: Vec<String>,
+    pub native_polls: bool,
+}
+
+impl std::fmt::Debug for ImessageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImessageConfig")
+            .field("enabled", &self.enabled)
+            .field("allowed_senders", &self.allowed_senders.len())
+            .field("native_polls", &self.native_polls)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ImessageConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.enabled
+            && (self.api_token.trim().is_empty()
+                || self.webhook_secret.trim().is_empty()
+                || self.allowed_senders.is_empty()
+                || self
+                    .allowed_senders
+                    .iter()
+                    .any(|sender| sender.trim().is_empty()))
+        {
+            return Err(
+                "iMessage requires LINQ_API_TOKEN, LINQ_WEBHOOK_SECRET, and LINQ_ALLOWED_SENDERS."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptionConfig {
     pub provider: String,
@@ -209,6 +250,8 @@ pub struct Settings {
     pub llm: LlmConfig,
     pub telegram: TelegramConfig,
     pub api: ApiServerConfig,
+    #[serde(default)]
+    pub imessage: ImessageConfig,
     pub transcription: TranscriptionConfig,
     pub background: BackgroundConfig,
     pub hosted_plugins: HostedPluginsConfig,
@@ -264,6 +307,18 @@ impl Settings {
                 token: env_string("LETHE_API_TOKEN", ""),
                 host: env_string("LETHE_API_HOST", "127.0.0.1"),
                 port: env_u16("LETHE_API_PORT", 1373),
+            },
+            imessage: ImessageConfig {
+                enabled: env_bool("LINQ_ENABLED", false),
+                api_token: env_string("LINQ_API_TOKEN", ""),
+                webhook_secret: env_string("LINQ_WEBHOOK_SECRET", ""),
+                allowed_senders: env_string("LINQ_ALLOWED_SENDERS", "")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                native_polls: env_bool("LINQ_NATIVE_POLLS", false),
             },
             llm: LlmConfig {
                 openrouter_api_key: env_string("OPENROUTER_API_KEY", ""),
@@ -433,6 +488,7 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
             host: "127.0.0.1".to_string(),
             port: 1373,
         },
+        imessage: ImessageConfig::default(),
         transcription: TranscriptionConfig {
             provider: String::new(),
             model: String::new(),
@@ -461,6 +517,36 @@ pub fn test_settings(root: &std::path::Path) -> Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imessage_requires_explicit_credentials_and_sender_binding_without_debug_leaks() {
+        assert!(ImessageConfig::default().validate().is_ok());
+        let mut config = ImessageConfig {
+            enabled: true,
+            ..ImessageConfig::default()
+        };
+        assert!(config.validate().is_err());
+        config.api_token = "private-linq-token".into();
+        config.webhook_secret = "private-webhook-secret".into();
+        assert!(config.validate().is_err());
+        config.allowed_senders = vec!["  ".into()];
+        assert!(config.validate().is_err());
+        config.allowed_senders = vec!["+15555550123".into()];
+        assert!(config.validate().is_ok());
+        let debug = format!("{config:?}");
+        assert!(!debug.contains(&config.api_token));
+        assert!(!debug.contains(&config.webhook_secret));
+        assert!(!debug.contains(&config.allowed_senders[0]));
+    }
+
+    #[test]
+    fn previous_settings_without_imessage_keep_the_transport_disabled() {
+        let settings = test_settings(std::path::Path::new("/tmp/lethe"));
+        let mut value = serde_json::to_value(settings).unwrap();
+        value.as_object_mut().unwrap().remove("imessage");
+        let restored: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.imessage, ImessageConfig::default());
+    }
 
     #[test]
     fn runtime_mode_defaults_to_cli_for_unknown_values() {
