@@ -265,6 +265,11 @@ lethe transport telegram --enable          # configure + enable the Telegram bot
 
 Under the hood a single `lethe api` process hosts the HTTP/SSE transport **and** the Telegram poller (when `TELEGRAM_BOT_TOKEN` is set) in the same address space, sharing one Agent, one actor registry, and one Brainstem (the sole source of heartbeats / proactive emissions — transports just subscribe and forward). API mode binds to `LETHE_API_HOST` (`127.0.0.1` by default) on `LETHE_API_PORT` (`1373`); use a reverse proxy for remote access.
 
+API mode also supports an opt-in Linq iMessage transport for allowlisted direct
+chats, scoped action approvals, and reviewed background notifications. See the
+[iMessage setup and limits](docs/imessage.md), including Hobby shared-line setup,
+text controls, and secure browser handoff.
+
 **Configure on the fly**
 
 ```bash
@@ -506,13 +511,16 @@ Override the dump directory with `LLM_DEBUG_DIR`.
 
 ## API
 
-`GET /health` is intentionally unauthenticated for readiness probes. Every
-other HTTP route and the browser WebSocket require
+`GET /health` is intentionally unauthenticated for readiness probes.
+`POST /webhooks/linq` verifies Linq's webhook signature instead of the Lethe API
+token. Every other HTTP route and the browser WebSocket require
 `Authorization: Bearer <LETHE_API_TOKEN>` or `x-lethe-token`.
 
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/health` | `GET` | Process readiness check; does not probe LLMs or external tools. |
+| `/webhooks/linq` | `POST` | Optional signed Linq ingress; publish only this route for iMessage webhooks. |
+| `/imessage/status` | `GET` | Authenticated Linq queue and delivery status; see [setup and limits](docs/imessage.md). |
 | `/chat` | `POST` | Send a user message and receive SSE response events. |
 | `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent (`message`, optional `chat_id`). |
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |

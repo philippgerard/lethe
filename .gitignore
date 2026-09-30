@@ -42,6 +42,10 @@ ideas.md
 questions.md
 epost/
 browser/
+!evals/browser/
+!evals/browser/**
+__pycache__/
+*.pyc
 thoughts/
 
 # Private data directories (never commit)

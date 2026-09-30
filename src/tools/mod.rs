@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod agent_id;
 pub mod filesystem;
 pub mod hosted_plugins;

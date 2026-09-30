@@ -2479,6 +2479,7 @@ dependencies = [
  "glob",
  "hf-hub",
  "hkdf",
+ "hmac 0.12.1",
  "kameo",
  "libc",
  "native-tls",

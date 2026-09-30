@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -414,21 +415,36 @@ fn cleanup_legacy_wake_derivatives(
 
 fn ensure_skills_bootstrap(skills_dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(skills_dir)?;
-    let readme = skills_dir.join("README.md");
-    if readme.exists() {
-        return Ok(());
-    }
-    fs::write(
-        readme,
-        "# Skills\n\n\
+    let defaults = [
+        (
+            "README.md",
+            "# Skills\n\n\
 This directory stores skill files with extended workflows and references.\n\
 This README is intentionally always present so skills are discoverable.\n\n\
 Use core tools to work with skills:\n\
 - list_directory(\"workspace/skills/\")\n\
 - read_file(\"workspace/skills/README.md\")\n\
 - read_file(\"workspace/skills/<name>.md\")\n\
-- grep_search(\"keyword\", path=\"workspace/skills/\")\n",
-    )
+- grep_search(\"keyword\", path=\"workspace/skills/\")\n\n\
+Bundled workflow: browser-workflows.md covers verified browser tasks and human handoff.\n",
+        ),
+        (
+            "browser-workflows.md",
+            include_str!("../../config/skills/browser-workflows.md"),
+        ),
+    ];
+    for (name, content) in defaults {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(skills_dir.join(name))
+        {
+            Ok(mut file) => file.write_all(content.as_bytes())?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn format_block(block: &MemoryBlock) -> String {
@@ -600,6 +616,12 @@ mod tests {
         let (tmp, store) = store();
 
         assert!(store.workspace_dir().join("skills/README.md").exists());
+        assert!(
+            store
+                .workspace_dir()
+                .join("skills/browser-workflows.md")
+                .exists()
+        );
         assert!(store.workspace_dir().join("projects").exists());
         let labels = store
             .blocks
@@ -622,6 +644,32 @@ mod tests {
         assert_eq!(stats.notes, 1);
         assert_eq!(stats.total_messages, 0);
         drop(tmp);
+    }
+
+    #[test]
+    fn skills_bootstrap_adds_workflow_to_existing_directory_without_overwriting() {
+        let tmp = tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        fs::create_dir(&skills).unwrap();
+        fs::write(skills.join("README.md"), "My skill index").unwrap();
+
+        ensure_skills_bootstrap(&skills).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(skills.join("README.md")).unwrap(),
+            "My skill index"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("browser-workflows.md")).unwrap(),
+            include_str!("../../config/skills/browser-workflows.md")
+        );
+
+        fs::write(skills.join("browser-workflows.md"), "My browser workflow").unwrap();
+        ensure_skills_bootstrap(&skills).unwrap();
+        assert_eq!(
+            fs::read_to_string(skills.join("browser-workflows.md")).unwrap(),
+            "My browser workflow"
+        );
     }
 
     #[test]

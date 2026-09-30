@@ -39,6 +39,13 @@ use crate::{
 
 pub(crate) async fn api_command(port: Option<u16>) -> Result<()> {
     let settings = Settings::from_env();
+    settings
+        .imessage
+        .validate()
+        .map_err(|error| anyhow!(error))?;
+    if settings.imessage.enabled && !settings.api.enabled {
+        anyhow::bail!("LINQ_ENABLED requires API_ENABLED=true for webhook ingress");
+    }
     if let Err(message) = settings.llm.ensure_ready() {
         anyhow::bail!(message);
     }

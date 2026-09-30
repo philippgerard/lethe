@@ -2,7 +2,9 @@ use genai::chat::Tool;
 
 use crate::tools::hosted_plugins::RemoteToolExposure;
 use crate::tools::spec::{ToolCategory, ToolDef};
-use crate::tools::{agent_id, filesystem, image, knowledge_graph, mcp, research, shell, web};
+use crate::tools::{
+    actions, agent_id, filesystem, image, knowledge_graph, mcp, research, shell, web,
+};
 
 use super::ToolRegistry;
 use super::{actor_specs, builtin_specs, telegram_specs};
@@ -21,6 +23,7 @@ pub fn all_defs() -> impl Iterator<Item = &'static ToolDef> {
         .chain(knowledge_graph::TOOL_DEFS.iter())
         .chain(mcp::TOOL_DEFS.iter())
         .chain(agent_id::TOOL_DEFS.iter())
+        .chain(actions::TOOL_DEFS.iter())
 }
 
 pub fn find_def(name: &str) -> Option<&'static ToolDef> {
@@ -62,6 +65,7 @@ impl<'a> ToolRegistry<'a> {
         match def.category {
             ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
             ToolCategory::Actor => self.runtime.actor.is_some(),
+            ToolCategory::Actions => self.runtime.actions.is_some(),
             ToolCategory::ActorSubagent => self
                 .runtime
                 .actor
@@ -91,6 +95,7 @@ impl<'a> ToolRegistry<'a> {
     pub(super) fn def_is_initial(&self, def: &ToolDef) -> bool {
         match def.category {
             ToolCategory::Initial => true,
+            ToolCategory::Actions => self.runtime.actions.is_some(),
             ToolCategory::Requestable => false,
             ToolCategory::CortexOnly => !self.is_subagent_context(),
             // Actor-orchestration tools stay discoverable (def_is_visible) but

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use async_stream::stream;
-use axum::extract::{Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -69,6 +70,7 @@ pub struct ApiState {
     /// when `LETHE_SECURE_PROMPT=hosted`; drives the `/secure-input*` routes and
     /// is handed to the agent-id tools per turn.
     secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
+    imessage: Option<Arc<crate::interfaces::imessage::ImessageTransport>>,
 }
 
 #[derive(Debug, Default)]
@@ -186,6 +188,7 @@ impl ApiState {
             brainstem: None,
             stream_tx,
             secure_prompt,
+            imessage: None,
         }
     }
 
@@ -556,6 +559,13 @@ pub fn router(state: ApiState) -> Router {
         .route("/secure-input", post(secure_input_submit))
         .route("/secure-input/cancel", post(secure_input_cancel))
         .route("/secure-input/pending", get(secure_input_pending))
+        .route(
+            "/webhooks/linq",
+            post(linq_webhook).layer(DefaultBodyLimit::max(
+                crate::interfaces::linq::LINQ_WEBHOOK_BODY_LIMIT,
+            )),
+        )
+        .route("/imessage/status", get(imessage_status))
         .with_state(state)
 }
 
@@ -565,6 +575,58 @@ pub async fn serve(settings: Settings, port: u16) -> Result<()> {
     // passes its own handle so both transports share one Brainstem.
     let brainstem = BrainstemHandle::new();
     serve_with_agent(settings, port, None, brainstem).await
+}
+
+/// This route is authenticated by the provider's signature, not the API bearer
+/// token. Publish/forward only this path when the main API is private.
+async fn linq_webhook(State(state): State<ApiState>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(transport) = state.imessage.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let event = match crate::interfaces::linq::verify_webhook(
+        transport.signing_secret(),
+        &headers,
+        &body,
+        chrono::Utc::now().timestamp(),
+    ) {
+        Ok(event) => event,
+        Err(crate::interfaces::linq::LinqError::InvalidSignature) => {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if matches!(&event, crate::interfaces::linq::WebhookEvent::Message(message) if message.text.len() > 32 * 1024)
+    {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    match transport.accept(event) {
+        Ok(accepted) => (
+            if accepted {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            },
+            Json(json!({"accepted": accepted})),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(error = %error, "Linq webhook could not be persisted");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
+}
+
+async fn imessage_status(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_auth(&state, &headers) {
+        return response;
+    }
+    match state.imessage.as_ref() {
+        None => Json(json!({"enabled": false})).into_response(),
+        Some(transport) => match transport.status() {
+            Ok(status) => Json(status).into_response(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+    }
 }
 
 /// Run the API server with optional shared agent + shared Brainstem.
@@ -580,11 +642,27 @@ pub async fn serve_with_agent(
         bail!("LETHE_API_TOKEN must be set in API mode");
     }
 
-    let state = match agent {
+    let mut state = match agent {
         Some(agent) => ApiState::with_shared_agent(settings.clone(), agent),
         None => ApiState::from_settings(settings.clone())?,
     }
     .with_brainstem(brainstem);
+    let _imessage_tasks = if settings.imessage.enabled {
+        let state_dir = settings.paths.lethe_home.join("data/transports");
+        let transport = Arc::new(crate::interfaces::imessage::ImessageTransport::new(
+            settings.imessage.clone(),
+            &state_dir,
+        )?);
+        let tasks = transport.start(
+            state.agent.clone(),
+            state.secure_prompt.clone(),
+            state.brainstem.clone(),
+        )?;
+        state.imessage = Some(transport);
+        Some(tasks)
+    } else {
+        None
+    };
     if let Err(error) = state.install_actor_broadcaster().await {
         tracing::warn!(error = %error, "actor broadcaster not installed");
     }
@@ -2224,6 +2302,9 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::HeaderValue;
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
     use tempfile::tempdir;
     use tokio::sync::Notify;
     use tokio::time::{sleep, timeout};
@@ -2258,6 +2339,241 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    const LINQ_TEST_SECRET: &str = "whsec_dGVzdC1zaWduaW5nLWtleQ==";
+    const LINQ_TEST_SENDER: &str = "+491234567890";
+
+    struct LinqRouteFixture {
+        _directory: tempfile::TempDir,
+        state: ApiState,
+        base: String,
+        client: reqwest::Client,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl LinqRouteFixture {
+        async fn new() -> Self {
+            let directory = tempdir().unwrap();
+            let mut settings = test_settings(directory.path());
+            settings.background.actors_enabled = false;
+            settings.background.hippocampus_enabled = false;
+            settings.background.curator_enabled = false;
+            settings.background.heartbeat_enabled = false;
+            let mut state = ApiState::from_settings(settings).unwrap();
+            state.imessage = Some(Arc::new(
+                crate::interfaces::imessage::ImessageTransport::new(
+                    crate::config::ImessageConfig {
+                        enabled: true,
+                        api_token: "test-api-token".into(),
+                        webhook_secret: LINQ_TEST_SECRET.into(),
+                        allowed_senders: vec![LINQ_TEST_SENDER.into()],
+                        native_polls: false,
+                    },
+                    &directory.path().join("linq"),
+                )
+                .unwrap(),
+            ));
+            // Serve only the HTTP router. Do not start model turns, transport
+            // workers, the Brainstem, or any request to the Linq provider.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let routes = router(state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, routes).await.unwrap();
+            });
+            Self {
+                _directory: directory,
+                state,
+                base,
+                client: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .pool_max_idle_per_host(0)
+                    .build()
+                    .unwrap(),
+                server,
+            }
+        }
+
+        async fn post(&self, body: Vec<u8>, headers: HeaderMap) -> reqwest::Response {
+            self.client
+                .post(format!("{}/webhooks/linq", self.base))
+                .headers(headers)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+
+        fn assert_queued_without_processing(&self, expected: i64) {
+            let status = self.state.imessage.as_ref().unwrap().status().unwrap();
+            assert_eq!(status["queued_inputs"], expected);
+            assert_eq!(status["interrupted_inputs"], 0);
+            assert_eq!(status["queued_outputs"], 0);
+            assert_eq!(status["provider_accepted_outputs"], 0);
+        }
+    }
+
+    impl Drop for LinqRouteFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn linq_test_payload() -> Value {
+        json!({
+            "api_version": "v3",
+            "webhook_version": crate::interfaces::linq::LINQ_WEBHOOK_VERSION,
+            "event_type": "message.received",
+            "event_id": "api-route-message",
+            "data": {
+                "id": "550e8400-e29b-41d4-a716-446655440001",
+                "chat": {"id": "550e8400-e29b-41d4-a716-446655440000", "is_group": false},
+                "direction": "inbound",
+                "sender_handle": {"handle": LINQ_TEST_SENDER, "is_me": false, "status": "active"},
+                "service": "iMessage",
+                "parts": [{"type": "text", "value": "Describe the task, without executing it"}],
+            },
+        })
+    }
+
+    fn linq_signed_headers(body: &[u8], timestamp: i64) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("webhook-id", "api-route-delivery".parse().unwrap());
+        headers.insert("webhook-timestamp", timestamp.to_string().parse().unwrap());
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"test-signing-key").unwrap();
+        mac.update(format!("api-route-delivery.{timestamp}.").as_bytes());
+        mac.update(body);
+        headers.insert(
+            "webhook-signature",
+            format!("v1,{}", STANDARD.encode(mac.finalize().into_bytes()))
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn linq_signed_ingress_is_public_but_status_and_chat_require_api_auth() {
+        let fixture = LinqRouteFixture::new().await;
+        let body = serde_json::to_vec_pretty(&linq_test_payload()).unwrap();
+        let signature = linq_signed_headers(&body, chrono::Utc::now().timestamp());
+        let response = fixture.post(body.clone(), signature.clone()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.json::<Value>().await.unwrap()["accepted"], true);
+        fixture.assert_queued_without_processing(1);
+
+        let response = fixture
+            .client
+            .get(format!("{}/imessage/status", fixture.base))
+            .headers(signature.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = fixture
+            .client
+            .post(format!("{}/chat", fixture.base))
+            .headers(signature)
+            .json(&json!({"message": "Do not execute this unauthenticated request"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = fixture
+            .client
+            .get(format!("{}/imessage/status", fixture.base))
+            .bearer_auth("secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.json::<Value>().await.unwrap();
+        assert_eq!(status["queued_inputs"], 1);
+        assert!(!status.to_string().contains("test-api-token"));
+        assert!(!status.to_string().contains(LINQ_TEST_SECRET));
+
+        // Possessing the API bearer token cannot substitute for provider
+        // signature verification on the public webhook route.
+        let response = fixture.post(body, authenticated_headers()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        fixture.assert_queued_without_processing(1);
+    }
+
+    #[tokio::test]
+    async fn linq_route_drops_untrusted_senders_groups_and_duplicate_events() {
+        let fixture = LinqRouteFixture::new().await;
+        for group in [false, true] {
+            let mut payload = linq_test_payload();
+            if group {
+                payload["data"]["chat"]["is_group"] = json!(true);
+            } else {
+                payload["data"]["sender_handle"]["handle"] = json!("+499999999999");
+            }
+            let body = serde_json::to_vec(&payload).unwrap();
+            let headers = linq_signed_headers(&body, chrono::Utc::now().timestamp());
+            let response = fixture.post(body, headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<Value>().await.unwrap()["accepted"], false);
+            fixture.assert_queued_without_processing(0);
+        }
+        let body = serde_json::to_vec(&linq_test_payload()).unwrap();
+        let headers = linq_signed_headers(&body, chrono::Utc::now().timestamp());
+        let response = fixture.post(body.clone(), headers.clone()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.json::<Value>().await.unwrap()["accepted"], true);
+        let response = fixture.post(body, headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<Value>().await.unwrap()["accepted"], false);
+        fixture.assert_queued_without_processing(1);
+    }
+
+    #[tokio::test]
+    async fn linq_route_rejects_invalid_raw_signatures_and_expired_deliveries() {
+        let fixture = LinqRouteFixture::new().await;
+        let body = serde_json::to_vec(&linq_test_payload()).unwrap();
+        let signature = linq_signed_headers(&body, chrono::Utc::now().timestamp());
+        let mut changed = body.clone();
+        changed.push(b'\n');
+        let response = fixture.post(changed, signature).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for timestamp in [
+            chrono::Utc::now().timestamp() - 600,
+            chrono::Utc::now().timestamp() + 600,
+        ] {
+            let headers = linq_signed_headers(&body, timestamp);
+            let response = fixture.post(body.clone(), headers).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let malformed = b"{invalid JSON}".to_vec();
+        let headers = linq_signed_headers(&malformed, chrono::Utc::now().timestamp());
+        let response = fixture.post(malformed, headers).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        fixture.assert_queued_without_processing(0);
+    }
+
+    #[tokio::test]
+    async fn linq_route_enforces_the_one_mebibyte_body_limit_before_ingress() {
+        let fixture = LinqRouteFixture::new().await;
+        let limit = crate::interfaces::linq::LINQ_WEBHOOK_BODY_LIMIT;
+        assert_eq!(limit, 1024 * 1024);
+        // JSON trailing whitespace keeps the provider fixture valid while
+        // isolating the HTTP body limit from the message's smaller text limit.
+        let mut oversized = serde_json::to_vec(&linq_test_payload()).unwrap();
+        oversized.resize(limit + 1, b' ');
+        let headers = linq_signed_headers(&oversized, chrono::Utc::now().timestamp());
+        let response = fixture.post(oversized, headers).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        fixture.assert_queued_without_processing(0);
+        let mut boundary = serde_json::to_vec(&linq_test_payload()).unwrap();
+        boundary.resize(limit, b' ');
+        let headers = linq_signed_headers(&boundary, chrono::Utc::now().timestamp());
+        let response = fixture.post(boundary, headers).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.json::<Value>().await.unwrap()["accepted"], true);
+        fixture.assert_queued_without_processing(1);
     }
 
     fn pending_reaction(message_id: i64, emoji: &str) -> PendingReaction {
