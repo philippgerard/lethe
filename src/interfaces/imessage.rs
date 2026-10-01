@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::agent::{Agent, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
 use crate::config::ImessageConfig;
 use crate::interfaces::actions::{ActionStore, ApprovalRequest, ApprovalScope, ApprovalStatus};
+use crate::interfaces::imessage_formatting::{RenderedText, render_imessage_markdown};
 use crate::interfaces::linq::{DeliveryUpdate, LinqClient, LinqError, PollEnvelope, WebhookEvent};
 use crate::scheduler::brainstem::BrainstemHandle;
 use crate::tools::actions::ActionToolContext;
@@ -634,7 +635,7 @@ impl ImessageTransport {
     }
 
     fn queue(&self, inbound: &Inbound, output: Value) -> bool {
-        match self.store.queue_output(inbound, output) {
+        match prepare_output(output).and_then(|output| self.store.queue_output(inbound, output)) {
             Ok(_) => {
                 self.outbox_notify.notify_one();
                 true
@@ -1044,23 +1045,12 @@ impl ImessageTransport {
                     return Ok(String::new());
                 }
                 if request.status == ApprovalStatus::Approved {
-                    let text = format!(
-                        "Approved, awaiting continuation: {}\nReply /resume {} to continue after checking the terms. This approval expires automatically.",
-                        request.summary, request.request_id
-                    );
-                    let sent = self
-                        .client
-                        .send_text(chat, &text, reply_to, &format!("lethe:{id}:text:0"))
-                        .await?;
-                    self.store.record_sent(id, chat, &sent.message_id)?;
-                    return Ok(sent.message_id);
+                    return self
+                        .deliver_text(id, chat, reply_to, output, &output_text(output)?)
+                        .await;
                 }
-                let text = format!(
-                    "Approval required: {}\nReply /approve {} or /reject {}. This request expires automatically.",
-                    request.summary, request.request_id, request.request_id
-                );
                 (
-                    text,
+                    output_text(output)?,
                     vec!["Approve".to_string(), "Reject".to_string()],
                     vec![request.approve_choice, request.reject_choice],
                     request.expires_at,
@@ -1068,11 +1058,6 @@ impl ImessageTransport {
             }
             Some("choices") => {
                 let options: Vec<String> = serde_json::from_value(output["options"].clone())?;
-                let text = format!(
-                    "{}\n{}\nReply with your choice.",
-                    output["question"].as_str().unwrap_or("Choose:"),
-                    options.join(" / ")
-                );
                 let values = options
                     .iter()
                     .map(|option| format!("answer:{option}"))
@@ -1082,7 +1067,7 @@ impl ImessageTransport {
                     [id],
                     |row| row.get(0),
                 )?;
-                (text, options, values, created_at + 900)
+                (output_text(output)?, options, values, created_at + 900)
             }
             _ => (
                 output["content"].as_str().unwrap_or("").to_string(),
@@ -1091,15 +1076,7 @@ impl ImessageTransport {
                 0,
             ),
         };
-        let mut provider_id = String::new();
-        for (index, chunk) in text_chunks(&text, 3000).iter().enumerate() {
-            let sent = self
-                .client
-                .send_text(chat, chunk, reply_to, &format!("lethe:{id}:text:{index}"))
-                .await?;
-            self.store.record_sent(id, chat, &sent.message_id)?;
-            provider_id = sent.message_id;
-        }
+        let provider_id = self.deliver_text(id, chat, reply_to, output, &text).await?;
         if self.config.native_polls && !options.is_empty() {
             match self
                 .client
@@ -1121,6 +1098,83 @@ impl ImessageTransport {
         }
         Ok(provider_id)
     }
+
+    async fn deliver_text(
+        &self,
+        id: &str,
+        chat: &str,
+        reply_to: Option<&str>,
+        output: &Value,
+        legacy_text: &str,
+    ) -> Result<String> {
+        let mut provider_id = String::new();
+        for (index, part) in output_parts(output, legacy_text)?.iter().enumerate() {
+            let sent = self
+                .client
+                .send_text_with_decorations(
+                    chat,
+                    &part.text,
+                    &part.text_decorations,
+                    reply_to,
+                    &format!("lethe:{id}:text:{index}"),
+                )
+                .await?;
+            self.store.record_sent(id, chat, &sent.message_id)?;
+            provider_id = sent.message_id;
+        }
+        Ok(provider_id)
+    }
+}
+
+fn output_text(output: &Value) -> Result<String> {
+    Ok(match output["kind"].as_str() {
+        Some("approval") => {
+            let request: ApprovalRequest = serde_json::from_value(output["request"].clone())?;
+            if request.status == ApprovalStatus::Approved {
+                format!(
+                    "Approved, awaiting continuation: {}\nReply /resume {} to continue after checking the terms. This approval expires automatically.",
+                    request.summary, request.request_id
+                )
+            } else {
+                format!(
+                    "Approval required: {}\nReply /approve {} or /reject {}. This request expires automatically.",
+                    request.summary, request.request_id, request.request_id
+                )
+            }
+        }
+        Some("choices") => {
+            let options: Vec<String> = serde_json::from_value(output["options"].clone())?;
+            format!(
+                "{}\n{}\nReply with your choice.",
+                output["question"].as_str().unwrap_or("Choose:"),
+                options.join(" / ")
+            )
+        }
+        _ => output["content"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+fn prepare_output(mut output: Value) -> Result<Value> {
+    // Persist rendering before the first send: a retry must keep identical
+    // message chunks, decoration ranges, and provider idempotency keys.
+    let parts = render_imessage_markdown(&output_text(&output)?).chunks(3000);
+    output["text_parts"] = serde_json::to_value(parts)?;
+    Ok(output)
+}
+
+fn output_parts(output: &Value, legacy_text: &str) -> Result<Vec<RenderedText>> {
+    if let Some(parts) = output.get("text_parts") {
+        return Ok(serde_json::from_value(parts.clone())?);
+    }
+    // Queued rows from before rendering was introduced may already have been
+    // accepted remotely. Preserve their old payloads when reusing their keys.
+    Ok(text_chunks(legacy_text, 3000)
+        .into_iter()
+        .map(|text| RenderedText {
+            text,
+            text_decorations: Vec::new(),
+        })
+        .collect())
 }
 
 fn approved_continuation(request: &ApprovalRequest) -> String {
@@ -1572,6 +1626,83 @@ mod tests {
             message_id: "message-1".to_string(),
             text: "hello".to_string(),
             vote: None,
+        }
+    }
+
+    #[test]
+    fn rendered_outbox_payload_survives_restart_without_changing_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = transport(directory.path());
+        let markdown = "😀 **Ready**\n\n---\n\n[Details](https://example.test/details)";
+        assert!(original.queue(&inbound(), json!({"kind": "text", "content": markdown})));
+        drop(original);
+        let restored = transport(directory.path());
+        let raw: String = restored
+            .store
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM linq_outbox", [], |row| row.get(0))
+            .unwrap();
+        let output: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(output["content"], markdown);
+        let parts = output_parts(&output, "do not re-render this replacement").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].text,
+            "😀 Ready\n\nDetails (https://example.test/details)"
+        );
+        assert_eq!(
+            serde_json::to_value(&parts[0].text_decorations).unwrap(),
+            json!([{"range": [3, 8], "style": "bold"}])
+        );
+    }
+
+    #[test]
+    fn preexisting_outbox_rows_keep_original_chunks_and_no_decorations() {
+        let markdown = format!("{}**pending**", "x".repeat(2998));
+        let output = json!({"kind": "text", "content": markdown});
+        let parts = output_parts(&output, &markdown).unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<String>(),
+            markdown
+        );
+        assert_eq!(parts[0].text.chars().count(), 3000);
+        assert!(parts.iter().all(|part| part.text_decorations.is_empty()));
+    }
+
+    #[test]
+    fn approval_rendering_preserves_binding_and_exact_decision_commands() {
+        let request = ApprovalRequest {
+            request_id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            scope: inbound().scope(),
+            summary: "Buy **2 items for €49.99** at [Example](https://shop.example.test/checkout), reference `order_A_B`.".into(),
+            expires_at: 100,
+            status: ApprovalStatus::Pending,
+            approve_choice: "opaque-approve".into(),
+            reject_choice: "opaque-reject".into(),
+        };
+        for status in [ApprovalStatus::Pending, ApprovalStatus::Approved] {
+            let mut request = request.clone();
+            request.status = status;
+            let output = prepare_output(json!({"kind": "approval", "request": request})).unwrap();
+            assert_eq!(output["request"], serde_json::to_value(&request).unwrap());
+            let parts = output_parts(&output, "").unwrap();
+            let text = parts
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<String>();
+            assert!(text.contains("2 items for €49.99"));
+            assert!(text.contains("https://shop.example.test/checkout"));
+            assert!(text.contains("order_A_B"));
+            if status == ApprovalStatus::Pending {
+                assert!(text.contains(&format!("/approve {}", request.request_id)));
+                assert!(text.contains(&format!("/reject {}", request.request_id)));
+            } else {
+                assert!(text.contains(&format!("/resume {}", request.request_id)));
+            }
         }
     }
 

@@ -16,6 +16,8 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use thiserror::Error;
 
+use super::imessage_formatting::TextDecoration;
+
 pub const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
 pub const LINQ_WEBHOOK_VERSION: &str = "2026-02-03";
 pub const LINQ_TEXT_LIMIT: usize = 10_000;
@@ -103,6 +105,18 @@ impl LinqClient {
         reply_to: Option<&str>,
         idempotency_key: &str,
     ) -> LinqResult<SentMessage> {
+        self.send_text_with_decorations(chat_id, text, &[], reply_to, idempotency_key)
+            .await
+    }
+
+    pub(super) async fn send_text_with_decorations(
+        &self,
+        chat_id: &str,
+        text: &str,
+        decorations: &[TextDecoration],
+        reply_to: Option<&str>,
+        idempotency_key: &str,
+    ) -> LinqResult<SentMessage> {
         validate_uuid(chat_id)?;
         validate_idempotency_key(idempotency_key)?;
         if text.trim().is_empty() || text.chars().count() > LINQ_TEXT_LIMIT {
@@ -110,10 +124,24 @@ impl LinqClient {
                 "text must contain 1-10000 characters",
             ));
         }
+        let mut boundaries = vec![0];
+        for character in text.chars() {
+            boundaries.push(boundaries.last().copied().unwrap() + character.len_utf16());
+        }
+        if decorations.iter().any(|decoration| {
+            decoration.range[0] >= decoration.range[1]
+                || boundaries.binary_search(&decoration.range[0]).is_err()
+                || boundaries.binary_search(&decoration.range[1]).is_err()
+        }) {
+            return Err(LinqError::InvalidRequest("invalid text decoration range"));
+        }
         let mut message = json!({
             "parts": [{"type": "text", "value": text}],
             "idempotency_key": idempotency_key,
         });
+        if !decorations.is_empty() {
+            message["parts"][0]["text_decorations"] = json!(decorations);
+        }
         if let Some(message_id) = reply_to {
             validate_uuid(message_id)?;
             message["reply_to"] = json!({"message_id": message_id});
@@ -795,6 +823,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(poll.poll.options[0].option_id, OPTION);
+        let decorations: Vec<TextDecoration> = serde_json::from_value(json!([
+            {"range": [3, 8], "style": "bold"},
+            {"range": [3, 8], "style": "italic"},
+        ]))
+        .unwrap();
+        client
+            .send_text_with_decorations(
+                CHAT,
+                "😀 Ready",
+                &decorations,
+                Some(MESSAGE),
+                "formatted-request",
+            )
+            .await
+            .unwrap();
         server.abort();
         let requests = requests.lock().unwrap();
         assert_eq!(requests[0].0, format!("/chats/{CHAT}/messages"));
@@ -814,6 +857,34 @@ mod tests {
                 "idempotency_key": "poll-request",
             }})
         );
+        assert_eq!(
+            requests[2].2,
+            json!({"message": {
+                "parts": [{"type": "text", "value": "😀 Ready", "text_decorations": [
+                    {"range": [3, 8], "style": "bold"},
+                    {"range": [3, 8], "style": "italic"},
+                ]}],
+                "reply_to": {"message_id": MESSAGE},
+                "idempotency_key": "formatted-request",
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_decoration_ranges_that_split_unicode_or_exceed_text() {
+        let client = LinqClient::new("test-token".into()).unwrap();
+        for range in [[1, 2], [3, 9], [3, 3], [8, 3]] {
+            let decorations: Vec<TextDecoration> = serde_json::from_value(json!([
+                {"range": range, "style": "bold"}
+            ]))
+            .unwrap();
+            assert!(matches!(
+                client
+                    .send_text_with_decorations(CHAT, "😀 Ready", &decorations, None, "request")
+                    .await,
+                Err(LinqError::InvalidRequest("invalid text decoration range"))
+            ));
+        }
     }
 
     #[tokio::test]
