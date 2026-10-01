@@ -79,6 +79,16 @@ timestamps outside a five-minute window, and deduplicates inbound event IDs in
 durable storage. See [Linq's webhook guide](https://docs.linqapp.com/channel/imessage/guides/webhooks/).
 The webhook has a 1 MiB body limit; accepted text has a 32 KiB limit.
 
+Outgoing Markdown is rendered as readable text with Linq's native bold and italic
+decorations, including correct UTF-16 ranges for emoji and long-message chunks.
+Links retain their URLs and code retains its literal content. Struck-out text
+also carries an explicit label so its meaning survives SMS/RCS, which ignore
+decorations. Rendered chunks are persisted before sending, so delivery retries
+reuse identical payloads. Previously queued messages retain their original
+payloads. Whitespace-only pieces are rebalanced where possible; standalone
+excess whitespace is omitted because Linq rejects empty-looking text parts.
+See [Linq's sending guide](https://docs.linqapp.com/channel/imessage/guides/messaging/sending-messages/).
+
 `GET /imessage/status` requires `Authorization: Bearer <LETHE_API_TOKEN>` or
 `x-lethe-token`. It reports enablement, queue counts, interrupted turns, and
 provider/device delivery observations without revealing secrets. An unsigned
