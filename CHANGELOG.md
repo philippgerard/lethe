@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add explicit quiet completion for scheduled `/wake` runs. The wake-only
+  `wake_finish_silently` tool suppresses final acknowledgments when a task has
+  nothing to report and returns successful, undelivered completion to the
+  scheduler. Later tool work invalidates the request; checkpoints and failures
+  retain their existing status. Wake prompts now explain the current delivery
+  contract instead of relying on outdated instructions that final text is
+  discarded.
+
 - Refresh compatible Rust dependencies across Lethe, the vendored provider
   library, and the legacy migrator. FastEmbed moves to 5.17.4 with ONNX Runtime
   bindings 2.0.0-rc.13; HTTP/TLS, compression, Unicode, and Arrow dependencies

@@ -62,6 +62,14 @@ impl<'a> ToolRegistry<'a> {
         if !self.runtime.policy.allows_builtin(def.name) {
             return false;
         }
+        if def.name == "wake_finish_silently" {
+            return self.runtime.allow_silent_completion
+                && self
+                    .runtime
+                    .telegram
+                    .as_ref()
+                    .is_some_and(|context| context.guard.is_some());
+        }
         match def.category {
             ToolCategory::Initial | ToolCategory::Requestable | ToolCategory::CortexOnly => true,
             ToolCategory::Actor => self.runtime.actor.is_some(),
@@ -93,6 +101,9 @@ impl<'a> ToolRegistry<'a> {
     /// A def is "initial" (loaded without `request_tool`) when both its
     /// category is initial-like AND any required runtime context is present.
     pub(super) fn def_is_initial(&self, def: &ToolDef) -> bool {
+        if def.name == "wake_finish_silently" {
+            return self.def_is_visible(def);
+        }
         match def.category {
             ToolCategory::Initial => true,
             ToolCategory::Actions => self.runtime.actions.is_some(),

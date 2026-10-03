@@ -25,8 +25,7 @@ use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use crate::interfaces::telegram::{
     PendingReaction, SharedTelegramTurnGuard, TelegramClient, TelegramToolContext,
-    TelegramTurnGuard, TelegramTypingObserver, llm_auth_reply, llm_limit_reply,
-    split_telegram_messages,
+    TelegramTurnGuard, llm_auth_reply, llm_limit_reply, split_telegram_messages,
 };
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
@@ -48,6 +47,7 @@ const WAKE_TURN_FAILURE_MESSAGE: &str =
     "The scheduled task could not be completed. Please try again.";
 const WAKE_TURN_TIMEOUT_MESSAGE: &str =
     "The scheduled task timed out before completion. Please try again.";
+const WAKE_DELIVERY_INSTRUCTIONS: &str = "[Lethe scheduled-wake delivery contract]\nThis is a scheduled task, not an interactive user message. Normal final text is delivered automatically unless a Telegram delivery tool sent content. If the task requires no notification, call wake_finish_silently as your final tool after all work, then return a short non-empty internal acknowledgment. Any subsequent tool attempt invalidates quiet completion. Do not use a dot, an empty response, or an acknowledgment alone to request silence. Any task text saying plain wake text is discarded is outdated. If a notification is warranted, deliver it normally or with telegram_send_message.";
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -1440,8 +1440,10 @@ fn wake_tool_runtime(
             dry_run: false,
             sent_messages: None,
         }),
-        observer: Some(Arc::new(TelegramTypingObserver::new(token, chat_id))),
+        // Scheduled work must not emit automatic typing/escalation notices
+        // before deciding whether any user notification is warranted.
         secure_prompt,
+        allow_silent_completion: true,
         ..ToolRuntime::default()
     };
     (runtime, guard)
@@ -1450,6 +1452,7 @@ fn wake_tool_runtime(
 #[derive(Debug, Default, Eq, PartialEq)]
 struct WakeGuardDelivery {
     tool_messages_sent: usize,
+    silent_completion_requested: bool,
     visible_texts: Vec<String>,
     pending_reactions: Vec<PendingReaction>,
 }
@@ -1541,6 +1544,7 @@ fn take_wake_guard_delivery(
         .lock()
         .map(|mut guard| WakeGuardDelivery {
             tool_messages_sent: guard.visible_messages_sent(),
+            silent_completion_requested: guard.silent_completion_requested(),
             visible_texts: guard.drain_visible_texts(),
             pending_reactions: guard.drain_pending_reactions(),
         })
@@ -1590,7 +1594,7 @@ fn wake_delivery_response(
         "turn_completed": true,
         "chat_id": chat_id,
         "reply_chars": reply_chars,
-        "delivered": true,
+        "delivered": delivered_messages > 0 || reactions.delivered > 0,
         "delivery_status": delivery_status,
         "delivered_messages": delivered_messages,
     });
@@ -1642,6 +1646,7 @@ async fn finish_wake_delivery<RF, RFut, FF, FFut>(
     chat_id: i64,
     result: TurnResult,
     tool_messages_sent: usize,
+    silent_completion_requested: bool,
     pending_reactions: Vec<PendingReaction>,
     send_reaction: RF,
     mut send_fallback: FF,
@@ -1700,6 +1705,39 @@ where
             reply_chars,
             "tool_delivered",
             tool_messages_sent,
+            None,
+            &reactions,
+        );
+    }
+
+    if silent_completion_requested {
+        if reactions.has_failures() {
+            return wake_delivery_error(
+                if reactions.delivered > 0 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                chat_id,
+                reply_chars,
+                &reaction_failure_status("quiet_completion", &reactions),
+                true,
+                reactions.delivered > 0,
+                0,
+                None,
+                &reactions.error_summary(),
+                &reactions,
+            );
+        }
+        return wake_delivery_response(
+            chat_id,
+            reply_chars,
+            if reactions.delivered > 0 {
+                "reaction_delivered"
+            } else {
+                "quiet_completed"
+            },
+            0,
             None,
             &reactions,
         );
@@ -2011,6 +2049,7 @@ async fn send_wake_telegram_reaction(
 /// egress, so the agent's `telegram_send_message` is delivered to Telegram. A
 /// turn guard suppresses duplicate fallback delivery; when the model sends no
 /// Telegram message itself, the handler delivers its final non-empty reply.
+/// An explicit wake_finish_silently call completes without fallback delivery.
 async fn wake(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -2049,7 +2088,7 @@ async fn wake(
         }
     };
     let (runtime, delivery_guard) = wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
-    let req = TurnRequest::new(&body.message)
+    let req = TurnRequest::new(format!("{}\n\n{WAKE_DELIVERY_INSTRUCTIONS}", body.message))
         .with_runtime(runtime)
         .with_metadata(raw_message_metadata_value(
             MessageVisibility::Internal,
@@ -2061,6 +2100,7 @@ async fn wake(
         run_wake_turn_with_timeout(WAKE_TURN_TIMEOUT, state.agent.chat_once_result(req)).await;
     let WakeGuardDelivery {
         tool_messages_sent,
+        silent_completion_requested,
         visible_texts: tool_visible_texts,
         pending_reactions,
     } = match take_wake_guard_delivery(&delivery_guard) {
@@ -2107,6 +2147,7 @@ async fn wake(
                 chat_id,
                 result,
                 tool_messages_sent,
+                silent_completion_requested,
                 pending_reactions,
                 move |pending| {
                     let client = reaction_client.clone();
@@ -2756,7 +2797,7 @@ mod tests {
     }
 
     #[test]
-    fn wake_runtime_binds_telegram_observer_and_secure_prompt() {
+    fn wake_runtime_binds_telegram_and_secure_prompt_without_automatic_notices() {
         let tmp = tempdir().unwrap();
         let hub = crate::agent_id::secure_prompt::SecurePromptHub::new(
             tmp.path().join("secure-prompt.sock"),
@@ -2778,10 +2819,8 @@ mod tests {
         assert_eq!(delivery_guard.lock().unwrap().visible_messages_sent(), 1);
         assert!(!telegram.dry_run);
         assert!(telegram.sent_messages.is_none());
-        assert!(
-            runtime.observer.is_some(),
-            "deep-model notice/typing observer"
-        );
+        assert!(runtime.observer.is_none());
+        assert!(runtime.allow_silent_completion);
         assert_eq!(
             runtime
                 .secure_prompt
@@ -2816,6 +2855,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wake_control_tool_completes_without_egress_or_visible_history() {
+        let tmp = tempdir().unwrap();
+        let memory = crate::memory::MemoryStore::from_settings(&test_settings(tmp.path())).unwrap();
+        let shell = crate::tools::shell::ShellTools::new(memory.workspace_dir());
+        let (runtime, guard) = wake_tool_runtime("unused-token".to_string(), 42, None);
+        let registry = crate::tools::registry::ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            runtime,
+        );
+        let outcome: Value = serde_json::from_str(
+            &registry
+                .execute_async("wake_finish_silently", &json!({}))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(outcome["success"], true);
+
+        let delivery = take_wake_guard_delivery(&guard).unwrap();
+
+        assert!(delivery.silent_completion_requested);
+        assert_eq!(delivery.tool_messages_sent, 0);
+        assert!(delivery.visible_texts.is_empty());
+        assert!(delivery.pending_reactions.is_empty());
+        let response = finish_wake_delivery(
+            42,
+            TurnResult::Complete(".".to_string()),
+            delivery.tool_messages_sent,
+            delivery.silent_completion_requested,
+            delivery.pending_reactions,
+            |_| async { panic!("quiet completion must not react") },
+            |_| async { panic!("quiet completion must not send a message") },
+        )
+        .await;
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "quiet_completed");
+        assert!(memory.messages.get_recent(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn wake_delivery_does_not_duplicate_a_tool_delivered_message() {
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let calls = fallback_calls.clone();
@@ -2824,6 +2907,7 @@ mod tests {
             42,
             TurnResult::Complete("redundant final".to_string()),
             2,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             move |_| {
@@ -2854,6 +2938,7 @@ mod tests {
             42,
             TurnResult::Complete("redundant final".to_string()),
             1,
+            false,
             vec![pending_reaction(70, "👍"), pending_reaction(71, "🔥")],
             |pending| async move {
                 if pending.message_id == 70 {
@@ -2895,6 +2980,7 @@ mod tests {
             42,
             TurnResult::Complete("  final answer  ".to_string()),
             0,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             move |text| {
@@ -2918,6 +3004,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wake_delivery_silent_completion_suppresses_final_text() {
+        for reply in [".", "Completed.", "", "x".repeat(5000).as_str()] {
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+            let calls = fallback_calls.clone();
+            let response = finish_wake_delivery(
+                42,
+                TurnResult::Complete(reply.to_string()),
+                0,
+                true,
+                Vec::new(),
+                |_| async { Ok(()) },
+                move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Ok(73) }
+                },
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["success"], true);
+            assert_eq!(body["turn_completed"], true);
+            assert_eq!(body["reply_chars"], reply.chars().count());
+            assert_eq!(body["delivered"], false);
+            assert_eq!(body["delivery_status"], "quiet_completed");
+            assert_eq!(body["delivered_messages"], 0);
+            assert!(body.get("message_id").is_none());
+            assert!(body.get("error").is_none());
+            assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_silent_completion_preserves_checkpoint_failure() {
+        let response = finish_wake_delivery(
+            42,
+            TurnResult::Checkpointed,
+            0,
+            true,
+            Vec::new(),
+            |_| async { Ok(()) },
+            |_| async { panic!("quiet checkpoint must never send a fallback") },
+        )
+        .await;
+
+        let body = response_json(response).await;
+        assert_eq!(body["success"], false);
+        assert_eq!(body["turn_completed"], false);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "checkpoint_suppressed");
+    }
+
+    #[tokio::test]
+    async fn wake_silent_completion_preserves_reaction_outcomes() {
+        for reaction_succeeds in [true, false] {
+            let response = finish_wake_delivery(
+                42,
+                TurnResult::Complete("internal acknowledgment".to_string()),
+                0,
+                true,
+                vec![pending_reaction(70, "👍")],
+                move |_| async move {
+                    if reaction_succeeds {
+                        Ok(())
+                    } else {
+                        Err("reaction rejected".to_string())
+                    }
+                },
+                |_| async { panic!("quiet completion must never send a fallback") },
+            )
+            .await;
+
+            assert_eq!(
+                response.status(),
+                if reaction_succeeds {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_GATEWAY
+                }
+            );
+            let body = response_json(response).await;
+            assert_eq!(body["success"], reaction_succeeds);
+            assert_eq!(body["delivered"], reaction_succeeds);
+            assert_eq!(body["delivered_messages"], 0);
+            assert_eq!(
+                body["delivery_status"],
+                if reaction_succeeds {
+                    "reaction_delivered"
+                } else {
+                    "quiet_completion_reactions_failed"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn wake_delivery_never_uses_a_checkpoint_as_fallback() {
         let fallback_calls = Arc::new(AtomicUsize::new(0));
         let calls = fallback_calls.clone();
@@ -2926,6 +3108,7 @@ mod tests {
             42,
             TurnResult::Checkpointed,
             0,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             move |_| {
@@ -2955,6 +3138,7 @@ mod tests {
             42,
             TurnResult::Checkpointed,
             2,
+            false,
             vec![pending_reaction(70, "👍")],
             |_| async { Ok(()) },
             move |_| {
@@ -2984,6 +3168,7 @@ mod tests {
             42,
             TurnResult::Complete("final answer".to_string()),
             0,
+            false,
             vec![pending_reaction(70, "👍")],
             |_| async { Err("reaction rejected".to_string()) },
             move |_| {
@@ -3019,6 +3204,7 @@ mod tests {
             42,
             TurnResult::Complete("   ".to_string()),
             0,
+            false,
             vec![pending_reaction(70, "👍")],
             |_| async { Ok(()) },
             move |_| {
@@ -3050,6 +3236,7 @@ mod tests {
             42,
             TurnResult::Complete("x".repeat(5000)),
             0,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             move |text| {
@@ -3085,6 +3272,7 @@ mod tests {
             42,
             TurnResult::Complete("   ".to_string()),
             0,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             move |_| {
@@ -3110,6 +3298,7 @@ mod tests {
             42,
             TurnResult::Complete("final answer".to_string()),
             0,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             |_| async { Err("telegram offline".to_string()) },
@@ -3135,6 +3324,7 @@ mod tests {
             42,
             TurnResult::Complete("x".repeat(5000)),
             0,
+            false,
             Vec::new(),
             |_| async { Ok(()) },
             move |_| {
@@ -3377,6 +3567,7 @@ mod tests {
             42,
             TurnResult::Complete("fallback answer".to_string()),
             0,
+            false,
             vec![pending_reaction(70, "👍")],
             move |_| {
                 reaction_progress.record_reaction();
