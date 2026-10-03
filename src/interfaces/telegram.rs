@@ -1747,6 +1747,7 @@ pub struct TelegramTurnGuard {
     forced_channel: Option<VisibleTelegramChannel>,
     visible_messages_sent: usize,
     visible_texts: Vec<String>,
+    silent_completion_requested: bool,
 }
 
 impl TelegramTurnGuard {
@@ -1756,6 +1757,7 @@ impl TelegramTurnGuard {
             forced_channel: None,
             visible_messages_sent: 0,
             visible_texts: Vec::new(),
+            silent_completion_requested: false,
         }
     }
 
@@ -1765,6 +1767,7 @@ impl TelegramTurnGuard {
             forced_channel: Some(channel),
             visible_messages_sent: 0,
             visible_texts: Vec::new(),
+            silent_completion_requested: false,
         }
     }
 
@@ -1790,6 +1793,26 @@ impl TelegramTurnGuard {
 
     pub fn visible_messages_sent(&self) -> usize {
         self.visible_messages_sent
+    }
+
+    /// Explicitly finish a wake without fallback delivery. This is control
+    /// state, not a visible message. A subsequent tool attempt must clear it.
+    pub fn request_silent_completion(&mut self) -> Result<(), &'static str> {
+        if self.visible_messages_sent > 0 || self.has_pending_reactions() {
+            return Err(
+                "Silent completion cannot be requested after Telegram delivery or a queued reaction.",
+            );
+        }
+        self.silent_completion_requested = true;
+        Ok(())
+    }
+
+    pub fn silent_completion_requested(&self) -> bool {
+        self.silent_completion_requested
+    }
+
+    pub fn clear_silent_completion(&mut self) {
+        self.silent_completion_requested = false;
     }
 
     pub fn drain_visible_texts(&mut self) -> Vec<String> {

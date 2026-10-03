@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::args::{bool_arg, i64_arg, string_arg, string_arg_default};
@@ -46,7 +46,44 @@ fn exec_telegram_react(registry: &ToolRegistry<'_>, args: &Value) -> String {
     }
 }
 
+fn exec_wake_finish_silently(registry: &ToolRegistry<'_>, _args: &Value) -> String {
+    let error = |message: &str| json!({"success": false, "error": message}).to_string();
+    if !registry.runtime.allow_silent_completion {
+        return error("Silent completion is available only in scheduled wake turns.");
+    }
+    let Some(guard) = registry
+        .runtime
+        .telegram
+        .as_ref()
+        .and_then(|context| context.guard.as_ref())
+    else {
+        return error("Silent completion requires a Telegram wake delivery guard.");
+    };
+    let mut guard = match guard.lock() {
+        Ok(guard) => guard,
+        Err(error_message) => {
+            return error(&format!("Telegram turn guard poisoned: {error_message}"));
+        }
+    };
+    match guard.request_silent_completion() {
+        Ok(()) => json!({
+            "success": true,
+            "silent_completion_requested": true,
+            "message": "Quiet completion requested. Finish with a short non-empty internal acknowledgment; it will not be sent to Telegram.",
+        })
+        .to_string(),
+        Err(message) => error(message),
+    }
+}
+
 pub const TOOL_DEFS: &[ToolDef] = &[
+    ToolDef {
+        name: "wake_finish_silently",
+        description: "Finish a scheduled POST /wake turn without sending a Telegram message when the requested work is complete and no user notification is warranted. Call this as your final tool after all work, instead of returning punctuation, an empty response, or a silence sentinel. Available only in wake turns, before any Telegram message/file delivery or queued reaction. Any subsequent tool attempt invalidates quiet completion. After success, finish with a short non-empty internal acknowledgment; final text is suppressed. This tool does not send anything to the user.",
+        params: &[],
+        category: ToolCategory::Transport,
+        execute: ToolExecutor::Sync(exec_wake_finish_silently),
+    },
     // Transport-neutral chat egress for client (web/desktop) sessions. Shares
     // the executor with telegram_send_message — MessageEgress routes to the
     // attached transport. Only send_message is exposed for clients: the chat

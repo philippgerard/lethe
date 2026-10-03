@@ -83,6 +83,7 @@ impl ToolPolicy {
                 name == "request_tool"
                     || name == "think_deeply"
                     || name == "chat_send_message"
+                    || name == "wake_finish_silently"
                     || name.starts_with("memory_")
                     || name.starts_with("archival_")
                     || name.starts_with("conversation_")
@@ -138,6 +139,9 @@ pub struct ActorToolContext {
 #[derive(Clone, Default)]
 pub struct ToolRuntime {
     pub telegram: Option<TelegramToolContext>,
+    /// Trusted opt-in for scheduled wake turns that may complete without any
+    /// user-visible message. Ordinary chat and subagent turns leave this false.
+    pub allow_silent_completion: bool,
     pub client: Option<ClientToolContext>,
     pub actions: Option<crate::tools::actions::ActionToolContext>,
     pub actor: Option<ActorToolContext>,
@@ -168,6 +172,7 @@ impl std::fmt::Debug for ToolRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolRuntime")
             .field("telegram", &self.telegram.is_some())
+            .field("allow_silent_completion", &self.allow_silent_completion)
             .field("client", &self.client.is_some())
             .field("actions", &self.actions.is_some())
             .field("actor", &self.actor.is_some())

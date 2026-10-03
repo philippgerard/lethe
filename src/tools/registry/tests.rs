@@ -678,6 +678,157 @@ fn telegram_send_message_description_matches_wake_delivery_contract() {
 }
 
 #[test]
+fn wake_silent_completion_requires_trusted_runtime_and_guard() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::interfaces::telegram::{TelegramToolContext, TelegramTurnGuard};
+
+    for (allowed, has_telegram, has_guard) in [
+        (false, true, true),
+        (true, true, false),
+        (true, false, false),
+    ] {
+        let (_tmp, memory, shell) = registry();
+        let guard = Arc::new(Mutex::new(TelegramTurnGuard::new()));
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            "/tmp/lethe-cache",
+            &shell,
+            ToolRuntime {
+                allow_silent_completion: allowed,
+                telegram: has_telegram.then(|| TelegramToolContext {
+                    token: "unused-token".to_string(),
+                    chat_id: 99,
+                    user_id: Some(7),
+                    last_message_id: Some(42),
+                    guard: has_guard.then(|| guard.clone()),
+                    dry_run: true,
+                    sent_messages: None,
+                }),
+                ..ToolRuntime::default()
+            },
+        );
+
+        assert!(!registry.tool_is_available("wake_finish_silently"));
+        assert!(!registry.is_initial_tool("wake_finish_silently"));
+        assert!(
+            registry
+                .tools()
+                .iter()
+                .all(|tool| tool.name.as_str() != "wake_finish_silently")
+        );
+        let result: serde_json::Value =
+            serde_json::from_str(&registry.execute("wake_finish_silently", &json!({}))).unwrap();
+        assert_eq!(result["success"], false);
+        assert!(!guard.lock().unwrap().silent_completion_requested());
+        assert_eq!(guard.lock().unwrap().visible_messages_sent(), 0);
+    }
+}
+
+#[test]
+fn wake_silent_completion_is_initial_and_executes_without_visible_delivery() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::interfaces::telegram::{TelegramToolContext, TelegramTurnGuard};
+
+    let (_tmp, memory, shell) = registry();
+    let guard = Arc::new(Mutex::new(TelegramTurnGuard::new()));
+    let registry = ToolRegistry::with_runtime(
+        &memory,
+        memory.workspace_dir(),
+        "/tmp/lethe-cache",
+        &shell,
+        ToolRuntime {
+            allow_silent_completion: true,
+            telegram: Some(TelegramToolContext {
+                token: "unused-token".to_string(),
+                chat_id: 99,
+                user_id: Some(7),
+                last_message_id: Some(42),
+                guard: Some(guard.clone()),
+                dry_run: true,
+                sent_messages: None,
+            }),
+            policy: ToolPolicy::HostedSafe,
+            ..ToolRuntime::default()
+        },
+    );
+
+    assert!(registry.tool_is_available("wake_finish_silently"));
+    assert!(registry.is_initial_tool("wake_finish_silently"));
+    assert!(
+        registry
+            .tools_for_active(&HashSet::new())
+            .iter()
+            .any(|tool| tool.name.as_str() == "wake_finish_silently")
+    );
+    let result: serde_json::Value =
+        serde_json::from_str(&registry.execute("wake_finish_silently", &json!({}))).unwrap();
+    assert_eq!(result["success"], true);
+    assert_eq!(result["silent_completion_requested"], true);
+    assert!(
+        result["message"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+
+    let mut guard = guard.lock().unwrap();
+    assert!(guard.silent_completion_requested());
+    assert_eq!(guard.visible_messages_sent(), 0);
+    assert!(!guard.has_pending_reactions());
+    assert!(guard.drain_visible_texts().is_empty());
+    guard.clear_silent_completion();
+    assert!(!guard.silent_completion_requested());
+}
+
+#[test]
+fn wake_silent_completion_rejects_existing_messages_or_reactions() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::interfaces::telegram::{TelegramToolContext, TelegramTurnGuard};
+
+    for has_message in [false, true] {
+        let (_tmp, memory, shell) = registry();
+        let mut turn_guard = TelegramTurnGuard::new();
+        if has_message {
+            turn_guard.record_visible_text("Already delivered");
+        } else {
+            turn_guard.queue_pending_reaction(99, 42, "👍");
+        }
+        let guard = Arc::new(Mutex::new(turn_guard));
+        let registry = ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            "/tmp/lethe-cache",
+            &shell,
+            ToolRuntime {
+                allow_silent_completion: true,
+                telegram: Some(TelegramToolContext {
+                    token: "unused-token".to_string(),
+                    chat_id: 99,
+                    user_id: Some(7),
+                    last_message_id: Some(42),
+                    guard: Some(guard.clone()),
+                    dry_run: true,
+                    sent_messages: None,
+                }),
+                ..ToolRuntime::default()
+            },
+        );
+
+        let result: serde_json::Value =
+            serde_json::from_str(&registry.execute("wake_finish_silently", &json!({}))).unwrap();
+        assert_eq!(result["success"], false);
+        assert!(result["error"].as_str().unwrap().contains("after Telegram"));
+        let guard = guard.lock().unwrap();
+        assert!(!guard.silent_completion_requested());
+        assert_eq!(guard.visible_messages_sent(), usize::from(has_message));
+        assert_eq!(guard.has_pending_reactions(), !has_message);
+    }
+}
+
+#[test]
 fn exposes_and_executes_telegram_tools_when_context_is_present() {
     use std::sync::{Arc, Mutex};
 

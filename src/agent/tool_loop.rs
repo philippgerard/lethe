@@ -55,6 +55,14 @@ fn telegram_delivery_confirmed(guard: Option<&SharedTelegramTurnGuard>) -> bool 
         .is_some_and(|guard| guard.visible_messages_sent() > 0)
 }
 
+fn invalidate_silent_completion_for_tool(guard: Option<&SharedTelegramTurnGuard>, tool_name: &str) {
+    if tool_name != "wake_finish_silently"
+        && let Some(mut guard) = guard.and_then(|guard| guard.lock().ok())
+    {
+        guard.clear_silent_completion();
+    }
+}
+
 fn empty_response_nudge(
     telegram_delivery_confirmed: bool,
     tool_model_fallback: bool,
@@ -165,6 +173,7 @@ const FREE_TOOL_NAMES: &[&str] = &[
     "note_get",
     // Chat egress (Telegram-branded + the client-transport alias)
     "telegram_send_message",
+    "wake_finish_silently",
     "telegram_send_file",
     "telegram_react",
     "chat_send_message",
@@ -1120,6 +1129,10 @@ pub(super) async fn complete_turn_with_tools_config_shared(
         let mut image_views = Vec::new();
         let mut round_progress = ToolRoundProgress::default();
         for call in tool_calls {
+            // Quiet completion applies only after the final tool attempt. Clear
+            // it before dispatch, including unknown, unloaded, or failing tools,
+            // so later work cannot inherit an earlier decision to stay silent.
+            invalidate_silent_completion_for_tool(telegram_guard.as_ref(), &call.fn_name);
             let call_id = call.call_id.clone();
             let tool_name = call.fn_name.clone();
             let args_string = call.fn_arguments.to_string();
@@ -2014,6 +2027,44 @@ mod tests {
         delivered.record_visible_message();
         let delivered_guard = Arc::new(Mutex::new(delivered));
         assert!(telegram_delivery_confirmed(Some(&delivered_guard)));
+    }
+
+    #[test]
+    fn any_later_tool_attempt_invalidates_quiet_completion() {
+        let guard = Arc::new(Mutex::new(
+            crate::interfaces::telegram::TelegramTurnGuard::new(),
+        ));
+        for tool_name in [
+            "read_file",
+            "telegram_send_message",
+            "unknown_tool",
+            "request_tool",
+            "think_deeply",
+        ] {
+            guard.lock().unwrap().request_silent_completion().unwrap();
+
+            invalidate_silent_completion_for_tool(Some(&guard), tool_name);
+
+            assert!(
+                !guard.lock().unwrap().silent_completion_requested(),
+                "later {tool_name} must invalidate silence before it runs"
+            );
+        }
+    }
+
+    #[test]
+    fn quiet_completion_can_be_requested_again_after_later_work() {
+        let guard = Arc::new(Mutex::new(
+            crate::interfaces::telegram::TelegramTurnGuard::new(),
+        ));
+        guard.lock().unwrap().request_silent_completion().unwrap();
+        invalidate_silent_completion_for_tool(Some(&guard), "read_file");
+        assert!(!guard.lock().unwrap().silent_completion_requested());
+
+        invalidate_silent_completion_for_tool(Some(&guard), "wake_finish_silently");
+        guard.lock().unwrap().request_silent_completion().unwrap();
+        invalidate_silent_completion_for_tool(Some(&guard), "wake_finish_silently");
+        assert!(guard.lock().unwrap().silent_completion_requested());
     }
 
     #[test]

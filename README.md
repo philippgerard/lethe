@@ -522,7 +522,7 @@ token. Every other HTTP route and the browser WebSocket require
 | `/webhooks/linq` | `POST` | Optional signed Linq ingress; publish only this route for iMessage webhooks. |
 | `/imessage/status` | `GET` | Authenticated Linq queue and delivery status; see [setup and limits](docs/imessage.md). |
 | `/chat` | `POST` | Send a user message and receive SSE response events. |
-| `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent (`message`, optional `chat_id`). |
+| `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent. The agent can call `wake_finish_silently` when no notification is warranted (`message`, optional `chat_id`). |
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |
 | `/browser/stream` | `GET`/WebSocket | Relay the live vault-sealed browser viewport and input stream. |
 | `/cancel` | `POST` | Cancel active work for a chat. |
@@ -535,6 +535,16 @@ token. Every other HTTP route and the browser WebSocket require
 | `/secure-input` | `POST` | Deliver a browser-sealed credential envelope to a pending agent-id prompt (hosted mode). |
 | `/secure-input/cancel` | `POST` | Dismiss a pending secure-input request. |
 | `/secure-input/pending` | `GET` | Live secure-input requests (with sealing envelope) for tab re-hydration. |
+
+Scheduled tasks with conditional notifications should call `wake_finish_silently`
+as their final tool when there is nothing to report, then return a short internal
+acknowledgment. This tool is available only during `/wake`; it does not send a
+message. A completed quiet run returns `success: true`, `turn_completed: true`,
+`delivered: false`, and `delivery_status: "quiet_completed"`. Further tool work
+invalidates the quiet request; call it again only after that work completes.
+Checkpoints, turn failures, and failed reactions retain their failure status.
+Empty final responses and punctuation are not silence signals, and ordinary
+final replies still use the existing fallback delivery.
 
 `/wake` reports turn completion and Telegram delivery separately. A confirmed
 Telegram tool side effect can coexist with `success: false` when the turn later
