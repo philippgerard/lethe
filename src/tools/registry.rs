@@ -138,6 +138,8 @@ pub struct ActorToolContext {
 
 #[derive(Clone, Default)]
 pub struct ToolRuntime {
+    /// Trusted routing override for proactive notifications only.
+    pub notification_egress: Option<std::sync::Arc<dyn MessageEgress + Send + Sync>>,
     pub telegram: Option<TelegramToolContext>,
     /// Trusted opt-in for scheduled wake turns that may complete without any
     /// user-visible message. Ordinary chat and subagent turns leave this false.
@@ -171,6 +173,7 @@ pub struct ToolRuntime {
 impl std::fmt::Debug for ToolRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolRuntime")
+            .field("notification_egress", &self.notification_egress.is_some())
             .field("telegram", &self.telegram.is_some())
             .field("allow_silent_completion", &self.allow_silent_completion)
             .field("client", &self.client.is_some())

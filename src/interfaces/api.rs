@@ -1,3 +1,4 @@
+use crate::interfaces::notification_delivery::NotificationDelivery;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -45,7 +46,7 @@ const WAKE_TURN_TIMEOUT: Duration = Duration::from_secs(240);
 const WAKE_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const WAKE_TURN_FAILURE_MESSAGE: &str = "The scheduled task stopped before completion. Completed actions may have taken effect; check its state before restarting.";
 const WAKE_TURN_TIMEOUT_MESSAGE: &str = "The scheduled task timed out before completion. Completed actions may have taken effect; check its state before restarting.";
-const WAKE_DELIVERY_INSTRUCTIONS: &str = "[Lethe scheduled-wake delivery contract]\nThis is a scheduled task, not an interactive user message. Normal final text is delivered automatically unless a Telegram delivery tool sent content. If the task requires no notification, call wake_finish_silently as your final tool after all work, then return a short non-empty internal acknowledgment. Any subsequent tool attempt invalidates quiet completion. Do not use a dot, an empty response, or an acknowledgment alone to request silence. Any task text saying plain wake text is discarded is outdated. If a notification is warranted, deliver it normally or with telegram_send_message.";
+const WAKE_DELIVERY_INSTRUCTIONS: &str = "[Lethe scheduled-wake delivery contract]\nThis is a scheduled task, not an interactive user message. Normal final text is routed to the selected notification channels automatically unless a delivery tool already sent content. telegram_send_message also follows those preferences, including iMessage-only delivery. If the task requires no notification, call wake_finish_silently as your final tool after all work, then return a short non-empty internal acknowledgment. Any subsequent tool attempt invalidates quiet completion. Do not use a dot, an empty response, or an acknowledgment alone to request silence. Any task text saying plain wake text is discarded is outdated. If a notification is warranted, deliver it normally or with telegram_send_message.";
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -650,6 +651,8 @@ pub async fn serve_with_agent(
         let transport = Arc::new(crate::interfaces::imessage::ImessageTransport::new(
             settings.imessage.clone(),
             &state_dir,
+            !settings.telegram.bot_token.is_empty()
+                && !settings.telegram.allowed_user_ids.is_empty(),
         )?);
         let tasks = transport.start(
             state.agent.clone(),
@@ -1443,6 +1446,7 @@ async fn annotate_wake_response(
     task_name: &str,
     failure_kind: &str,
     imessage_status: &str,
+    delivery: Option<&NotificationDelivery>,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
     let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
@@ -1460,6 +1464,22 @@ async fn annotate_wake_response(
     body["run_id"] = json!(run_id);
     body["task_name"] = json!(task_name);
     body["imessage_status"] = json!(imessage_status);
+    if let Some(delivery) = delivery {
+        body["telegram_delivered_messages"] = json!(delivery.telegram_messages());
+        body["imessage_queued_messages"] = json!(delivery.imessage_messages());
+        // Durable acceptance is not device delivery. Keep the scheduler's
+        // success signal, but don't claim Telegram delivery for iMessage-only.
+        if delivery.telegram_messages() == 0 && delivery.imessage_messages() > 0 {
+            body["delivered"] = json!(false);
+            body["delivered_messages"] = json!(0);
+            if body["success"] == true {
+                body["delivery_status"] = json!("notification_queued");
+            }
+        }
+        if delivery.imessage_messages() > 0 {
+            parts.status = StatusCode::OK;
+        }
+    }
     if body["success"] == false {
         body["failure_kind"] = json!(failure_kind);
     }
@@ -2032,14 +2052,13 @@ async fn run_wake_delivery_with_timeout(
     }
 }
 
-async fn send_wake_telegram_message(
-    client: TelegramClient,
-    chat_id: i64,
+async fn send_wake_notification(
+    delivery: Arc<NotificationDelivery>,
     text: String,
     progress: Arc<WakeDeliveryProgress>,
     visible_texts: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> std::result::Result<i64, String> {
-    match client.send_message(chat_id, &text).await {
+    match delivery.send_text(text.clone()).await {
         Ok(message_id) => {
             progress.record_message();
             if let Ok(mut visible_texts) = visible_texts.lock() {
@@ -2135,9 +2154,8 @@ async fn wake(
         );
     };
 
-    // Bind the turn to the real Telegram egress. message_egress() prefers
-    // runtime.telegram over the SSE client egress, so telegram_send_message
-    // reaches Telegram instead of a discarded response stream.
+    // Keep the wake control guard while routing user-visible tool output and
+    // fallback notices through the current notification preferences.
     let telegram_client = match TelegramClient::new(token.clone(), vec![chat_id]) {
         Ok(client) => client,
         Err(error) => {
@@ -2147,7 +2165,19 @@ async fn wake(
             );
         }
     };
-    let (runtime, delivery_guard) = wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
+    let (mut runtime, delivery_guard) =
+        wake_tool_runtime(token, chat_id, state.secure_prompt.clone());
+    let notification_delivery =
+        match NotificationDelivery::new(&state.settings, chat_id, Some(delivery_guard.clone())) {
+            Ok(delivery) => delivery,
+            Err(_) => {
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Notification settings are unavailable",
+                );
+            }
+        };
+    runtime.notification_egress = Some(notification_delivery.clone());
     let run_id = Uuid::new_v4().to_string();
     let task_name = wake_task_name(body.task_name.as_deref());
     tracing::info!(%run_id, %task_name, "scheduled task started");
@@ -2185,14 +2215,8 @@ async fn wake(
     };
 
     let fallback_visible_texts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let mut notification_texts = tool_visible_texts.clone();
     let (response, failure_kind) = match turn_result {
         Ok(Ok(result)) => {
-            notification_texts.extend(wake_fallback_notifications(
-                &result,
-                tool_messages_sent,
-                silent_completion_requested,
-            ));
             let reply_chars = result
                 .complete_text()
                 .map(|reply| reply.chars().count())
@@ -2210,7 +2234,7 @@ async fn wake(
             let reaction_progress = progress.clone();
             let reaction_client = telegram_client.clone();
             let send_progress = progress.clone();
-            let fallback_client = telegram_client.clone();
+            let fallback_client = notification_delivery.clone();
             let visible_texts = fallback_visible_texts.clone();
             let delivery = finish_wake_delivery(
                 chat_id,
@@ -2227,7 +2251,7 @@ async fn wake(
                     let client = fallback_client.clone();
                     let progress = send_progress.clone();
                     let visible_texts = visible_texts.clone();
-                    send_wake_telegram_message(client, chat_id, text, progress, visible_texts)
+                    send_wake_notification(client, text, progress, visible_texts)
                 },
             );
             let response = run_wake_delivery_with_timeout(
@@ -2276,9 +2300,6 @@ async fn wake(
                     }
                 };
             let user_message = wake_failure_notice(&task_name, &run_id, user_message);
-            if tool_messages_sent == 0 {
-                notification_texts.push(user_message.clone());
-            }
             let progress = Arc::new(WakeDeliveryProgress::new(
                 tool_messages_sent,
                 pending_reactions.len(),
@@ -2286,7 +2307,7 @@ async fn wake(
             let reaction_progress = progress.clone();
             let reaction_client = telegram_client.clone();
             let send_progress = progress.clone();
-            let notification_client = telegram_client.clone();
+            let notification_client = notification_delivery.clone();
             let visible_texts = fallback_visible_texts.clone();
             let delivery = finish_wake_failure(
                 chat_id,
@@ -2302,13 +2323,7 @@ async fn wake(
                     send_wake_telegram_reaction(client, pending, progress)
                 },
                 move |text| {
-                    send_wake_telegram_message(
-                        notification_client,
-                        chat_id,
-                        text,
-                        send_progress,
-                        visible_texts,
-                    )
+                    send_wake_notification(notification_client, text, send_progress, visible_texts)
                 },
             );
             let delivery_kind = format!("{failure_kind}_notice");
@@ -2333,12 +2348,9 @@ async fn wake(
             let reaction_progress = progress.clone();
             let reaction_client = telegram_client.clone();
             let send_progress = progress.clone();
-            let notification_client = telegram_client.clone();
+            let notification_client = notification_delivery.clone();
             let visible_texts = fallback_visible_texts.clone();
             let user_message = wake_failure_notice(&task_name, &run_id, WAKE_TURN_TIMEOUT_MESSAGE);
-            if tool_messages_sent == 0 {
-                notification_texts.push(user_message.clone());
-            }
             let delivery = finish_wake_failure(
                 chat_id,
                 tool_messages_sent,
@@ -2356,13 +2368,7 @@ async fn wake(
                     send_wake_telegram_reaction(client, pending, progress)
                 },
                 move |text| {
-                    send_wake_telegram_message(
-                        notification_client,
-                        chat_id,
-                        text,
-                        send_progress,
-                        visible_texts,
-                    )
+                    send_wake_notification(notification_client, text, send_progress, visible_texts)
                 },
             );
             let response = run_wake_delivery_with_timeout(
@@ -2384,50 +2390,18 @@ async fn wake(
         Ok(fallback_texts) => visible_texts.extend(fallback_texts.iter().cloned()),
         Err(error) => tracing::warn!(error = %error, "wake delivery transcript lock poisoned"),
     }
-    let imessage_status = queue_wake_imessage(&state, chat_id, &run_id, &notification_texts);
+    let imessage_status = notification_delivery.imessage_status();
     persist_wake_visible_history(state.agent.as_ref(), visible_texts);
     tracing::info!(%run_id, %task_name, imessage_status, "scheduled task finished");
-    annotate_wake_response(response, &run_id, &task_name, failure_kind, imessage_status).await
-}
-
-fn wake_fallback_notifications(
-    result: &TurnResult,
-    tool_messages_sent: usize,
-    silent: bool,
-) -> Vec<String> {
-    if tool_messages_sent > 0 || silent {
-        return Vec::new();
-    }
-    result
-        .complete_text()
-        .map(|reply| split_telegram_messages(reply.trim()))
-        .unwrap_or_default()
-}
-
-fn queue_wake_imessage(
-    state: &ApiState,
-    chat_id: i64,
-    run_id: &str,
-    texts: &[String],
-) -> &'static str {
-    // Explicit deliveries to another recipient must never be copied to the principal.
-    if texts.is_empty() {
-        return "no_notification";
-    }
-    if Some(chat_id) != resolve_wake_chat_id(&state.settings, None) {
-        return "different_recipient";
-    }
-    let Some(transport) = state.imessage.as_ref() else {
-        return "disabled";
-    };
-    match transport.queue_scheduled_notifications(texts) {
-        Ok(true) => "queued",
-        Ok(false) => "not_subscribed",
-        Err(error) => {
-            tracing::error!(%run_id, error = %crate::diagnostics::error_summary(&error), "scheduled iMessage notification could not be queued");
-            "queue_failed"
-        }
-    }
+    annotate_wake_response(
+        response,
+        &run_id,
+        &task_name,
+        failure_kind,
+        imessage_status,
+        Some(&notification_delivery),
+    )
+    .await
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
@@ -2542,6 +2516,7 @@ mod tests {
                         native_polls: false,
                     },
                     &directory.path().join("linq"),
+                    true,
                 )
                 .unwrap(),
             ));
@@ -3026,6 +3001,113 @@ mod tests {
         assert_eq!(body["delivered"], false);
         assert_eq!(body["delivery_status"], "quiet_completed");
         assert!(memory.messages.get_recent(10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wake_tools_route_to_imessage_only_and_report_queue_acceptance() {
+        use crate::interfaces::notifications::{
+            Channel, NotificationCommand, NotificationPreferences,
+        };
+        let tmp = tempdir().unwrap();
+        let mut settings = test_settings(tmp.path());
+        settings.telegram.bot_token = "must-not-call-telegram".into();
+        settings.telegram.allowed_user_ids = vec![42];
+        settings.imessage = crate::config::ImessageConfig {
+            enabled: true,
+            api_token: "test".into(),
+            webhook_secret: "secret".into(),
+            allowed_senders: vec!["+49123456789".into()],
+            native_polls: false,
+        };
+        let prefs = NotificationPreferences::open(
+            &tmp.path().join("data/transports"),
+            &settings.imessage,
+            true,
+        )
+        .unwrap();
+        prefs
+            .command(
+                Channel::Imessage,
+                NotificationCommand::Set(true),
+                Some(("chat-1", "+49123456789")),
+            )
+            .unwrap();
+        prefs
+            .command(Channel::Telegram, NotificationCommand::Set(false), None)
+            .unwrap();
+        let memory = crate::memory::MemoryStore::from_settings(&settings).unwrap();
+        let shell = crate::tools::shell::ShellTools::new(memory.workspace_dir());
+        let (mut runtime, guard) = wake_tool_runtime(settings.telegram.bot_token.clone(), 42, None);
+        let routing = NotificationDelivery::new(&settings, 42, Some(guard.clone())).unwrap();
+        runtime.notification_egress = Some(routing.clone());
+        let registry = crate::tools::registry::ToolRegistry::with_runtime(
+            &memory,
+            memory.workspace_dir(),
+            tmp.path().join("cache"),
+            &shell,
+            runtime,
+        );
+        let outcome: Value = serde_json::from_str(
+            &registry
+                .execute_async(
+                    "telegram_send_message",
+                    &json!({"text": "Scheduled reminder"}),
+                )
+                .await,
+        )
+        .unwrap();
+        assert_eq!(outcome["success"], true);
+        assert_eq!(outcome["telegram_status"], "off");
+        let delivery = take_wake_guard_delivery(&guard).unwrap();
+        assert_eq!(delivery.tool_messages_sent, 1);
+        let response = finish_wake_delivery(
+            42,
+            TurnResult::Complete("redundant final".into()),
+            delivery.tool_messages_sent,
+            false,
+            delivery.pending_reactions,
+            |_| async { panic!("must not react") },
+            |_| async { panic!("must not duplicate the tool notification") },
+        )
+        .await;
+        let body = response_json(
+            annotate_wake_response(
+                response,
+                "run",
+                "reminder",
+                "delivery_failed",
+                routing.imessage_status(),
+                Some(&routing),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["success"], true);
+        assert_eq!(body["delivered"], false);
+        assert_eq!(body["delivery_status"], "notification_queued");
+        assert_eq!(body["imessage_queued_messages"], 1);
+        assert_eq!(body["telegram_delivered_messages"], 0);
+        // A final fallback and a task failure use exactly the same routing.
+        let progress = Arc::new(WakeDeliveryProgress::new(0, 0));
+        let visible = Arc::new(StdMutex::new(Vec::new()));
+        send_wake_notification(
+            routing.clone(),
+            "Final fallback".into(),
+            progress.clone(),
+            visible.clone(),
+        )
+        .await
+        .unwrap();
+        send_wake_notification(
+            routing.clone(),
+            "Task failure notice".into(),
+            progress,
+            visible,
+        )
+        .await
+        .unwrap();
+        assert_eq!(routing.imessage_messages(), 3);
+        assert_eq!(routing.telegram_messages(), 0);
     }
 
     #[tokio::test]
@@ -3534,7 +3616,8 @@ mod tests {
             )
                 .into_response();
             let response =
-                annotate_wake_response(response, "run-123", "morning-brief", kind, "queued").await;
+                annotate_wake_response(response, "run-123", "morning-brief", kind, "queued", None)
+                    .await;
             assert_eq!(response.status(), StatusCode::OK);
             let body = response_json(response).await;
             assert_eq!(body["run_id"], "run-123");
@@ -3566,6 +3649,7 @@ mod tests {
                 "brief",
                 "checkpoint",
                 "no_notification",
+                None,
             )
             .await,
         )
@@ -3582,40 +3666,19 @@ mod tests {
             &WakeReactionDelivery::default(),
         );
         let body = response_json(
-            annotate_wake_response(completed, "run-2", "brief", "delivery_failed", "queued").await,
+            annotate_wake_response(
+                completed,
+                "run-2",
+                "brief",
+                "delivery_failed",
+                "queued",
+                None,
+            )
+            .await,
         )
         .await;
         assert_eq!(body["success"], true);
         assert!(body.get("failure_kind").is_none());
-    }
-
-    #[tokio::test]
-    async fn wake_notification_routing_preserves_quiet_and_recipient_boundaries() {
-        let mut fixture = LinqRouteFixture::new().await;
-        fixture.state.settings.telegram.allowed_user_ids = vec![42];
-        let long_reply = TurnResult::Complete("x".repeat(5000));
-        let texts = wake_fallback_notifications(&long_reply, 0, false);
-        assert_eq!(texts.iter().map(String::len).sum::<usize>(), 5000);
-        assert!(wake_fallback_notifications(&long_reply, 1, false).is_empty());
-        assert!(wake_fallback_notifications(&long_reply, 0, true).is_empty());
-        assert!(wake_fallback_notifications(&TurnResult::Checkpointed, 0, false).is_empty());
-        assert_eq!(
-            queue_wake_imessage(&fixture.state, 42, "run", &[]),
-            "no_notification"
-        );
-        assert_eq!(
-            queue_wake_imessage(&fixture.state, 99, "run", &texts),
-            "different_recipient"
-        );
-        assert_eq!(
-            queue_wake_imessage(&fixture.state, 42, "run", &texts),
-            "not_subscribed"
-        );
-        fixture.state.imessage = None;
-        assert_eq!(
-            queue_wake_imessage(&fixture.state, 42, "run", &texts),
-            "disabled"
-        );
     }
 
     #[tokio::test]
@@ -3634,6 +3697,7 @@ mod tests {
             "brief",
             "delivery_failed",
             "queue_failed",
+            None,
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);

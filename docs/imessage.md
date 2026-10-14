@@ -114,8 +114,9 @@ does not authorize that invocation.
 | `/approvals` | Show pending and approved, unconsumed requests in this conversation. |
 | `/resume <request-id>` | Continue an approved, unconsumed, unexpired request after checking the current state. |
 | `/cancel` | Stop this conversation's current iMessage turn and clear its queued input. Independently running workers continue. |
-| `/notifications on` | Choose this conversation as the destination for reviewed background notifications. |
-| `/notifications off` | Remove this conversation's notification subscription. |
+| `/notifications` or `/notifications status` | Show Telegram and iMessage notification settings. |
+| `/notifications on` | Link this conversation and enable iMessage notifications. |
+| `/notifications off` | Disable iMessage notifications; automatically enable Telegram if it was the last channel on. |
 
 `execute_approved_action(request_id)` consumes an approved payload before
 dispatching its saved arguments. It cannot be reused, including when a tool
@@ -174,20 +175,31 @@ or live evaluation is part of ordinary repository validation.
 
 ## Background updates and recovery
 
-Notifications start off. `/notifications on` stores one chat/sender destination;
-opting in from another allowed direct conversation replaces it. Consent persists
-across restarts but is used only while the sender remains allowlisted.
-`/notifications off` applies to that same destination and skips unsent queued
-notifications. An outgoing request already in progress cannot be recalled.
+Telegram notifications start on; iMessage starts off until linked. Existing
+iMessage subscriptions are preserved during upgrade. In either private chat,
+`/notifications` shows both settings and `/notifications on` or `/notifications off`
+changes that channel. Both may be on. Turning off the last enabled channel turns
+on the other and explains the switch. If the other channel is not configured or
+iMessage has never been linked, the current channel stays on with an explanation.
+These commands run locally without a model call. Replies to your own messages,
+including command confirmations, always return to the originating chat.
 
-Normal Brainstem emissions are forwarded after the existing notification review.
-Scheduled `/wake` messages and failure notices for the configured principal are
-also mirrored to this subscribed conversation through the durable outbox. A
-Telegram delivery failure does not suppress a scheduled fallback or failure
-notice on iMessage. Explicit wakes to other Telegram recipients are excluded.
-Quiet scheduled turns enqueue nothing. A file sent with `telegram_send_file` is
-mirrored as the text "An attachment was sent in Telegram." followed by its
-caption, if any; the file itself is not uploaded to iMessage.
+The iMessage destination and preferences persist across restarts. Turning it off
+retains the linked destination for automatic reactivation, but invalidates unsent
+notifications; turning it back on does not replay those old notices. Linking from
+another allowed direct conversation replaces the destination. Delivery rechecks
+the sender allowlist and current preference. An outgoing request already in
+progress cannot be recalled. If iMessage becomes unavailable or its sender is
+removed, Telegram is selected as the remaining usable channel.
+
+Reviewed Brainstem emissions, scheduled `/wake` messages and failure notices,
+and generated actor updates follow these preferences. A Telegram send failure
+does not suppress durable iMessage queueing when iMessage is enabled. Explicit
+wakes to other Telegram recipients are excluded from owner routing.
+Quiet scheduled turns enqueue nothing. Attachments still require Telegram;
+when Telegram is off, the tool returns an error asking for a text summary.
+When both channels are on, an attachment sent to Telegram is described in the
+iMessage notification with its caption; the file itself is not uploaded there.
 Raw actor messages and every worker completion are not forwarded automatically. Existing `HEARTBEAT_ENABLED`,
 `HEARTBEAT_INTERVAL`, `PROACTIVE_MAX_PER_DAY`, and
 `PROACTIVE_COOLDOWN_MINUTES` govern proactive evaluation and rate limits.

@@ -16,6 +16,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use super::notifications::{Channel, NotificationCommand, NotificationPreferences};
 use crate::agent::{Agent, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
 use crate::config::ImessageConfig;
 use crate::interfaces::actions::{ActionStore, ApprovalRequest, ApprovalScope, ApprovalStatus};
@@ -63,12 +64,12 @@ impl Inbound {
 }
 
 #[derive(Clone)]
-struct DeliveryStore {
+pub(crate) struct DeliveryStore {
     path: PathBuf,
 }
 
 impl DeliveryStore {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -117,7 +118,7 @@ impl DeliveryStore {
         Ok(store)
     }
 
-    fn connection(&self) -> Result<Connection> {
+    pub(crate) fn connection(&self) -> Result<Connection> {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         Ok(connection)
@@ -444,6 +445,7 @@ enum ProcessOutcome {
 }
 
 pub struct ImessageTransport {
+    notifications: NotificationPreferences,
     config: ImessageConfig,
     client: LinqClient,
     store: DeliveryStore,
@@ -470,16 +472,11 @@ impl Drop for ImessageTasks {
 }
 
 impl ImessageTransport {
-    pub fn new(config: ImessageConfig, state_dir: &Path) -> Result<Self> {
+    pub fn new(config: ImessageConfig, state_dir: &Path, telegram_available: bool) -> Result<Self> {
         config.validate().map_err(|error| anyhow!(error))?;
         let store = DeliveryStore::open(&state_dir.join("linq.sqlite"))?;
-        store.connection()?.execute_batch(
-            "CREATE TABLE IF NOT EXISTS linq_notification_target (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                chat TEXT NOT NULL, sender TEXT NOT NULL
-            );",
-        )?;
         Ok(Self {
+            notifications: NotificationPreferences::open(state_dir, &config, telegram_available)?,
             client: LinqClient::new(config.api_token.clone())?,
             config,
             store,
@@ -540,19 +537,20 @@ impl ImessageTransport {
         };
         // Hold registration's lock before publishing control commands to the
         // inbox, so the worker cannot claim a command while its handler runs.
-        let control =
-            if notification_command(&inbound.text).is_some() || inbound.text.trim() == "/cancel" {
-                Some(
-                    self.active
-                        .lock()
-                        .map_err(|_| anyhow!("iMessage turn lock unavailable"))?,
-                )
-            } else {
-                None
-            };
+        let control = if NotificationCommand::parse(&inbound.text).is_some()
+            || inbound.text.trim() == "/cancel"
+        {
+            Some(
+                self.active
+                    .lock()
+                    .map_err(|_| anyhow!("iMessage turn lock unavailable"))?,
+            )
+        } else {
+            None
+        };
         let accepted = self.store.enqueue(&inbound)?;
         if accepted {
-            if let Some(enabled) = notification_command(&inbound.text) {
+            if let Some(enabled) = NotificationCommand::parse(&inbound.text) {
                 self.set_notifications(&inbound, enabled)?;
                 self.store.finish(&inbound.event_id, "done")?;
                 return Ok(true);
@@ -750,7 +748,7 @@ impl ImessageTransport {
         let scope = inbound.scope();
         let now = chrono::Utc::now().timestamp();
         let mut message = inbound.text.clone();
-        if let Some(enabled) = notification_command(&message) {
+        if let Some(enabled) = NotificationCommand::parse(&message) {
             self.set_notifications(inbound, enabled)?;
             return Ok(ProcessOutcome::Complete);
         }
@@ -871,22 +869,12 @@ impl ImessageTransport {
         Ok(ProcessOutcome::Complete)
     }
 
-    fn set_notifications(&self, inbound: &Inbound, enabled: bool) -> Result<()> {
-        let connection = self.store.connection()?;
-        let content = if enabled {
-            connection.execute(
-                "INSERT INTO linq_notification_target VALUES (1,?1,?2)
-                 ON CONFLICT(singleton) DO UPDATE SET chat=excluded.chat,sender=excluded.sender",
-                params![inbound.chat, inbound.sender],
-            )?;
-            "Reminders and reviewed background updates will go to this conversation. Use /notifications off to stop them."
-        } else {
-            connection.execute(
-                "DELETE FROM linq_notification_target WHERE chat=?1 AND sender=?2",
-                params![inbound.chat, inbound.sender],
-            )?;
-            "Notifications are off for this conversation."
-        };
+    fn set_notifications(&self, inbound: &Inbound, command: NotificationCommand) -> Result<()> {
+        let content = self.notifications.command(
+            Channel::Imessage,
+            command,
+            Some((&inbound.chat, &inbound.sender)),
+        )?;
         if !self.queue(inbound, json!({"kind": "text", "content": content})) {
             bail!("notification acknowledgement could not be persisted");
         }
@@ -894,16 +882,10 @@ impl ImessageTransport {
     }
 
     fn notification_target(&self) -> Result<Option<Inbound>> {
-        let target: Option<(String, String)> = self
-            .store
-            .connection()?
-            .query_row(
-                "SELECT chat,sender FROM linq_notification_target WHERE singleton=1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(target
+        Ok(self
+            .notifications
+            .route()?
+            .imessage
             .filter(|(_, sender)| self.config.allowed_senders.contains(sender))
             .map(|(chat, sender)| Inbound {
                 event_id: String::new(),
@@ -915,21 +897,16 @@ impl ImessageTransport {
             }))
     }
 
-    /// Queue scheduled text for the current opted-in principal. Delivery
-    /// rechecks consent and allowlisting.
     pub(crate) fn queue_scheduled_notifications(&self, texts: &[String]) -> Result<bool> {
-        let Some(target) = self.notification_target()? else {
+        if self.notification_target()?.is_none() {
             return Ok(false);
-        };
-        for text in texts {
-            if text.trim().is_empty() {
-                continue;
-            }
-            let output = prepare_output(json!({"kind": "notification", "content": text}))?;
-            self.store.queue_output(&target, output)?;
+        }
+        let mut queued = false;
+        for text in texts.iter().filter(|text| !text.trim().is_empty()) {
+            queued |= self.notifications.queue_imessage(text)?;
         }
         self.outbox_notify.notify_one();
-        Ok(true)
+        Ok(queued)
     }
 
     async fn run_notifications(self: Arc<Self>, brainstem: BrainstemHandle) {
@@ -947,8 +924,8 @@ impl ImessageTransport {
             tokio::select! {
                 emission = receiver.recv() => match emission {
                     Ok(emission) => {
-                        if let Ok(Some(current_target)) = self.notification_target() {
-                            self.queue(&current_target, json!({"kind": "notification", "content": emission.message}));
+                        if let Err(error) = self.queue_scheduled_notifications(&[emission.message]) {
+                            tracing::warn!(error = %error, "background iMessage notification could not be queued");
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -990,9 +967,11 @@ impl ImessageTransport {
             return Ok(false);
         }
         if output["kind"].as_str() == Some("notification") {
-            return Ok(self
-                .notification_target()?
-                .is_some_and(|target| target.chat == chat && target.sender == sender));
+            let route = self.notifications.route()?;
+            return Ok(route
+                .imessage
+                .is_some_and(|target| target.0 == chat && target.1 == sender)
+                && output["notification_generation"].as_i64().unwrap_or(0) == route.generation);
         }
         Ok(true)
     }
@@ -1192,7 +1171,7 @@ fn output_text(output: &Value) -> Result<String> {
     })
 }
 
-fn prepare_output(mut output: Value) -> Result<Value> {
+pub(crate) fn prepare_output(mut output: Value) -> Result<Value> {
     // Persist rendering before the first send: a retry must keep identical
     // message chunks, decoration ranges, and provider idempotency keys.
     let parts = render_imessage_markdown(&output_text(&output)?).chunks(3000);
@@ -1230,14 +1209,6 @@ fn retryable_poll_error(error: &LinqError) -> bool {
     }
 }
 
-fn notification_command(text: &str) -> Option<bool> {
-    match text.trim() {
-        "/notifications on" => Some(true),
-        "/notifications off" => Some(false),
-        _ => None,
-    }
-}
-
 fn approval_command(text: &str) -> Option<(bool, &str)> {
     let (command, id) = text.trim().split_once(' ')?;
     if Uuid::parse_str(id).is_err() {
@@ -1271,7 +1242,9 @@ mod tests {
             "Run failed; check status".to_string(),
         ];
         assert!(!current.queue_scheduled_notifications(&texts).unwrap());
-        current.set_notifications(&inbound(), true).unwrap();
+        current
+            .set_notifications(&inbound(), NotificationCommand::Set(true))
+            .unwrap();
         assert!(current.queue_scheduled_notifications(&texts).unwrap());
         drop(current);
         let restored = transport(directory.path());
@@ -1296,13 +1269,27 @@ mod tests {
                 .output_is_authorized("chat-1", "+49123456789", output)
                 .unwrap()
         );
-        restored.set_notifications(&inbound(), false).unwrap();
+        restored
+            .set_notifications(&inbound(), NotificationCommand::Set(false))
+            .unwrap();
         assert!(
             !restored
                 .output_is_authorized("chat-1", "+49123456789", output)
                 .unwrap()
         );
         assert!(!restored.queue_scheduled_notifications(&texts).unwrap());
+        restored
+            .set_notifications(&inbound(), NotificationCommand::Set(true))
+            .unwrap();
+        assert!(
+            !restored
+                .output_is_authorized("chat-1", "+49123456789", output)
+                .unwrap()
+        );
+        restored
+            .accept(command_event("status", "+49123456789", "/notifications"))
+            .unwrap();
+        assert!(restored.store.next_inbound().unwrap().is_none());
     }
 
     #[test]
@@ -1348,6 +1335,7 @@ mod tests {
                 native_polls: false,
             },
             directory,
+            true,
         )
         .unwrap()
     }
@@ -1698,13 +1686,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(brainstem.subscriber_count(), 0);
         transport
-            .store
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO linq_notification_target VALUES (1,'chat-1','+49123456789')",
-                [],
-            )
+            .accept(command_event("on", "+49123456789", "/notifications on"))
             .unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while brainstem.subscriber_count() == 0 {
@@ -1715,10 +1697,7 @@ mod tests {
         .unwrap();
         assert_eq!(brainstem.subscriber_count(), 1);
         transport
-            .store
-            .connection()
-            .unwrap()
-            .execute("DELETE FROM linq_notification_target", [])
+            .accept(command_event("off", "+49123456789", "/notifications off"))
             .unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while brainstem.subscriber_count() > 0 {
@@ -1970,6 +1949,7 @@ mod tests {
                 native_polls: false,
             },
             directory.path(),
+            true,
         )
         .unwrap();
         let store = &transport.store;
