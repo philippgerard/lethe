@@ -134,6 +134,36 @@ enum OpenAiOAuthError {
     Other(#[from] anyhow::Error),
 }
 
+#[derive(Debug, Error)]
+#[error("OpenAI OAuth stream failed: {message}")]
+struct OpenAiStreamFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl OpenAiStreamFailure {
+    fn incomplete() -> Self {
+        Self {
+            message: "stream ended before completion".to_string(),
+            retryable: true,
+        }
+    }
+}
+
+fn classify_stream_failure(error: anyhow::Error) -> OpenAiOAuthError {
+    if error
+        .downcast_ref::<OpenAiStreamFailure>()
+        .is_some_and(|error| error.retryable)
+    {
+        OpenAiOAuthError::Transient {
+            message: error.to_string(),
+            retry_after: Duration::from_secs(2),
+        }
+    } else {
+        OpenAiOAuthError::Other(error)
+    }
+}
+
 impl std::fmt::Debug for OpenAiOAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // In particular, never include Unauthorized.rejected_token in logs.
@@ -204,13 +234,17 @@ impl OpenAiOAuthClient {
                 }
                 Err(error @ OpenAiOAuthError::RateLimited { retry_after, .. }) => {
                     last_error = Some(error);
-                    if !openai_rate_limit_is_retryable(retry_after) {
+                    if !openai_rate_limit_is_retryable(retry_after) || attempt == 2 {
                         break;
                     }
                     tokio::time::sleep(retry_after).await;
                 }
                 Err(error @ OpenAiOAuthError::Transient { retry_after, .. }) => {
+                    tracing::warn!(model, attempt = attempt + 1, error = %crate::diagnostics::error_summary(&anyhow!(error.to_string())), "temporary model request failure");
                     last_error = Some(error);
+                    if attempt == 2 {
+                        break;
+                    }
                     let wait = retry_after.max(Duration::from_secs(5 * (attempt + 1) as u64));
                     tokio::time::sleep(wait).await;
                 }
@@ -232,13 +266,20 @@ impl OpenAiOAuthClient {
         options: &ChatOptions,
         on_delta: DeltaCallback<'_>,
     ) -> Result<ChatResponse> {
+        let emitted = std::sync::atomic::AtomicBool::new(false);
+        let guarded_delta = |text: &str| {
+            if !text.is_empty() {
+                emitted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            on_delta(text);
+        };
         let result = self
-            .call_messages_stream(model, request.clone(), options, on_delta)
+            .call_messages_stream(model, request.clone(), options, &guarded_delta)
             .await;
         let result = match result {
             Err(OpenAiOAuthError::Unauthorized { rejected_token }) => {
                 self.refresh_access(Some(&rejected_token)).await?;
-                self.call_messages_stream(model, request.clone(), options, on_delta)
+                self.call_messages_stream(model, request.clone(), options, &guarded_delta)
                     .await
             }
             other => other,
@@ -248,7 +289,10 @@ impl OpenAiOAuthClient {
             Err(OpenAiOAuthError::Unauthorized { rejected_token }) => {
                 Err(self.require_login(&rejected_token).await.into())
             }
-            Err(error) if openai_stream_error_is_retryable(&error) => {
+            Err(error)
+                if !emitted.load(std::sync::atomic::Ordering::Relaxed)
+                    && openai_stream_error_is_retryable(&error) =>
+            {
                 let response = self.exec_chat_request(model, request, options).await?;
                 if let Some(text) = response.first_text() {
                     on_delta(text);
@@ -319,7 +363,10 @@ impl OpenAiOAuthClient {
         let text = response
             .text()
             .await
-            .map_err(|error| anyhow!("OpenAI OAuth response read failed: {error}"))?;
+            .map_err(|error| OpenAiOAuthError::Transient {
+                message: format!("OpenAI OAuth response read failed: {}", error.without_url()),
+                retry_after: Duration::from_secs(2),
+            })?;
 
         let response_log_body = if let Ok(value) = serde_json::from_str::<Value>(&text) {
             value
@@ -355,7 +402,7 @@ impl OpenAiOAuthClient {
             });
         }
 
-        if status.as_u16() == 529 || status.as_u16() == 503 {
+        if status.is_server_error() {
             return Err(OpenAiOAuthError::Transient {
                 message: format!(
                     "OpenAI OAuth overloaded ({}) - {}",
@@ -385,7 +432,7 @@ impl OpenAiOAuthClient {
             serde_json::from_str(&text)
                 .with_context(|| format!("invalid OpenAI OAuth JSON: {}", truncate_err(&text)))?
         } else {
-            parse_streamed_response(&text).map_err(OpenAiOAuthError::Other)?
+            parse_streamed_response(&text).map_err(classify_stream_failure)?
         };
 
         openai_response_to_chat_response(data, model).map_err(Into::into)
@@ -454,7 +501,7 @@ impl OpenAiOAuthClient {
                 retry_after,
             });
         }
-        if status.as_u16() == 529 || status.as_u16() == 503 {
+        if status.is_server_error() {
             let text = response.text().await.unwrap_or_default();
             return Err(OpenAiOAuthError::Transient {
                 message: format!(
@@ -493,7 +540,7 @@ impl OpenAiOAuthClient {
                 break;
             }
         }
-        let data = state.finalize().map_err(OpenAiOAuthError::Other)?;
+        let data = state.finalize().map_err(classify_stream_failure)?;
         openai_response_to_chat_response(data, model).map_err(Into::into)
     }
 
@@ -962,25 +1009,43 @@ fn openai_stream_error_message(
     event_name: &str,
     payload_type: &str,
     payload_obj: &Map<String, Value>,
-) -> Option<String> {
+) -> Option<OpenAiStreamFailure> {
     let error = if event_name == "error" || payload_type == "error" {
-        payload_obj.get("error")
+        Some(
+            payload_obj
+                .get("error")
+                .and_then(Value::as_object)
+                .unwrap_or(payload_obj),
+        )
     } else if event_name == "response.failed" || payload_type == "response.failed" {
         payload_obj
             .get("response")
             .and_then(Value::as_object)
             .and_then(|response| response.get("error"))
+            .and_then(Value::as_object)
     } else {
         None
     }?;
 
-    if let Some(message) = error.get("message").and_then(Value::as_str) {
-        if let Some(code) = error.get("code").and_then(Value::as_str) {
-            return Some(format!("{code}: {message}"));
-        }
-        return Some(message.to_string());
-    }
-    error.as_str().map(str::to_string)
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("provider returned an error");
+    Some(OpenAiStreamFailure {
+        message: format!("{code}: {message}"),
+        retryable: matches!(
+            code,
+            "server_error"
+                | "internal_error"
+                | "overloaded_error"
+                | "service_unavailable"
+                | "request_timeout"
+        ),
+    })
 }
 
 /// Streaming counterpart to `parse_streamed_response`. Holds the same
@@ -991,7 +1056,7 @@ struct OpenAiStreamState {
     latest_response: Option<Map<String, Value>>,
     output_items: Vec<(String, Map<String, Value>)>,
     output_text_deltas: Vec<String>,
-    error: Option<String>,
+    error: Option<OpenAiStreamFailure>,
     done: bool,
 }
 
@@ -1092,10 +1157,10 @@ impl OpenAiStreamState {
 
     fn finalize(mut self) -> Result<Value> {
         if let Some(error) = self.error {
-            return Err(anyhow!("OpenAI OAuth stream failed: {error}"));
+            return Err(error.into());
         }
         if !self.done {
-            return Err(anyhow!("OpenAI OAuth stream ended before completion"));
+            return Err(OpenAiStreamFailure::incomplete().into());
         }
 
         if !self.output_items.is_empty() {
@@ -1191,8 +1256,8 @@ fn parse_streamed_response(raw: &str) -> Result<Value> {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if let Some(message) = openai_stream_error_message(&event_name, payload_type, payload_obj) {
-            return Err(anyhow!("OpenAI OAuth stream failed: {message}"));
+        if let Some(error) = openai_stream_error_message(&event_name, payload_type, payload_obj) {
+            return Err(error.into());
         }
 
         if let Some(response) = payload_obj.get("response").and_then(Value::as_object) {
@@ -1269,7 +1334,7 @@ fn parse_streamed_response(raw: &str) -> Result<Value> {
     }
 
     if !completed {
-        return Err(anyhow!("OpenAI OAuth stream ended before completion"));
+        return Err(OpenAiStreamFailure::incomplete().into());
     }
 
     latest_response

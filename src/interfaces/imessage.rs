@@ -35,6 +35,19 @@ struct Inbound {
     vote: Option<String>,
 }
 
+fn imessage_failure_notice(error: &anyhow::Error) -> &'static str {
+    // Only fixed, safe notices reach the user; full diagnostics stay in logs.
+    if crate::interfaces::telegram::llm_auth_reply(error).is_some() {
+        "My model connection needs to be renewed. Use /login openai in our private Telegram chat, then ask me to continue from the current state."
+    } else if let Some(message) = crate::interfaces::telegram::llm_limit_reply(error) {
+        message
+    } else if error.is::<tokio::time::error::Elapsed>() {
+        "This request timed out before I could finish. Work already completed may still have taken effect; ask me to continue from the current state."
+    } else {
+        "I couldn't finish answering because the model request or task processing failed. The error was recorded. Work already completed may still have taken effect; ask me to continue from the current state."
+    }
+}
+
 impl Inbound {
     fn scope(&self) -> ApprovalScope {
         ApprovalScope {
@@ -156,8 +169,13 @@ impl DeliveryStore {
 
     fn queue_output(&self, inbound: &Inbound, payload: Value) -> Result<String> {
         let id = Uuid::new_v4().to_string();
+        self.queue_output_with_id(inbound, payload, &id)?;
+        Ok(id)
+    }
+
+    fn queue_output_with_id(&self, inbound: &Inbound, payload: Value, id: &str) -> Result<()> {
         self.connection()?.execute(
-            "INSERT INTO linq_outbox(id,chat,sender,reply_to,payload) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT OR IGNORE INTO linq_outbox(id,chat,sender,reply_to,payload) VALUES (?1,?2,?3,?4,?5)",
             params![
                 id,
                 inbound.chat,
@@ -166,7 +184,7 @@ impl DeliveryStore {
                 payload.to_string()
             ],
         )?;
-        Ok(id)
+        Ok(())
     }
 
     fn record_sent(&self, outbox_id: &str, chat: &str, message_id: &str) -> Result<()> {
@@ -693,10 +711,14 @@ impl ImessageTransport {
                         continue;
                     }
                     if let Err(error) = &result {
-                        tracing::warn!(error = %error, "iMessage turn failed");
-                        self.queue(&inbound, json!({
-                            "kind": "text", "content": "I couldn't complete that task. Ask me to check its state before repeating an action."
-                        }));
+                        tracing::warn!(event_id = %inbound.event_id,
+                            error = %crate::diagnostics::error_summary(error), "iMessage turn failed");
+                        self.queue(
+                            &inbound,
+                            json!({
+                                "kind": "text", "content": imessage_failure_notice(error)
+                            }),
+                        );
                     }
                     let _ = self.store.finish(
                         &inbound.event_id,
@@ -892,6 +914,28 @@ impl ImessageTransport {
                 text: String::new(),
                 vote: None,
             }))
+    }
+
+    /// Queue scheduled text for the current opted-in principal. Stable keys
+    /// avoid duplicate queue entries, and delivery rechecks consent/allowlisting.
+    pub(crate) fn queue_scheduled_notifications(
+        &self,
+        run_id: &str,
+        texts: &[String],
+    ) -> Result<bool> {
+        let Some(target) = self.notification_target()? else {
+            return Ok(false);
+        };
+        for (index, text) in texts.iter().enumerate() {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let output = prepare_output(json!({"kind": "notification", "content": text}))?;
+            self.store
+                .queue_output_with_id(&target, output, &format!("wake:{run_id}:{index}"))?;
+        }
+        self.outbox_notify.notify_one();
+        Ok(true)
     }
 
     async fn run_notifications(self: Arc<Self>, brainstem: BrainstemHandle) {
@@ -1223,6 +1267,86 @@ fn text_chunks(text: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_delivery_requires_consent_and_is_durable_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = transport(directory.path());
+        let texts = vec![
+            "Morning brief".to_string(),
+            "Run failed; check status".to_string(),
+        ];
+        assert!(
+            !current
+                .queue_scheduled_notifications("run-1", &texts)
+                .unwrap()
+        );
+        current.set_notifications(&inbound(), true).unwrap();
+        assert!(
+            current
+                .queue_scheduled_notifications("run-1", &texts)
+                .unwrap()
+        );
+        assert!(
+            current
+                .queue_scheduled_notifications("run-1", &texts)
+                .unwrap()
+        );
+        let count: i64 = current
+            .store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM linq_outbox WHERE id LIKE 'wake:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(current);
+        let restored = transport(directory.path());
+        let payload: String = restored
+            .store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT payload FROM linq_outbox WHERE id='wake:run-1:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let output: Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            restored
+                .output_is_authorized("chat-1", "+49123456789", &output)
+                .unwrap()
+        );
+        restored.set_notifications(&inbound(), false).unwrap();
+        assert!(
+            !restored
+                .output_is_authorized("chat-1", "+49123456789", &output)
+                .unwrap()
+        );
+        assert!(
+            !restored
+                .queue_scheduled_notifications("run-2", &texts)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn imessage_failures_explain_limits_and_do_not_echo_provider_errors() {
+        let limit = anyhow!("HTTP 429: private provider body").context("LLM request failed");
+        assert_eq!(
+            imessage_failure_notice(&limit),
+            crate::interfaces::telegram::USAGE_LIMIT_MESSAGE
+        );
+        let failure = anyhow!("private provider body").context("LLM request failed");
+        let notice = imessage_failure_notice(&failure);
+        assert!(notice.contains("model request"));
+        assert!(!notice.contains("private provider body"));
+        assert!(!notice.contains("Ask me to check its state"));
+    }
 
     fn transport(directory: &Path) -> ImessageTransport {
         ImessageTransport::new(

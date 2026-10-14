@@ -3,6 +3,7 @@ pub mod agent;
 pub mod agent_id;
 pub mod config;
 pub mod conversation;
+mod diagnostics;
 pub mod interfaces;
 pub mod llm;
 pub mod memory;

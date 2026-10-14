@@ -180,9 +180,14 @@ across restarts but is used only while the sender remains allowlisted.
 `/notifications off` applies to that same destination and skips unsent queued
 notifications. An outgoing request already in progress cannot be recalled.
 
-Only normal Brainstem emissions are forwarded: reminders and background updates
-that pass the existing notification review. Raw actor messages and every worker
-completion are not forwarded automatically. Existing `HEARTBEAT_ENABLED`,
+Normal Brainstem emissions are forwarded after the existing notification review.
+Scheduled `/wake` messages and failure notices for the configured principal are
+also mirrored to this subscribed conversation through the durable outbox. A
+Telegram delivery failure does not suppress a scheduled fallback or failure
+notice on iMessage. Explicit wakes to other Telegram recipients are excluded.
+Quiet scheduled turns enqueue nothing. Outbox IDs include the wake run UUID, so
+queueing the same message again within a run does not create another delivery.
+Raw actor messages and every worker completion are not forwarded automatically. Existing `HEARTBEAT_ENABLED`,
 `HEARTBEAT_INTERVAL`, `PROACTIVE_MAX_PER_DAY`, and
 `PROACTIVE_COOLDOWN_MINUTES` govern proactive evaluation and rate limits.
 

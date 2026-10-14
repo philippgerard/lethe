@@ -78,9 +78,17 @@ pub enum TelegramError {
     #[error("telegram api error: {0}")]
     Api(String),
     #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<reqwest::Error> for TelegramError {
+    fn from(error: reqwest::Error) -> Self {
+        // Bot API URLs contain the credential in their path. Strip the URL at
+        // the boundary so Display, Debug, and chained errors are all safe.
+        Self::Http(error.without_url())
+    }
 }
 
 pub type TelegramResult<T> = Result<T, TelegramError>;
@@ -2398,6 +2406,31 @@ pub fn set_message_reaction_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_errors_remove_credential_bearing_urls_from_all_representations() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(502)
+                .body("")
+                .unwrap(),
+        );
+        let error = response.error_for_status().unwrap_err().with_url(
+            "https://api.telegram.org/bot123456:private-token/getUpdates"
+                .parse()
+                .unwrap(),
+        );
+        let error = TelegramError::from(error);
+        for text in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{:#}", anyhow::Error::new(error)),
+        ] {
+            assert!(text.contains("502"));
+            assert!(!text.contains("private-token"));
+            assert!(!text.contains("api.telegram.org"));
+        }
+    }
 
     #[test]
     fn parses_text_update_and_authorization() {
