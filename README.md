@@ -522,7 +522,7 @@ token. Every other HTTP route and the browser WebSocket require
 | `/webhooks/linq` | `POST` | Optional signed Linq ingress; publish only this route for iMessage webhooks. |
 | `/imessage/status` | `GET` | Authenticated Linq queue and delivery status; see [setup and limits](docs/imessage.md). |
 | `/chat` | `POST` | Send a user message and receive SSE response events. |
-| `/wake` | `POST` | Run one scheduler-triggered turn with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent. The agent can call `wake_finish_silently` when no notification is warranted (`message`, optional `chat_id` and `task_name`). |
+| `/wake` | `POST` | Run one scheduler-triggered turn (`message`, optional `chat_id` and `task_name`) with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent. The agent can call `wake_finish_silently` when no notification is warranted. |
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |
 | `/browser/stream` | `GET`/WebSocket | Relay the live vault-sealed browser viewport and input stream. |
 | `/cancel` | `POST` | Cancel active work for a chat. |
@@ -555,7 +555,7 @@ The response also includes `run_id`, `task_name`, `failure_kind` on failure, and
 `turn_timeout`, `turn_failed`, `delivery_failed`, `imessage_queue_failed`, or
 `checkpoint`. The scheduler companion must allowlist `checkpoint` to record an
 internally checkpointed run separately from a failed one. Scheduled messages for the configured principal are mirrored
-to the opted-in iMessage conversation using its durable outbox. `queued` confirms
+to the opted-in iMessage conversation using its durable outbox. `imessage_status: "queued"` confirms
 handoff, not receipt on the phone. Quiet turns send nothing; delivery to another
 Telegram recipient is never copied to the principal. Failure notices identify
 the task and run; use that run ID to find the sanitized cause chain in server

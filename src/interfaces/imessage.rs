@@ -1329,10 +1329,9 @@ mod tests {
         assert!(notice.contains("/login openai"));
         assert!(!notice.contains("OPENAI_AUTH_TOKEN"));
 
-        let static_token = anyhow::Error::new(crate::llm::openai_oauth::OpenAiAuthRequired {
-            static_token: true,
-        })
-        .context("LLM request failed");
+        let static_token =
+            anyhow::Error::new(crate::llm::openai_oauth::OpenAiAuthRequired { static_token: true })
+                .context("LLM request failed");
         let notice = imessage_failure_notice(&static_token);
         assert!(notice.contains("OPENAI_AUTH_TOKEN"));
         assert!(notice.contains("Remove that override"));

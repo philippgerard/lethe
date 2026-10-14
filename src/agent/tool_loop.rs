@@ -996,11 +996,10 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                     .await
             }
         }
-        .map_err(|error| {
+        .inspect_err(|error| {
             tracing::error!(iteration, model = %model_id,
-                error = %crate::diagnostics::error_summary(&error),
+                error = %crate::diagnostics::error_summary(error),
                 "model request failed; completed tool calls will not be replayed");
-            error
         })?;
         if let Some(prompt_tokens) = response.usage.prompt_tokens {
             context

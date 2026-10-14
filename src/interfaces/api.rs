@@ -3560,8 +3560,14 @@ mod tests {
         )
         .await;
         let body = response_json(
-            annotate_wake_response(checkpoint, "run-1", "brief", "checkpoint", "no_notification")
-                .await,
+            annotate_wake_response(
+                checkpoint,
+                "run-1",
+                "brief",
+                "checkpoint",
+                "no_notification",
+            )
+            .await,
         )
         .await;
         assert_eq!(body["delivery_status"], "checkpoint_suppressed");
@@ -3622,8 +3628,14 @@ mod tests {
             Some(99),
             &WakeReactionDelivery::default(),
         );
-        let response = annotate_wake_response(response, "run-123", "brief", "delivery_failed", "queue_failed")
-                .await;
+        let response = annotate_wake_response(
+            response,
+            "run-123",
+            "brief",
+            "delivery_failed",
+            "queue_failed",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["success"], false);
