@@ -10,9 +10,12 @@ pub trait MessageEgress {
 }
 
 impl super::ToolRegistry<'_> {
-    /// Pick the active message egress, preferring direct Telegram over the
-    /// generic client transport when both are attached.
+    /// Trusted notification turns override the interactive transport. Other
+    /// turns prefer direct Telegram over a generic client transport.
     pub(crate) fn message_egress(&self) -> Option<&dyn MessageEgress> {
+        if let Some(context) = self.runtime.notification_egress.as_ref() {
+            return Some(context.as_ref());
+        }
         if let Some(context) = self.runtime.telegram.as_ref() {
             return Some(context);
         }

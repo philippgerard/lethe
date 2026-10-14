@@ -266,7 +266,13 @@ lethe transport telegram --enable          # configure + enable the Telegram bot
 Under the hood a single `lethe api` process hosts the HTTP/SSE transport **and** the Telegram poller (when `TELEGRAM_BOT_TOKEN` is set) in the same address space, sharing one Agent, one actor registry, and one Brainstem (the sole source of heartbeats / proactive emissions — transports just subscribe and forward). API mode binds to `LETHE_API_HOST` (`127.0.0.1` by default) on `LETHE_API_PORT` (`1373`); use a reverse proxy for remote access.
 
 API mode also supports an opt-in Linq iMessage transport for allowlisted direct
-chats, scoped action approvals, and reviewed background notifications. See the
+chats, scoped action approvals, and reviewed background notifications. In either
+private chat, use `/notifications` to see both channels, or `/notifications on`
+and `/notifications off` to change the current channel. Both may be on; turning
+off the last one automatically enables the other and confirms the switch.
+iMessage must first be linked with `/notifications on` in that chat. Preferences
+persist across restarts and affect scheduled and background notices, while
+interactive replies stay in the chat you use. See the
 [iMessage setup and limits](docs/imessage.md), including Hobby shared-line setup,
 text controls, and secure browser handoff.
 
@@ -522,7 +528,7 @@ token. Every other HTTP route and the browser WebSocket require
 | `/webhooks/linq` | `POST` | Optional signed Linq ingress; publish only this route for iMessage webhooks. |
 | `/imessage/status` | `GET` | Authenticated Linq queue and delivery status; see [setup and limits](docs/imessage.md). |
 | `/chat` | `POST` | Send a user message and receive SSE response events. |
-| `/wake` | `POST` | Run one scheduler-triggered turn (`message`, optional `chat_id` and `task_name`) with real Telegram egress; a normal final response is delivered automatically when no Telegram tool message was sent. The agent can call `wake_finish_silently` when no notification is warranted. |
+| `/wake` | `POST` | Run one scheduler-triggered turn (`message`, optional `chat_id` and `task_name`) with notification preferences applied to tool sends and final responses; a normal final response is delivered automatically when no tool message was sent. The agent can call `wake_finish_silently` when no notification is warranted. |
 | `/events` | `GET` | Subscribe to brainstem + actor SSE events. |
 | `/browser/stream` | `GET`/WebSocket | Relay the live vault-sealed browser viewport and input stream. |
 | `/cancel` | `POST` | Cancel active work for a chat. |
@@ -554,8 +560,12 @@ The response also includes `run_id`, `task_name`, `failure_kind` on failure, and
 `imessage_status`. `failure_kind` is one of `authentication`, `limit`,
 `turn_timeout`, `turn_failed`, `delivery_failed`, `imessage_queue_failed`, or
 `checkpoint`. The scheduler companion must allowlist `checkpoint` to record an
-internally checkpointed run separately from a failed one. Scheduled messages for the configured principal are mirrored
-to the opted-in iMessage conversation using its durable outbox. `imessage_status: "queued"` confirms
+internally checkpointed run separately from a failed one. Scheduled messages for
+the configured principal follow the Telegram/iMessage preferences selected in
+chat. `telegram_delivered_messages` counts confirmed Telegram sends and
+`imessage_queued_messages` counts durable queue entries. iMessage-only acceptance
+returns `delivery_status: "notification_queued"` and `delivered: false` with
+`success: true` when the task completed. `imessage_status: "queued"` confirms
 handoff, not receipt on the phone. Quiet turns send nothing; delivery to another
 Telegram recipient is never copied to the principal. Failure notices identify
 the task and run; use that run ID to find the sanitized cause chain in server

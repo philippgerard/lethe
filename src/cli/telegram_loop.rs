@@ -23,6 +23,8 @@ use lethe::conversation::transcription::{
     choose_transcription_provider, default_model_for_provider, transcribe_audio,
 };
 use lethe::conversation::{ConversationManager, ProcessCallback, ProcessContext};
+use lethe::interfaces::notification_delivery::NotificationDelivery;
+use lethe::interfaces::notifications::{Channel, NotificationCommand, NotificationPreferences};
 use lethe::interfaces::telegram::{
     FirstUserLockCallback, IncomingTelegramCallback, IncomingTelegramText, SharedTelegramTurnGuard,
     TelegramClient, TelegramToolContext, TelegramTurnGuard, TelegramTypingObserver,
@@ -93,6 +95,7 @@ pub enum TelegramRuntimeCommand {
     Aux(Option<String>),
     Deep(Option<String>),
     Login(Option<String>),
+    Notifications(NotificationCommand),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,8 +243,21 @@ pub async fn run_telegram_with_agent(
     // Do not subscribe until a target chat is known: Brainstem uses live
     // subscriber presence as its publication boundary, so an eager receiver
     // would make it persist messages that this loop can only drop.
-    let mut brainstem_rx = brainstem_receiver_for_target(brainstem, target_chat_id);
+    let notifications = NotificationPreferences::open(
+        &settings.paths.lethe_home.join("data/transports"),
+        &settings.imessage,
+        true,
+    )?;
+    let mut brainstem_rx = brainstem_receiver_for_target(
+        brainstem,
+        target_chat_id.filter(|_| notifications.route().is_ok_and(|route| route.telegram)),
+    );
     loop {
+        if notifications.route().is_ok_and(|route| route.telegram) {
+            ensure_brainstem_subscription(&mut brainstem_rx, brainstem, target_chat_id);
+        } else {
+            brainstem_rx = None;
+        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 println!("telegram_runner_stopped: interrupt");
@@ -250,7 +266,7 @@ pub async fn run_telegram_with_agent(
             emission = receive_brainstem_emission(&mut brainstem_rx) => {
                 match emission {
                     Ok(BrainstemEmission { message, .. }) => {
-                        if let Some(chat_id) = target_chat_id {
+                        if let Some(chat_id) = target_chat_id.filter(|_| notifications.route().is_ok_and(|route| route.telegram)) {
                             if let Err(error) = send_telegram_messages_with_delays(
                                 &client,
                                 chat_id,
@@ -286,14 +302,9 @@ pub async fn run_telegram_with_agent(
                     }
                 };
                 offset = next_offset;
-                if let Some(chat_id) = last_chat_id {
+                if let Some(chat_id) = last_chat_id && client.is_private_owner(chat_id, chat_id) {
                     target_chat_id = Some(chat_id);
                     target_chat_id_state.store(chat_id, Ordering::SeqCst);
-                    ensure_brainstem_subscription(
-                        &mut brainstem_rx,
-                        brainstem,
-                        target_chat_id,
-                    );
                 }
                 if processed > 0 {
                     println!("processed_updates: {processed}");
@@ -335,6 +346,9 @@ async fn receive_brainstem_emission(
 }
 
 pub fn parse_telegram_runtime_command(text: &str) -> Option<TelegramRuntimeCommand> {
+    if let Some(command) = NotificationCommand::parse(text) {
+        return Some(TelegramRuntimeCommand::Notifications(command));
+    }
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -366,7 +380,7 @@ pub fn parse_telegram_runtime_command(text: &str) -> Option<TelegramRuntimeComma
 
 pub fn telegram_help_text(settings: &Settings) -> String {
     format!(
-        "Hello. I'm {}.\n\nSend me any message and I'll help.\n\nCommands:\n/status - Check runtime status\n/login openai - Reconnect OpenAI in your browser (owner only)\n/login cancel - Cancel pending sign-in\n/stop - Cancel current processing when supported\n/heartbeat - Force a check-in\n/model [model-id] - Show or change the main model\n/aux [model-id] - Show or change the auxiliary model\n/deep [model-id] - Show or change the deep-thinking model",
+        "Hello. I'm {}.\n\nSend me any message and I'll help.\n\nCommands:\n/notifications [on|off|status] - Choose where notifications arrive\n/status - Check runtime status\n/login openai - Reconnect OpenAI in your browser (owner only)\n/login cancel - Cancel pending sign-in\n/stop - Cancel current processing when supported\n/heartbeat - Force a check-in\n/model [model-id] - Show or change the main model\n/aux [model-id] - Show or change the auxiliary model\n/deep [model-id] - Show or change the deep-thinking model",
         settings.agent_name
     )
 }
@@ -711,6 +725,19 @@ async fn handle_telegram_runtime_command(
     };
 
     match command {
+        TelegramRuntimeCommand::Notifications(command) => {
+            let response = if client.is_private_owner(incoming.chat_id, incoming.user_id) {
+                NotificationPreferences::open(
+                    &settings.paths.lethe_home.join("data/transports"),
+                    &settings.imessage,
+                    true,
+                )?
+                .command(Channel::Telegram, command, None)?
+            } else {
+                "Notification settings are only available to the owner in our private chat.".into()
+            };
+            client.send_message(incoming.chat_id, &response).await?;
+        }
         TelegramRuntimeCommand::Login(argument) => {
             super::telegram_login::handle_login(client, incoming, argument.as_deref()).await?;
         }
@@ -1026,20 +1053,15 @@ fn remember_background_failure_notice(chat_id: i64, message: &'static str) {
 }
 
 async fn process_telegram_actor_updates(
-    client: &TelegramClient,
+    _client: &TelegramClient,
     agent: &Agent,
     settings: &Settings,
     options: &AgentOptions,
     chat_id: i64,
     updates: &[ActorNamedEvent],
 ) -> Result<()> {
-    let runtime = ToolRuntime {
-        observer: Some(Arc::new(TelegramTypingObserver::new(
-            settings.telegram.bot_token.clone(),
-            chat_id,
-        ))),
-        ..ToolRuntime::default()
-    };
+    let delivery = NotificationDelivery::new(settings, chat_id, None)?;
+    let runtime = ToolRuntime::default();
     let synthetic_message = actor_update_synthetic_message(updates);
     let req = TurnRequest::new(&synthetic_message)
         .with_runtime(runtime)
@@ -1049,12 +1071,16 @@ async fn process_telegram_actor_updates(
             MessageKind::ActorUpdate,
             "actor_update",
         ));
-    let result = match with_telegram_typing(client, chat_id, agent.chat_once_result(req)).await {
+    let result = match agent.chat_once_result(req).await {
         Ok(result) => result,
         Err(error) => {
             let error = anyhow::Error::new(error);
             if background_failure_notice_due(chat_id, llm_failure_reply(&error)) {
-                let message = send_llm_failure_reply(client, chat_id, &error).await?;
+                let message = llm_failure_reply(&error);
+                delivery
+                    .send_text(message.to_string())
+                    .await
+                    .map_err(|error| anyhow!(error))?;
                 remember_background_failure_notice(chat_id, message);
             }
             return Err(error);
@@ -1078,7 +1104,7 @@ async fn process_telegram_actor_updates(
     let final_text_delivered = if is_idle_ack {
         false
     } else {
-        send_telegram_actor_update_response(client, chat_id, &response).await?
+        send_telegram_actor_update_response(&delivery, &response).await?
     };
     // Synthetic requests are intentionally excluded from normal history.
     // Persist a companion assistant row only when this exact final text was
@@ -1121,8 +1147,7 @@ async fn process_telegram_actor_updates(
 /// failure is logged and treated as consumed (and is not persisted as a
 /// complete transcript row).
 async fn send_telegram_actor_update_response(
-    client: &TelegramClient,
-    chat_id: i64,
+    delivery: &Arc<NotificationDelivery>,
     response: &str,
 ) -> Result<bool> {
     let chunks = split_telegram_messages(response);
@@ -1131,12 +1156,11 @@ async fn send_telegram_actor_update_response(
     }
     let total = chunks.len();
     for (index, chunk) in chunks.into_iter().enumerate() {
-        if let Err(error) = client.send_message(chat_id, &chunk).await {
+        if let Err(error) = delivery.send_text(chunk.clone()).await {
             if index == 0 {
-                return Err(error.into());
+                return Err(anyhow!(error));
             }
             tracing::warn!(
-                chat_id,
                 delivered_chunks = index,
                 total_chunks = total,
                 error = %error,
@@ -1146,7 +1170,6 @@ async fn send_telegram_actor_update_response(
         }
         if index + 1 < total {
             let delay = telegram_inter_message_delay(&chunk);
-            let _ = client.send_chat_action(chat_id, "typing").await;
             tokio::time::sleep(delay).await;
         }
     }
@@ -1951,6 +1974,24 @@ mod tests {
         settings.llm.llm_model = "openai/gpt-5".to_string();
         settings.llm.llm_model_aux = "openai/gpt-5-mini".to_string();
         settings
+    }
+
+    #[test]
+    fn notification_commands_are_native_in_telegram() {
+        for (text, command) in [
+            (
+                "/notifications@LetheBot off",
+                NotificationCommand::Set(false),
+            ),
+            ("/notifications on", NotificationCommand::Set(true)),
+            ("/notifications", NotificationCommand::Status),
+            ("/notifications unknown", NotificationCommand::Help),
+        ] {
+            assert_eq!(
+                parse_telegram_runtime_command(text),
+                Some(TelegramRuntimeCommand::Notifications(command))
+            );
+        }
     }
 
     #[test]
