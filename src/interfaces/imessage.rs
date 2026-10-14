@@ -37,8 +37,12 @@ struct Inbound {
 
 fn imessage_failure_notice(error: &anyhow::Error) -> &'static str {
     // Only fixed, safe notices reach the user; full diagnostics stay in logs.
-    if crate::interfaces::telegram::llm_auth_reply(error).is_some() {
-        "My model connection needs to be renewed. Use /login openai in our private Telegram chat, then ask me to continue from the current state."
+    if let Some(message) = crate::interfaces::telegram::llm_auth_reply(error) {
+        if message == crate::interfaces::telegram::OPENAI_STATIC_TOKEN_MESSAGE {
+            "My model connection uses a static OPENAI_AUTH_TOKEN override that cannot renew itself. Remove that override from the deployment configuration, restart Lethe, use /login openai in our private Telegram chat, then ask me to continue from the current state."
+        } else {
+            "My model connection needs to be renewed. Use /login openai in our private Telegram chat, then ask me to continue from the current state."
+        }
     } else if let Some(message) = crate::interfaces::telegram::llm_limit_reply(error) {
         message
     } else if error.is::<tokio::time::error::Elapsed>() {
@@ -169,13 +173,8 @@ impl DeliveryStore {
 
     fn queue_output(&self, inbound: &Inbound, payload: Value) -> Result<String> {
         let id = Uuid::new_v4().to_string();
-        self.queue_output_with_id(inbound, payload, &id)?;
-        Ok(id)
-    }
-
-    fn queue_output_with_id(&self, inbound: &Inbound, payload: Value, id: &str) -> Result<()> {
         self.connection()?.execute(
-            "INSERT OR IGNORE INTO linq_outbox(id,chat,sender,reply_to,payload) VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO linq_outbox(id,chat,sender,reply_to,payload) VALUES (?1,?2,?3,?4,?5)",
             params![
                 id,
                 inbound.chat,
@@ -184,7 +183,7 @@ impl DeliveryStore {
                 payload.to_string()
             ],
         )?;
-        Ok(())
+        Ok(id)
     }
 
     fn record_sent(&self, outbox_id: &str, chat: &str, message_id: &str) -> Result<()> {
@@ -916,23 +915,18 @@ impl ImessageTransport {
             }))
     }
 
-    /// Queue scheduled text for the current opted-in principal. Stable keys
-    /// avoid duplicate queue entries, and delivery rechecks consent/allowlisting.
-    pub(crate) fn queue_scheduled_notifications(
-        &self,
-        run_id: &str,
-        texts: &[String],
-    ) -> Result<bool> {
+    /// Queue scheduled text for the current opted-in principal. Delivery
+    /// rechecks consent and allowlisting.
+    pub(crate) fn queue_scheduled_notifications(&self, texts: &[String]) -> Result<bool> {
         let Some(target) = self.notification_target()? else {
             return Ok(false);
         };
-        for (index, text) in texts.iter().enumerate() {
+        for text in texts {
             if text.trim().is_empty() {
                 continue;
             }
             let output = prepare_output(json!({"kind": "notification", "content": text}))?;
-            self.store
-                .queue_output_with_id(&target, output, &format!("wake:{run_id}:{index}"))?;
+            self.store.queue_output(&target, output)?;
         }
         self.outbox_notify.notify_one();
         Ok(true)
@@ -1269,69 +1263,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scheduled_delivery_requires_consent_and_is_durable_and_idempotent() {
+    fn scheduled_delivery_requires_consent_and_is_durable() {
         let directory = tempfile::tempdir().unwrap();
         let current = transport(directory.path());
         let texts = vec![
             "Morning brief".to_string(),
             "Run failed; check status".to_string(),
         ];
-        assert!(
-            !current
-                .queue_scheduled_notifications("run-1", &texts)
-                .unwrap()
-        );
+        assert!(!current.queue_scheduled_notifications(&texts).unwrap());
         current.set_notifications(&inbound(), true).unwrap();
-        assert!(
-            current
-                .queue_scheduled_notifications("run-1", &texts)
-                .unwrap()
-        );
-        assert!(
-            current
-                .queue_scheduled_notifications("run-1", &texts)
-                .unwrap()
-        );
-        let count: i64 = current
-            .store
-            .connection()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM linq_outbox WHERE id LIKE 'wake:%'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
+        assert!(current.queue_scheduled_notifications(&texts).unwrap());
         drop(current);
         let restored = transport(directory.path());
-        let payload: String = restored
-            .store
-            .connection()
-            .unwrap()
-            .query_row(
-                "SELECT payload FROM linq_outbox WHERE id='wake:run-1:0'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let output: Value = serde_json::from_str(&payload).unwrap();
+        let notifications: Vec<Value> = {
+            let connection = restored.store.connection().unwrap();
+            let mut statement = connection
+                .prepare("SELECT payload FROM linq_outbox ORDER BY rowid")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|payload| serde_json::from_str::<Value>(&payload.unwrap()).unwrap())
+                .filter(|output| output["kind"] == "notification")
+                .collect()
+        };
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0]["content"], "Morning brief");
+        assert_eq!(notifications[1]["content"], "Run failed; check status");
+        let output = &notifications[0];
         assert!(
             restored
-                .output_is_authorized("chat-1", "+49123456789", &output)
+                .output_is_authorized("chat-1", "+49123456789", output)
                 .unwrap()
         );
         restored.set_notifications(&inbound(), false).unwrap();
         assert!(
             !restored
-                .output_is_authorized("chat-1", "+49123456789", &output)
+                .output_is_authorized("chat-1", "+49123456789", output)
                 .unwrap()
         );
-        assert!(
-            !restored
-                .queue_scheduled_notifications("run-2", &texts)
-                .unwrap()
-        );
+        assert!(!restored.queue_scheduled_notifications(&texts).unwrap());
     }
 
     #[test]
@@ -1346,6 +1317,26 @@ mod tests {
         assert!(notice.contains("model request"));
         assert!(!notice.contains("private provider body"));
         assert!(!notice.contains("Ask me to check its state"));
+    }
+
+    #[test]
+    fn imessage_auth_failures_distinguish_static_override_from_sign_in() {
+        let sign_in = anyhow::Error::new(crate::llm::openai_oauth::OpenAiAuthRequired {
+            static_token: false,
+        })
+        .context("LLM request failed");
+        let notice = imessage_failure_notice(&sign_in);
+        assert!(notice.contains("/login openai"));
+        assert!(!notice.contains("OPENAI_AUTH_TOKEN"));
+
+        let static_token = anyhow::Error::new(crate::llm::openai_oauth::OpenAiAuthRequired {
+            static_token: true,
+        })
+        .context("LLM request failed");
+        let notice = imessage_failure_notice(&static_token);
+        assert!(notice.contains("OPENAI_AUTH_TOKEN"));
+        assert!(notice.contains("Remove that override"));
+        assert!(notice.contains("restart Lethe"));
     }
 
     fn transport(directory: &Path) -> ImessageTransport {

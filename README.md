@@ -551,7 +551,10 @@ Telegram tool side effect can coexist with `success: false` when the turn later
 checkpoints; callers must inspect `delivered` and `delivery_status` and must not
 blindly retry an HTTP 200 response.
 The response also includes `run_id`, `task_name`, `failure_kind` on failure, and
-`imessage_status`. Scheduled messages for the configured principal are mirrored
+`imessage_status`. `failure_kind` is one of `authentication`, `limit`,
+`turn_timeout`, `turn_failed`, `delivery_failed`, `imessage_queue_failed`, or
+`checkpoint`. The scheduler companion must allowlist `checkpoint` to record an
+internally checkpointed run separately from a failed one. Scheduled messages for the configured principal are mirrored
 to the opted-in iMessage conversation using its durable outbox. `queued` confirms
 handoff, not receipt on the phone. Quiet turns send nothing; delivery to another
 Telegram recipient is never copied to the principal. Failure notices identify

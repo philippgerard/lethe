@@ -185,8 +185,9 @@ Scheduled `/wake` messages and failure notices for the configured principal are
 also mirrored to this subscribed conversation through the durable outbox. A
 Telegram delivery failure does not suppress a scheduled fallback or failure
 notice on iMessage. Explicit wakes to other Telegram recipients are excluded.
-Quiet scheduled turns enqueue nothing. Outbox IDs include the wake run UUID, so
-queueing the same message again within a run does not create another delivery.
+Quiet scheduled turns enqueue nothing. A file sent with `telegram_send_file` is
+mirrored as the text "An attachment was sent in Telegram." followed by its
+caption, if any; the file itself is not uploaded to iMessage.
 Raw actor messages and every worker completion are not forwarded automatically. Existing `HEARTBEAT_ENABLED`,
 `HEARTBEAT_INTERVAL`, `PROACTIVE_MAX_PER_DAY`, and
 `PROACTIVE_COOLDOWN_MINUTES` govern proactive evaluation and rate limits.

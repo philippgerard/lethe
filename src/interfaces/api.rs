@@ -1441,6 +1441,7 @@ async fn annotate_wake_response(
     response: Response,
     run_id: &str,
     task_name: &str,
+    failure_kind: &str,
     imessage_status: &str,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
@@ -1460,18 +1461,7 @@ async fn annotate_wake_response(
     body["task_name"] = json!(task_name);
     body["imessage_status"] = json!(imessage_status);
     if body["success"] == false {
-        let delivery = body["delivery_status"].as_str().unwrap_or_default();
-        body["failure_kind"] = json!(if delivery.starts_with("authentication") {
-            "authentication"
-        } else if delivery.starts_with("limit") {
-            "limit"
-        } else if delivery.starts_with("turn_timeout") {
-            "turn_timeout"
-        } else if body["turn_completed"] == true {
-            "delivery_failed"
-        } else {
-            "turn_failed"
-        });
+        body["failure_kind"] = json!(failure_kind);
     }
     // A durable notification already exists. A transport-level retry could
     // repeat the task; the JSON contract still records any failure.
@@ -2196,7 +2186,7 @@ async fn wake(
 
     let fallback_visible_texts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let mut notification_texts = tool_visible_texts.clone();
-    let response = match turn_result {
+    let (response, failure_kind) = match turn_result {
         Ok(Ok(result)) => {
             notification_texts.extend(wake_fallback_notifications(
                 &result,
@@ -2240,7 +2230,7 @@ async fn wake(
                     send_wake_telegram_message(client, chat_id, text, progress, visible_texts)
                 },
             );
-            run_wake_delivery_with_timeout(
+            let response = run_wake_delivery_with_timeout(
                 WAKE_DELIVERY_TIMEOUT,
                 chat_id,
                 reply_chars,
@@ -2249,7 +2239,13 @@ async fn wake(
                 progress,
                 delivery,
             )
-            .await
+            .await;
+            let failure_kind = if turn_completed {
+                "delivery_failed"
+            } else {
+                "checkpoint"
+            };
+            (response, failure_kind)
         }
         Ok(Err(error)) => {
             let error = anyhow::Error::new(error);
@@ -2316,7 +2312,7 @@ async fn wake(
                 },
             );
             let delivery_kind = format!("{failure_kind}_notice");
-            run_wake_delivery_with_timeout(
+            let response = run_wake_delivery_with_timeout(
                 WAKE_DELIVERY_TIMEOUT,
                 chat_id,
                 0,
@@ -2325,7 +2321,8 @@ async fn wake(
                 progress,
                 delivery,
             )
-            .await
+            .await;
+            (response, failure_kind)
         }
         Err(_) => {
             tracing::warn!(%run_id, %task_name, "scheduled task timed out");
@@ -2368,7 +2365,7 @@ async fn wake(
                     )
                 },
             );
-            run_wake_delivery_with_timeout(
+            let response = run_wake_delivery_with_timeout(
                 WAKE_DELIVERY_TIMEOUT,
                 chat_id,
                 0,
@@ -2377,7 +2374,8 @@ async fn wake(
                 progress,
                 delivery,
             )
-            .await
+            .await;
+            (response, "turn_timeout")
         }
     };
 
@@ -2389,7 +2387,7 @@ async fn wake(
     let imessage_status = queue_wake_imessage(&state, chat_id, &run_id, &notification_texts);
     persist_wake_visible_history(state.agent.as_ref(), visible_texts);
     tracing::info!(%run_id, %task_name, imessage_status, "scheduled task finished");
-    annotate_wake_response(response, &run_id, &task_name, imessage_status).await
+    annotate_wake_response(response, &run_id, &task_name, failure_kind, imessage_status).await
 }
 
 fn wake_fallback_notifications(
@@ -2422,7 +2420,7 @@ fn queue_wake_imessage(
     let Some(transport) = state.imessage.as_ref() else {
         return "disabled";
     };
-    match transport.queue_scheduled_notifications(run_id, texts) {
+    match transport.queue_scheduled_notifications(texts) {
         Ok(true) => "queued",
         Ok(false) => "not_subscribed",
         Err(error) => {
@@ -3520,7 +3518,13 @@ mod tests {
         let notice = wake_failure_notice("morning-brief", "run-123", WAKE_TURN_FAILURE_MESSAGE);
         assert!(notice.contains("morning-brief"));
         assert!(notice.contains("run-123"));
-        for kind in ["turn_failed", "authentication", "limit", "turn_timeout"] {
+        for kind in [
+            "turn_failed",
+            "authentication",
+            "limit",
+            "turn_timeout",
+            "checkpoint",
+        ] {
             let response = (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
@@ -3530,7 +3534,7 @@ mod tests {
             )
                 .into_response();
             let response =
-                annotate_wake_response(response, "run-123", "morning-brief", "queued").await;
+                annotate_wake_response(response, "run-123", "morning-brief", kind, "queued").await;
             assert_eq!(response.status(), StatusCode::OK);
             let body = response_json(response).await;
             assert_eq!(body["run_id"], "run-123");
@@ -3541,6 +3545,42 @@ mod tests {
             assert_eq!(body["imessage_status"], "queued");
             assert_eq!(body["failure_kind"], kind);
         }
+    }
+
+    #[tokio::test]
+    async fn wake_checkpoint_is_reported_as_checkpoint_and_success_has_no_failure_kind() {
+        let checkpoint = finish_wake_delivery(
+            42,
+            TurnResult::Checkpointed,
+            0,
+            false,
+            Vec::new(),
+            |_| async { Ok(()) },
+            |_| async { panic!("checkpoint must never send a fallback") },
+        )
+        .await;
+        let body = response_json(
+            annotate_wake_response(checkpoint, "run-1", "brief", "checkpoint", "no_notification")
+                .await,
+        )
+        .await;
+        assert_eq!(body["delivery_status"], "checkpoint_suppressed");
+        assert_eq!(body["failure_kind"], "checkpoint");
+
+        let completed = wake_delivery_response(
+            42,
+            20,
+            "fallback_delivered",
+            1,
+            Some(99),
+            &WakeReactionDelivery::default(),
+        );
+        let body = response_json(
+            annotate_wake_response(completed, "run-2", "brief", "delivery_failed", "queued").await,
+        )
+        .await;
+        assert_eq!(body["success"], true);
+        assert!(body.get("failure_kind").is_none());
     }
 
     #[tokio::test]
@@ -3582,7 +3622,8 @@ mod tests {
             Some(99),
             &WakeReactionDelivery::default(),
         );
-        let response = annotate_wake_response(response, "run-123", "brief", "queue_failed").await;
+        let response = annotate_wake_response(response, "run-123", "brief", "delivery_failed", "queue_failed")
+                .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         assert_eq!(body["success"], false);

@@ -2024,6 +2024,17 @@ impl TelegramToolContext {
     }
 }
 
+/// Text-only record of a confirmed file delivery. Mirrors cannot carry the
+/// file, so they state where it was sent and keep any caption.
+fn telegram_attachment_notice(caption: &str) -> String {
+    let caption = caption.trim();
+    if caption.is_empty() {
+        "An attachment was sent in Telegram.".to_string()
+    } else {
+        format!("An attachment was sent in Telegram.\n{caption}")
+    }
+}
+
 impl crate::tools::registry::MessageEgress for TelegramToolContext {
     fn send_message(
         &self,
@@ -2105,7 +2116,7 @@ impl TelegramToolContext {
             Err(error) => return error_payload(&error),
         };
         if self.dry_run {
-            self.record_visible_message((!caption.trim().is_empty()).then_some(caption));
+            self.record_visible_message(Some(&telegram_attachment_notice(caption)));
             return serde_json::to_string_pretty(&json!({
                 "success": true,
                 "type": plan.send_type.as_str(),
@@ -2125,7 +2136,7 @@ impl TelegramToolContext {
         match result {
             Ok(message_id) => {
                 self.remember_sent_message(message_id, caption);
-                self.record_visible_message((!caption.trim().is_empty()).then_some(caption));
+                self.record_visible_message(Some(&telegram_attachment_notice(caption)));
                 serde_json::to_string_pretty(&json!({
                     "success": true,
                     "type": plan.send_type.as_str(),
@@ -3338,6 +3349,36 @@ mod tests {
             assert_eq!(plan.send_type, expected);
             assert!(plan.is_url);
         }
+    }
+
+    #[test]
+    fn telegram_file_delivery_records_text_notice_with_optional_caption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("report.pdf");
+        std::fs::write(&file, "pdf bytes").unwrap();
+        let guard = Arc::new(Mutex::new(TelegramTurnGuard::new()));
+        let context = TelegramToolContext {
+            token: "token".to_string(),
+            chat_id: 99,
+            user_id: Some(7),
+            last_message_id: Some(42),
+            guard: Some(guard.clone()),
+            dry_run: true,
+            sent_messages: None,
+        };
+
+        context.send_file(file.to_str().unwrap(), "", true);
+        context.send_file(file.to_str().unwrap(), "  Weekly report  ", true);
+
+        let mut guard = guard.lock().unwrap();
+        assert_eq!(guard.visible_messages_sent(), 2);
+        assert_eq!(
+            guard.drain_visible_texts(),
+            vec![
+                "An attachment was sent in Telegram.".to_string(),
+                "An attachment was sent in Telegram.\nWeekly report".to_string(),
+            ]
+        );
     }
 
     #[test]
