@@ -35,6 +35,23 @@ struct Inbound {
     vote: Option<String>,
 }
 
+fn imessage_failure_notice(error: &anyhow::Error) -> &'static str {
+    // Only fixed, safe notices reach the user; full diagnostics stay in logs.
+    if let Some(message) = crate::interfaces::telegram::llm_auth_reply(error) {
+        if message == crate::interfaces::telegram::OPENAI_STATIC_TOKEN_MESSAGE {
+            "My model connection uses a static OPENAI_AUTH_TOKEN override that cannot renew itself. Remove that override from the deployment configuration, restart Lethe, use /login openai in our private Telegram chat, then ask me to continue from the current state."
+        } else {
+            "My model connection needs to be renewed. Use /login openai in our private Telegram chat, then ask me to continue from the current state."
+        }
+    } else if let Some(message) = crate::interfaces::telegram::llm_limit_reply(error) {
+        message
+    } else if error.is::<tokio::time::error::Elapsed>() {
+        "This request timed out before I could finish. Work already completed may still have taken effect; ask me to continue from the current state."
+    } else {
+        "I couldn't finish answering because the model request or task processing failed. The error was recorded. Work already completed may still have taken effect; ask me to continue from the current state."
+    }
+}
+
 impl Inbound {
     fn scope(&self) -> ApprovalScope {
         ApprovalScope {
@@ -693,10 +710,14 @@ impl ImessageTransport {
                         continue;
                     }
                     if let Err(error) = &result {
-                        tracing::warn!(error = %error, "iMessage turn failed");
-                        self.queue(&inbound, json!({
-                            "kind": "text", "content": "I couldn't complete that task. Ask me to check its state before repeating an action."
-                        }));
+                        tracing::warn!(event_id = %inbound.event_id,
+                            error = %crate::diagnostics::error_summary(error), "iMessage turn failed");
+                        self.queue(
+                            &inbound,
+                            json!({
+                                "kind": "text", "content": imessage_failure_notice(error)
+                            }),
+                        );
                     }
                     let _ = self.store.finish(
                         &inbound.event_id,
@@ -892,6 +913,23 @@ impl ImessageTransport {
                 text: String::new(),
                 vote: None,
             }))
+    }
+
+    /// Queue scheduled text for the current opted-in principal. Delivery
+    /// rechecks consent and allowlisting.
+    pub(crate) fn queue_scheduled_notifications(&self, texts: &[String]) -> Result<bool> {
+        let Some(target) = self.notification_target()? else {
+            return Ok(false);
+        };
+        for text in texts {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let output = prepare_output(json!({"kind": "notification", "content": text}))?;
+            self.store.queue_output(&target, output)?;
+        }
+        self.outbox_notify.notify_one();
+        Ok(true)
     }
 
     async fn run_notifications(self: Arc<Self>, brainstem: BrainstemHandle) {
@@ -1223,6 +1261,82 @@ fn text_chunks(text: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_delivery_requires_consent_and_is_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = transport(directory.path());
+        let texts = vec![
+            "Morning brief".to_string(),
+            "Run failed; check status".to_string(),
+        ];
+        assert!(!current.queue_scheduled_notifications(&texts).unwrap());
+        current.set_notifications(&inbound(), true).unwrap();
+        assert!(current.queue_scheduled_notifications(&texts).unwrap());
+        drop(current);
+        let restored = transport(directory.path());
+        let notifications: Vec<Value> = {
+            let connection = restored.store.connection().unwrap();
+            let mut statement = connection
+                .prepare("SELECT payload FROM linq_outbox ORDER BY rowid")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|payload| serde_json::from_str::<Value>(&payload.unwrap()).unwrap())
+                .filter(|output| output["kind"] == "notification")
+                .collect()
+        };
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(notifications[0]["content"], "Morning brief");
+        assert_eq!(notifications[1]["content"], "Run failed; check status");
+        let output = &notifications[0];
+        assert!(
+            restored
+                .output_is_authorized("chat-1", "+49123456789", output)
+                .unwrap()
+        );
+        restored.set_notifications(&inbound(), false).unwrap();
+        assert!(
+            !restored
+                .output_is_authorized("chat-1", "+49123456789", output)
+                .unwrap()
+        );
+        assert!(!restored.queue_scheduled_notifications(&texts).unwrap());
+    }
+
+    #[test]
+    fn imessage_failures_explain_limits_and_do_not_echo_provider_errors() {
+        let limit = anyhow!("HTTP 429: private provider body").context("LLM request failed");
+        assert_eq!(
+            imessage_failure_notice(&limit),
+            crate::interfaces::telegram::USAGE_LIMIT_MESSAGE
+        );
+        let failure = anyhow!("private provider body").context("LLM request failed");
+        let notice = imessage_failure_notice(&failure);
+        assert!(notice.contains("model request"));
+        assert!(!notice.contains("private provider body"));
+        assert!(!notice.contains("Ask me to check its state"));
+    }
+
+    #[test]
+    fn imessage_auth_failures_distinguish_static_override_from_sign_in() {
+        let sign_in = anyhow::Error::new(crate::llm::openai_oauth::OpenAiAuthRequired {
+            static_token: false,
+        })
+        .context("LLM request failed");
+        let notice = imessage_failure_notice(&sign_in);
+        assert!(notice.contains("/login openai"));
+        assert!(!notice.contains("OPENAI_AUTH_TOKEN"));
+
+        let static_token =
+            anyhow::Error::new(crate::llm::openai_oauth::OpenAiAuthRequired { static_token: true })
+                .context("LLM request failed");
+        let notice = imessage_failure_notice(&static_token);
+        assert!(notice.contains("OPENAI_AUTH_TOKEN"));
+        assert!(notice.contains("Remove that override"));
+        assert!(notice.contains("restart Lethe"));
+    }
 
     fn transport(directory: &Path) -> ImessageTransport {
         ImessageTransport::new(

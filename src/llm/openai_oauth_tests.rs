@@ -342,3 +342,111 @@ async fn failed_persistence_retains_rotated_tokens_until_the_file_is_writable() 
     assert!(!f.client.tokens.lock().await.persistence_pending);
     assert_eq!(f.refreshes.load(Ordering::SeqCst), 1);
 }
+
+const COMPLETE_RESPONSE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"recovered\"}]}]}}\n\n";
+const PARTIAL_RESPONSE: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n";
+
+async fn response_fixture(responses: Vec<(u16, &'static str)>) -> Fixture {
+    use axum::{Router, routing::post};
+    let mut f = fixture(200, false).await;
+    f.server.abort();
+    let requests = f.requests.clone();
+    let app = Router::new().route(
+        "/responses",
+        post(move || {
+            let index = requests.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = responses[index.min(responses.len() - 1)];
+            async move {
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [("content-type", "text/event-stream")],
+                    body,
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.client.responses_url = format!("http://{}/responses", listener.local_addr().unwrap());
+    f.server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    f
+}
+
+#[tokio::test]
+async fn temporary_http_and_incomplete_responses_recover_at_the_model_boundary() {
+    for (status, body) in [
+        (500, "temporary"),
+        (502, "temporary"),
+        (504, "temporary"),
+        (200, PARTIAL_RESPONSE),
+        (
+            200,
+            "event: error\ndata: {\"type\":\"error\",\"code\":\"server_error\",\"message\":\"temporary\"}\n\n",
+        ),
+    ] {
+        let f = response_fixture(vec![(status, body), (200, COMPLETE_RESPONSE)]).await;
+        let result = f
+            .client
+            .exec_chat_request("gpt-5", ChatRequest::default(), &ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.first_text(), Some("recovered"));
+        assert_eq!(f.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(f.refreshes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn permanent_provider_failures_are_not_retried() {
+    for (status, body) in [
+        (400, "invalid request"),
+        (
+            200,
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"invalid request\"}}}\n\n",
+        ),
+    ] {
+        let f = response_fixture(vec![(status, body)]).await;
+        assert!(
+            f.client
+                .exec_chat_request("gpt-5", ChatRequest::default(), &ChatOptions::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(f.requests.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn transient_retries_are_bounded() {
+    let f = response_fixture(vec![(502, "temporary")]).await;
+    assert!(
+        f.client
+            .exec_chat_request("gpt-5", ChatRequest::default(), &ChatOptions::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(f.requests.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn streaming_retries_only_before_visible_output() {
+    for (first, expected, count, succeeds) in [
+        ("", "recovered", 2, true),
+        (PARTIAL_RESPONSE, "partial", 1, false),
+    ] {
+        let f = response_fixture(vec![(200, first), (200, COMPLETE_RESPONSE)]).await;
+        let output = std::sync::Mutex::new(String::new());
+        let on_delta = |text: &str| output.lock().unwrap().push_str(text);
+        let result = f
+            .client
+            .exec_chat_request_stream(
+                "gpt-5",
+                ChatRequest::default(),
+                &ChatOptions::default(),
+                &on_delta,
+            )
+            .await;
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(*output.lock().unwrap(), expected);
+        assert_eq!(f.requests.load(Ordering::SeqCst), count);
+    }
+}

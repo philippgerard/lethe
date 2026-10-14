@@ -988,14 +988,19 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                         &on_delta,
                         Some(&on_reasoning),
                     )
-                    .await?
+                    .await
             }
             None => {
                 router
                     .exec_chat_request_with_model(request.clone(), &model_id)
-                    .await?
+                    .await
             }
-        };
+        }
+        .inspect_err(|error| {
+            tracing::error!(iteration, model = %model_id,
+                error = %crate::diagnostics::error_summary(error),
+                "model request failed; completed tool calls will not be replayed");
+        })?;
         if let Some(prompt_tokens) = response.usage.prompt_tokens {
             context
                 .last_prompt_tokens

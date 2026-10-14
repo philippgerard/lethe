@@ -78,9 +78,17 @@ pub enum TelegramError {
     #[error("telegram api error: {0}")]
     Api(String),
     #[error(transparent)]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl From<reqwest::Error> for TelegramError {
+    fn from(error: reqwest::Error) -> Self {
+        // Bot API URLs contain the credential in their path. Strip the URL at
+        // the boundary so Display, Debug, and chained errors are all safe.
+        Self::Http(error.without_url())
+    }
 }
 
 pub type TelegramResult<T> = Result<T, TelegramError>;
@@ -2016,6 +2024,17 @@ impl TelegramToolContext {
     }
 }
 
+/// Text-only record of a confirmed file delivery. Mirrors cannot carry the
+/// file, so they state where it was sent and keep any caption.
+fn telegram_attachment_notice(caption: &str) -> String {
+    let caption = caption.trim();
+    if caption.is_empty() {
+        "An attachment was sent in Telegram.".to_string()
+    } else {
+        format!("An attachment was sent in Telegram.\n{caption}")
+    }
+}
+
 impl crate::tools::registry::MessageEgress for TelegramToolContext {
     fn send_message(
         &self,
@@ -2097,7 +2116,7 @@ impl TelegramToolContext {
             Err(error) => return error_payload(&error),
         };
         if self.dry_run {
-            self.record_visible_message((!caption.trim().is_empty()).then_some(caption));
+            self.record_visible_message(Some(&telegram_attachment_notice(caption)));
             return serde_json::to_string_pretty(&json!({
                 "success": true,
                 "type": plan.send_type.as_str(),
@@ -2117,7 +2136,7 @@ impl TelegramToolContext {
         match result {
             Ok(message_id) => {
                 self.remember_sent_message(message_id, caption);
-                self.record_visible_message((!caption.trim().is_empty()).then_some(caption));
+                self.record_visible_message(Some(&telegram_attachment_notice(caption)));
                 serde_json::to_string_pretty(&json!({
                     "success": true,
                     "type": plan.send_type.as_str(),
@@ -2398,6 +2417,31 @@ pub fn set_message_reaction_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_errors_remove_credential_bearing_urls_from_all_representations() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(502)
+                .body("")
+                .unwrap(),
+        );
+        let error = response.error_for_status().unwrap_err().with_url(
+            "https://api.telegram.org/bot123456:private-token/getUpdates"
+                .parse()
+                .unwrap(),
+        );
+        let error = TelegramError::from(error);
+        for text in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{:#}", anyhow::Error::new(error)),
+        ] {
+            assert!(text.contains("502"));
+            assert!(!text.contains("private-token"));
+            assert!(!text.contains("api.telegram.org"));
+        }
+    }
 
     #[test]
     fn parses_text_update_and_authorization() {
@@ -3305,6 +3349,36 @@ mod tests {
             assert_eq!(plan.send_type, expected);
             assert!(plan.is_url);
         }
+    }
+
+    #[test]
+    fn telegram_file_delivery_records_text_notice_with_optional_caption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("report.pdf");
+        std::fs::write(&file, "pdf bytes").unwrap();
+        let guard = Arc::new(Mutex::new(TelegramTurnGuard::new()));
+        let context = TelegramToolContext {
+            token: "token".to_string(),
+            chat_id: 99,
+            user_id: Some(7),
+            last_message_id: Some(42),
+            guard: Some(guard.clone()),
+            dry_run: true,
+            sent_messages: None,
+        };
+
+        context.send_file(file.to_str().unwrap(), "", true);
+        context.send_file(file.to_str().unwrap(), "  Weekly report  ", true);
+
+        let mut guard = guard.lock().unwrap();
+        assert_eq!(guard.visible_messages_sent(), 2);
+        assert_eq!(
+            guard.drain_visible_texts(),
+            vec![
+                "An attachment was sent in Telegram.".to_string(),
+                "An attachment was sent in Telegram.\nWeekly report".to_string(),
+            ]
+        );
     }
 
     #[test]
