@@ -235,12 +235,12 @@ impl NotificationPreferences {
     }
 
     pub(crate) fn queue_imessage(&self, text: &str) -> Result<bool> {
-        Ok(self.queue_delivery(text)?.imessage.is_some())
+        Ok(self.queue_delivery(text, "")?.imessage.is_some())
     }
 
     /// Select both destinations and persist iMessage output in one transaction,
     /// so simultaneous chat commands cannot create a gap between two reads.
-    pub(crate) fn queue_delivery(&self, text: &str) -> Result<NotificationRoute> {
+    pub(crate) fn queue_delivery(&self, text: &str, parse_mode: &str) -> Result<NotificationRoute> {
         let mut connection = self.store.connection()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let route = self.read_route(&tx)?;
@@ -250,7 +250,8 @@ impl NotificationPreferences {
             return Ok(route);
         };
         let output = super::imessage::prepare_output(serde_json::json!({
-            "kind": "notification", "content": text, "notification_generation": route.generation,
+            "kind": "notification", "content": text, "parse_mode": parse_mode,
+            "notification_generation": route.generation,
         }))?;
         tx.execute(
             "INSERT INTO linq_outbox(id,chat,sender,payload) VALUES(?1,?2,?3,?4)",

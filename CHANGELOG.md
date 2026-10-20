@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Preserve explicit HTML formatting when notifications and chat tool messages
+  are routed to iMessage. Render emphasis as native styles instead of visible
+  tags, decode entities, and retain links and code text. Ordinary Markdown and
+  previously queued delivery payloads keep their existing behavior.
+- Update Rustls to 0.23.46 in all three lockfiles to resolve the dependency
+  advisories reported by the release security gate.
+
 - Add explicit quiet completion for scheduled `/wake` runs. The wake-only
   `wake_finish_silently` tool suppresses final acknowledgments when a task has
   nothing to report and returns successful, undelivered completion to the

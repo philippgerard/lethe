@@ -3051,13 +3051,26 @@ mod tests {
             &registry
                 .execute_async(
                     "telegram_send_message",
-                    &json!({"text": "Scheduled reminder"}),
+                    &json!({"text": "🥐 <b>557 kcal</b>", "parse_mode": "html"}),
                 )
                 .await,
         )
         .unwrap();
         assert_eq!(outcome["success"], true);
         assert_eq!(outcome["telegram_status"], "off");
+        let connection =
+            rusqlite::Connection::open(tmp.path().join("data/transports/linq.sqlite")).unwrap();
+        let raw: String = connection
+            .query_row("SELECT payload FROM linq_outbox", [], |row| row.get(0))
+            .unwrap();
+        let queued: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            queued["text_parts"],
+            json!([{
+                "text": "🥐 557 kcal",
+                "text_decorations": [{"range": [3, 11], "style": "bold"}]
+            }])
+        );
         let delivery = take_wake_guard_delivery(&guard).unwrap();
         assert_eq!(delivery.tool_messages_sent, 1);
         let response = finish_wake_delivery(

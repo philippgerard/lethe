@@ -1,4 +1,7 @@
-//! Pure Markdown rendering for Linq text parts and their UTF-16 decorations.
+//! Pure text rendering for Linq text parts and their UTF-16 decorations.
+
+mod html;
+pub use html::render_imessage_html;
 
 use std::ops::Range;
 

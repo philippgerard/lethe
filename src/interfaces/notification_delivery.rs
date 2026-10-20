@@ -86,11 +86,11 @@ impl NotificationDelivery {
         }
     }
 
-    fn prepare_delivery(&self, text: &str) -> Result<(bool, bool)> {
+    fn prepare_delivery(&self, text: &str, parse_mode: &str) -> Result<(bool, bool)> {
         let Some(preferences) = &self.preferences else {
             return Ok((true, false));
         };
-        match preferences.queue_delivery(text) {
+        match preferences.queue_delivery(text, parse_mode) {
             Ok(route) => {
                 let queued = route.imessage.is_some();
                 if queued {
@@ -163,7 +163,7 @@ impl MessageEgress for NotificationDelivery {
         if text.trim().is_empty() {
             return json!({"success": false, "error": "Notification text is required"}).to_string();
         }
-        let (telegram_enabled, queued) = match self.prepare_delivery(text) {
+        let (telegram_enabled, queued) = match self.prepare_delivery(text, parse_mode) {
             Ok(route) => route,
             Err(_) => {
                 return json!({"success": false, "error": "Notification settings are unavailable"})
@@ -236,14 +236,16 @@ mod tests {
     #[derive(Default)]
     struct FakeTelegram {
         texts: Mutex<Vec<String>>,
+        parse_modes: Mutex<Vec<String>>,
         fail: std::sync::atomic::AtomicBool,
     }
     impl MessageEgress for FakeTelegram {
-        fn send_message(&self, text: &str, _: &str, _: Option<&str>) -> String {
+        fn send_message(&self, text: &str, parse_mode: &str, _: Option<&str>) -> String {
             if self.fail.load(Ordering::Relaxed) {
                 return json!({"success": false, "error": "offline"}).to_string();
             }
             self.texts.lock().unwrap().push(text.into());
+            self.parse_modes.lock().unwrap().push(parse_mode.into());
             json!({"success": true, "message_id": 42}).to_string()
         }
         fn send_file(&self, _: &str, _: &str, _: bool) -> String {
@@ -251,6 +253,75 @@ mod tests {
         }
         fn react(&self, _: &str, _: i64) -> String {
             panic!("disabled channel must not react")
+        }
+    }
+
+    #[test]
+    fn html_notifications_render_for_imessage_and_preserve_telegram_payloads() {
+        for telegram_enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = crate::config::ImessageConfig {
+                enabled: true,
+                api_token: "test".into(),
+                webhook_secret: "secret".into(),
+                allowed_senders: vec!["+49123456789".into()],
+                native_polls: false,
+            };
+            let prefs = NotificationPreferences::open(dir.path(), &config, true).unwrap();
+            prefs
+                .command(
+                    Channel::Imessage,
+                    NotificationCommand::Set(true),
+                    Some(("chat-1", "+49123456789")),
+                )
+                .unwrap();
+            if !telegram_enabled {
+                prefs
+                    .command(Channel::Telegram, NotificationCommand::Set(false), None)
+                    .unwrap();
+            }
+            let telegram = Arc::new(FakeTelegram::default());
+            let delivery = NotificationDelivery {
+                preferences: Some(prefs),
+                telegram: telegram.clone(),
+                guard: None,
+                telegram_sent: AtomicUsize::new(0),
+                imessage_queued: AtomicUsize::new(0),
+                imessage_failed: AtomicUsize::new(0),
+            };
+            let html = "🥐 <b>Frühstück</b>: <b>557 kcal</b> &amp; Kaffee";
+            let result: Value =
+                serde_json::from_str(&delivery.send_message(html, "HTML", None)).unwrap();
+            assert_eq!(result["success"], true);
+            assert_eq!(result["imessage_status"], "queued");
+            assert_eq!(
+                result["telegram_status"],
+                if telegram_enabled { "sent" } else { "off" }
+            );
+            if telegram_enabled {
+                assert_eq!(telegram.texts.lock().unwrap().as_slice(), [html]);
+                assert_eq!(telegram.parse_modes.lock().unwrap().as_slice(), ["HTML"]);
+            } else {
+                assert!(telegram.texts.lock().unwrap().is_empty());
+            }
+            // Read the durable delivery contract after dropping the producer.
+            drop(delivery);
+            let connection = rusqlite::Connection::open(dir.path().join("linq.sqlite")).unwrap();
+            let raw: String = connection
+                .query_row("SELECT payload FROM linq_outbox", [], |row| row.get(0))
+                .unwrap();
+            let output: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(output["content"], html);
+            assert_eq!(
+                output["text_parts"],
+                json!([{
+                    "text": "🥐 Frühstück: 557 kcal & Kaffee",
+                    "text_decorations": [
+                        {"range": [3, 12], "style": "bold"},
+                        {"range": [14, 22], "style": "bold"}
+                    ]
+                }])
+            );
         }
     }
 

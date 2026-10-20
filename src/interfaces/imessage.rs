@@ -20,11 +20,13 @@ use super::notifications::{Channel, NotificationCommand, NotificationPreferences
 use crate::agent::{Agent, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
 use crate::config::ImessageConfig;
 use crate::interfaces::actions::{ActionStore, ApprovalRequest, ApprovalScope, ApprovalStatus};
-use crate::interfaces::imessage_formatting::{RenderedText, render_imessage_markdown};
+use crate::interfaces::imessage_formatting::{
+    RenderedText, render_imessage_html, render_imessage_markdown,
+};
 use crate::interfaces::linq::{DeliveryUpdate, LinqClient, LinqError, PollEnvelope, WebhookEvent};
 use crate::scheduler::brainstem::BrainstemHandle;
 use crate::tools::actions::ActionToolContext;
-use crate::tools::registry::{ClientToolContext, ToolRuntime};
+use crate::tools::registry::{ClientToolContext, ClientToolEvent, ToolRuntime};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Inbound {
@@ -662,6 +664,25 @@ impl ImessageTransport {
         }
     }
 
+    fn queue_client_event(&self, inbound: &Inbound, event: ClientToolEvent) -> bool {
+        if event.event != "text"
+            || event
+                .data
+                .get("reply_markup")
+                .is_some_and(|value| !value.is_null())
+        {
+            return false;
+        }
+        self.queue(
+            inbound,
+            json!({
+                "kind": "text", "content": event.data["content"],
+                "parse_mode": event.data["parse_mode"],
+                "reply_markup": event.data["reply_markup"],
+            }),
+        )
+    }
+
     async fn run_inbox(
         self: Arc<Self>,
         agent: Arc<Agent>,
@@ -826,15 +847,7 @@ impl ImessageTransport {
         let transport = self.clone();
         let target = inbound.clone();
         let client = ClientToolContext::new(0, None, move |event| {
-            if event.event != "text"
-                || event
-                    .data
-                    .get("reply_markup")
-                    .is_some_and(|value| !value.is_null())
-            {
-                return false;
-            }
-            transport.queue(&target, json!({"kind": "text", "content": event.data["content"], "reply_markup": event.data["reply_markup"]}))
+            transport.queue_client_event(&target, event)
         });
         let transport = self.clone();
         let target = inbound.clone();
@@ -1174,7 +1187,16 @@ fn output_text(output: &Value) -> Result<String> {
 pub(crate) fn prepare_output(mut output: Value) -> Result<Value> {
     // Persist rendering before the first send: a retry must keep identical
     // message chunks, decoration ranges, and provider idempotency keys.
-    let parts = render_imessage_markdown(&output_text(&output)?).chunks(3000);
+    let text = output_text(&output)?;
+    let rendered = if output["parse_mode"]
+        .as_str()
+        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("html"))
+    {
+        render_imessage_html(&text)
+    } else {
+        render_imessage_markdown(&text)
+    };
+    let parts = rendered.chunks(3000);
     output["text_parts"] = serde_json::to_value(parts)?;
     Ok(output)
 }
@@ -1747,6 +1769,43 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&parts[0].text_decorations).unwrap(),
             json!([{"range": [3, 8], "style": "bold"}])
+        );
+    }
+
+    #[test]
+    fn html_outbox_payload_survives_restart_with_native_decorations() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = transport(directory.path());
+        let html = "🥐 <b>557 kcal</b> &amp; <i>Kaffee</i>";
+        let client = ClientToolContext::new(0, None, move |event| {
+            original.queue_client_event(&inbound(), event)
+        });
+        let sent: Value = serde_json::from_str(&client.send_message(html, " HTML ", None)).unwrap();
+        assert_eq!(sent["success"], true);
+        drop(client);
+        let restored = transport(directory.path());
+        let raw: String = restored
+            .store
+            .connection()
+            .unwrap()
+            .query_row("SELECT payload FROM linq_outbox", [], |row| row.get(0))
+            .unwrap();
+        let mut output: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(output["content"], html);
+        // Delivery retries use the saved rendering, even if a later renderer
+        // would interpret the source differently.
+        output["content"] = json!("do not render this changed content");
+        output["parse_mode"] = json!("");
+        let parts = output_parts(&output, "do not use legacy text").unwrap();
+        assert_eq!(
+            serde_json::to_value(parts).unwrap(),
+            json!([{
+                "text": "🥐 557 kcal & Kaffee",
+                "text_decorations": [
+                    {"range": [3, 11], "style": "bold"},
+                    {"range": [14, 20], "style": "italic"}
+                ]
+            }])
         );
     }
 
