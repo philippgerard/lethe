@@ -49,6 +49,8 @@
   },
   "openai": {
     "main": [
+      ["GPT-6.1 Terra", "gpt-6.1-terra", "$1/$5"],
+      ["GPT-6.1 Sol", "gpt-6.1-sol", "$2/$10"],
       ["GPT-5.5", "gpt-5.5", "$5/$30"],
       ["GPT-6 Astra", "gpt-6-astra", "$10/$50"],
       ["GPT-6 Astra (high reasoning)", "gpt-6-astra-high", "$10/$50"],

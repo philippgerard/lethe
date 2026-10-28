@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Upgrade the standalone legacy migrator to fixed Zstandard compression
+  dependencies through manifest-only Arrow IPC and Lance encoding patches.
+  Keep the existing storage readers and all release dependency audit gates.
+
+- Preserve provider-specific defaults during non-interactive initialization.
+- Update P-256 and its arithmetic dependencies, Tokio, and certificate
+  verification/root packages to clear newly reported release audit advisories.
+
+- Add GPT-6.1 Terra and Sol to the model catalog and Responses API routing.
+  Default everyday conversations to Terra and deep thinking to Sol when the
+  main model talks to OpenAI directly; explicit environment settings continue
+  to override these defaults. Bare GPT-6 ids use the Responses API without
+  `LLM_PROVIDER`.
+
 - Preserve explicit HTML formatting when notifications and chat tool messages
   are routed to iMessage. Render emphasis as native styles instead of visible
   tags, decode entities, and retain links and code text. Ordinary Markdown and

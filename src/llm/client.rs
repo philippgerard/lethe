@@ -293,9 +293,16 @@ fn is_gpt5_reasoning(model_name: &str) -> bool {
 }
 
 fn is_gpt6_reasoning(model_name: &str) -> bool {
-    ["gpt-6-astra", "gpt-6-sol", "gpt-6-terra", "gpt-6-luna"]
-        .iter()
-        .any(|prefix| model_name.starts_with(prefix))
+    [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-terra",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+    ]
+    .iter()
+    .any(|prefix| model_name.starts_with(prefix))
 }
 
 fn is_claude_without_sampling_params(model_name: &str) -> bool {
@@ -1203,9 +1210,13 @@ fn router_target_for_model(raw_model: &str, config: &LlmRouterConfig) -> Option<
     let api_base = normalize_api_base(&config.api_base);
     let slash_provider = slash_provider(model);
     let configured_provider = normalized_provider(&config.provider);
-    let provider = slash_provider
-        .or(configured_provider.as_deref())
-        .unwrap_or(if api_base.is_some() { "openai" } else { "" });
+    let provider = slash_provider.or(configured_provider.as_deref()).unwrap_or(
+        if api_base.is_some() || is_gpt6_reasoning(model) {
+            "openai"
+        } else {
+            ""
+        },
+    );
     if provider.is_empty() {
         return None;
     }
@@ -3529,6 +3540,8 @@ mod tests {
             "openai/gpt-6-astra",
             "openai/gpt-6-astra-high",
             "openai/gpt-6-sol",
+            "openai/gpt-6.1-sol",
+            "openai/gpt-6.1-terra",
             "openai/gpt-6-terra",
             "openai/gpt-6-luna",
         ] {
@@ -3545,13 +3558,38 @@ mod tests {
 
     #[test]
     fn bare_gpt6_tiers_use_the_openai_responses_adapter() {
-        for model in ["gpt-6-sol", "gpt-6-terra", "gpt-6-luna"] {
-            let config = config_for(model, "openai");
-            let target = router_target_for_model(model, &config).unwrap();
-            assert_eq!(target.adapter, AdapterKind::OpenAIResp);
-            assert_eq!(target.model_name, model);
-            assert_eq!(target.endpoint, OPENAI_ENDPOINT);
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-terra",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ] {
+            for provider in ["openai", ""] {
+                let config = config_for(model, provider);
+                let target = router_target_for_model(model, &config).unwrap();
+                assert_eq!(target.adapter, AdapterKind::OpenAIResp);
+                assert_eq!(target.model_name, model);
+                assert_eq!(target.endpoint, OPENAI_ENDPOINT);
+                assert_eq!(target.auth_env, "OPENAI_API_KEY");
+            }
         }
+    }
+
+    #[test]
+    fn bare_gpt6_ids_keep_relay_and_custom_endpoint_routing() {
+        let config = config_for("gpt-6.1-terra", "openrouter");
+        let target = router_target_for_model("gpt-6.1-terra", &config).unwrap();
+        assert_eq!(target.endpoint, OPENROUTER_ENDPOINT);
+        assert_eq!(target.adapter, AdapterKind::OpenAI);
+
+        let mut config = config_for("gpt-6.1-terra", "");
+        config.api_base = "http://localhost:8080/v1/".to_string();
+        let target = router_target_for_model("gpt-6.1-terra", &config).unwrap();
+        assert_eq!(target.endpoint, config.api_base);
+
+        let config = config_for("claude-sonnet-5", "");
+        assert_eq!(router_target_for_model("claude-sonnet-5", &config), None);
     }
 
     #[test]
@@ -3591,6 +3629,8 @@ mod tests {
             "openai/gpt-6-astra-high",
             "gpt-6-sol",
             "openai/gpt-6-sol",
+            "openai/gpt-6.1-sol",
+            "openai/gpt-6.1-terra",
             "gpt-6-terra",
             "openai/gpt-6-terra",
             "gpt-6-luna",
