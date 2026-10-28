@@ -293,9 +293,16 @@ fn is_gpt5_reasoning(model_name: &str) -> bool {
 }
 
 fn is_gpt6_reasoning(model_name: &str) -> bool {
-    ["gpt-6-astra", "gpt-6-sol", "gpt-6-terra", "gpt-6-luna"]
-        .iter()
-        .any(|prefix| model_name.starts_with(prefix))
+    [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-terra",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+    ]
+    .iter()
+    .any(|prefix| model_name.starts_with(prefix))
 }
 
 fn is_claude_without_sampling_params(model_name: &str) -> bool {
@@ -3529,6 +3536,8 @@ mod tests {
             "openai/gpt-6-astra",
             "openai/gpt-6-astra-high",
             "openai/gpt-6-sol",
+            "openai/gpt-6.1-sol",
+            "openai/gpt-6.1-terra",
             "openai/gpt-6-terra",
             "openai/gpt-6-luna",
         ] {
@@ -3545,7 +3554,13 @@ mod tests {
 
     #[test]
     fn bare_gpt6_tiers_use_the_openai_responses_adapter() {
-        for model in ["gpt-6-sol", "gpt-6-terra", "gpt-6-luna"] {
+        for model in [
+            "gpt-6-sol",
+            "gpt-6-terra",
+            "gpt-6-luna",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+        ] {
             let config = config_for(model, "openai");
             let target = router_target_for_model(model, &config).unwrap();
             assert_eq!(target.adapter, AdapterKind::OpenAIResp);
@@ -3591,6 +3606,8 @@ mod tests {
             "openai/gpt-6-astra-high",
             "gpt-6-sol",
             "openai/gpt-6-sol",
+            "openai/gpt-6.1-sol",
+            "openai/gpt-6.1-terra",
             "gpt-6-terra",
             "openai/gpt-6-terra",
             "gpt-6-luna",

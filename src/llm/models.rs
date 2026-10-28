@@ -294,6 +294,8 @@ mod tests {
                 "Claude Sonnet 5",
             ),
             ("openai", "gpt-6-sol", "GPT-6 Sol"),
+            ("openai", "gpt-6.1-sol", "GPT-6.1 Sol"),
+            ("openai", "gpt-6.1-terra", "GPT-6.1 Terra"),
             ("openai", "gpt-6-luna", "GPT-6 Luna"),
         ];
 

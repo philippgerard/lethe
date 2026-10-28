@@ -327,8 +327,8 @@ Lethe routes chat through `genai`. The runtime supports both API-key and subscri
 |----------|------|---------------------|
 | Anthropic (API key) | `ANTHROPIC_API_KEY` | `claude-opus-5-5` |
 | Anthropic (Claude Pro/Max) | `lethe login anthropic` → token file | `claude-sonnet-5` |
-| OpenAI (API key) | `OPENAI_API_KEY` | `gpt-6-sol` |
-| OpenAI (ChatGPT Plus/Pro) | `lethe login openai` → token file | `gpt-6-sol` |
+| OpenAI (API key) | `OPENAI_API_KEY` | `gpt-6.1-terra` |
+| OpenAI (ChatGPT Plus/Pro) | `lethe login openai` → token file | `gpt-6.1-terra` |
 | OpenRouter | `OPENROUTER_API_KEY` | `openrouter/moonshotai/kimi-k2.6` |
 | OpenCode Go | `OPENCODE_GO_API_KEY` | `opencode-go/kimi-k2.6` |
 | Local OpenAI-compatible | `LLM_API_BASE` + `OPENAI_API_KEY=local` | `openai/gemma-4-31B-it-Q8_0.gguf` |
@@ -341,7 +341,7 @@ Lethe uses up to four model slots. `LLM_MODEL` is the main model; `LLM_MODEL_AUX
 
 For [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) with high reasoning effort, set `LLM_MODEL_DEEP=gpt-6-astra-high` in the runtime environment, or use `/deep gpt-6-astra-high` over Telegram for the current process. This requires OpenAI authentication (an API key or ChatGPT login) and the native OpenAI endpoint. When keeping an Anthropic primary model, use `LLM_MODEL_DEEP=openai/gpt-6-astra-high` to select OpenAI explicitly. The `-high` suffix is Lethe's configuration shorthand: requests use `model: "gpt-6-astra"` and `reasoning: {"effort": "high"}` through the Responses API. Astra retains Lethe's 128k compaction budget.
 
-GPT-6 Sol and Luna use the Responses API for agent turns with function tools. Lethe also recognizes `gpt-6-terra` in its routing for when OpenAI makes that model ID available; it is not currently listed in the [OpenAI model catalog](https://developers.openai.com/api/docs/models). The current Anthropic catalog includes Claude Opus 5.5, Fable 5.1, and Sonnet 5.
+GPT-6.1 Terra is the default for everyday conversations; GPT-6.1 Sol is the default deep-thinking model. Set `LLM_MODEL=gpt-6.1-terra` and `LLM_MODEL_DEEP=openai/gpt-6.1-sol` in existing installations to adopt these defaults. Explicit environment settings take precedence (an empty deep model disables escalation). Both models use the Responses API for tool calls and retain Lethe's 128k compaction budget. See the [OpenAI model catalog](https://developers.openai.com/api/docs/models) for capabilities and pricing.
 
 ### Subscription OAuth
 

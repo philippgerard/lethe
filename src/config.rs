@@ -325,10 +325,13 @@ impl Settings {
                 openai_api_key: env_string("OPENAI_API_KEY", ""),
                 mistral_api_key: env_string("MISTRAL_API_KEY", ""),
                 opencode_go_api_key: env_string("OPENCODE_GO_API_KEY", ""),
-                llm_model: env_string("LLM_MODEL", ""),
+                llm_model: env_string("LLM_MODEL", "gpt-6.1-terra"),
                 llm_model_aux: env_string("LLM_MODEL_AUX", ""),
                 llm_model_tool: env_string("LLM_MODEL_TOOL", ""),
-                llm_model_deep: env_string("LLM_MODEL_DEEP", ""),
+                // An explicit empty value disables deep escalation.
+                llm_model_deep: env::var("LLM_MODEL_DEEP")
+                    .map(|value| value.trim().to_string())
+                    .unwrap_or_else(|_| "openai/gpt-6.1-sol".to_string()),
                 llm_provider: env_string("LLM_PROVIDER", ""),
                 llm_api_base: env_string("LLM_API_BASE", ""),
                 llm_context_limit: env_usize("LLM_CONTEXT_LIMIT", 100_000),
