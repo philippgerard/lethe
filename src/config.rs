@@ -288,6 +288,15 @@ impl Settings {
             lethe_home,
         };
 
+        let llm_provider = env_string("LLM_PROVIDER", "");
+        let llm_api_base = env_string("LLM_API_BASE", "");
+        let (llm_model, llm_model_deep) = resolve_models(
+            &env_string("LLM_MODEL", ""),
+            env::var("LLM_MODEL_DEEP"),
+            &llm_provider,
+            &llm_api_base,
+        );
+
         Self {
             agent_name: env_string("LETHE_AGENT_NAME", "lethe"),
             mode: RuntimeMode::parse(env_string("LETHE_MODE", "cli")),
@@ -325,15 +334,12 @@ impl Settings {
                 openai_api_key: env_string("OPENAI_API_KEY", ""),
                 mistral_api_key: env_string("MISTRAL_API_KEY", ""),
                 opencode_go_api_key: env_string("OPENCODE_GO_API_KEY", ""),
-                llm_model: env_string("LLM_MODEL", "gpt-6.1-terra"),
+                llm_model,
                 llm_model_aux: env_string("LLM_MODEL_AUX", ""),
                 llm_model_tool: env_string("LLM_MODEL_TOOL", ""),
-                // An explicit empty value disables deep escalation.
-                llm_model_deep: env::var("LLM_MODEL_DEEP")
-                    .map(|value| value.trim().to_string())
-                    .unwrap_or_else(|_| "openai/gpt-6.1-sol".to_string()),
-                llm_provider: env_string("LLM_PROVIDER", ""),
-                llm_api_base: env_string("LLM_API_BASE", ""),
+                llm_model_deep,
+                llm_provider,
+                llm_api_base,
                 llm_context_limit: env_usize("LLM_CONTEXT_LIMIT", 100_000),
                 llm_max_output: env_u32("LLM_MAX_OUTPUT", 8_000),
             },
@@ -376,6 +382,41 @@ impl Settings {
     pub fn effective_deep_model(&self) -> &str {
         self.llm.effective_deep_model()
     }
+}
+
+const DEFAULT_LLM_MODEL: &str = "gpt-6.1-terra";
+const DEFAULT_LLM_MODEL_DEEP: &str = "openai/gpt-6.1-sol";
+
+/// Main and deep model ids. The GPT-6.1 defaults apply only when the setup
+/// talks to OpenAI directly; an explicit LLM_MODEL_DEEP, even empty, wins.
+fn resolve_models(
+    model: &str,
+    deep: Result<String, env::VarError>,
+    provider: &str,
+    api_base: &str,
+) -> (String, String) {
+    let model = if model.is_empty() && is_native_openai(DEFAULT_LLM_MODEL, provider, api_base) {
+        DEFAULT_LLM_MODEL
+    } else {
+        model
+    };
+    let deep = match deep {
+        Ok(value) => value.trim().to_string(),
+        Err(_) if is_native_openai(model, provider, api_base) => DEFAULT_LLM_MODEL_DEEP.to_string(),
+        Err(_) => String::new(),
+    };
+    (model.to_string(), deep)
+}
+
+/// Whether `model` goes straight to OpenAI: a slash prefix wins, then
+/// LLM_PROVIDER, then the catalog; a custom API base is never native.
+fn is_native_openai(model: &str, provider: &str, api_base: &str) -> bool {
+    let provider = match model.split_once('/') {
+        Some((prefix, _)) => prefix,
+        None if !provider.is_empty() => provider,
+        None => crate::llm::models::provider_for_model(model).unwrap_or_default(),
+    };
+    api_base.is_empty() && provider.eq_ignore_ascii_case("openai")
 }
 
 fn default_lethe_home() -> PathBuf {
@@ -574,6 +615,80 @@ mod tests {
         assert_eq!(settings.effective_tool_model(), "");
         settings.llm.llm_model_tool = "  deepseek/deepseek-v4-pro  ".to_string();
         assert_eq!(settings.effective_tool_model(), "deepseek/deepseek-v4-pro");
+    }
+
+    #[test]
+    fn gpt_61_defaults_apply_only_to_native_openai_setups() {
+        let unset = || Err(env::VarError::NotPresent);
+        let terra_sol = (
+            "gpt-6.1-terra".to_string(),
+            "openai/gpt-6.1-sol".to_string(),
+        );
+        assert_eq!(resolve_models("", unset(), "", ""), terra_sol);
+        assert_eq!(resolve_models("", unset(), "OpenAI", ""), terra_sol);
+        assert_eq!(
+            resolve_models("anthropic/claude-sonnet-5", unset(), "", ""),
+            ("anthropic/claude-sonnet-5".to_string(), String::new())
+        );
+        for (model, provider, api_base) in [
+            ("", "anthropic", ""),
+            ("", "openrouter", ""),
+            ("", "opencode-go", ""),
+            ("", "", "http://localhost:8080/v1"),
+            ("", "openai", "http://localhost:8080/v1"),
+        ] {
+            assert_eq!(
+                resolve_models(model, unset(), provider, api_base),
+                (String::new(), String::new()),
+                "{provider} {api_base}"
+            );
+        }
+        for (model, provider) in [
+            ("claude-sonnet-5", ""),
+            ("claude-opus-5-5", "anthropic"),
+            ("openrouter/openai/gpt-6.1-terra", ""),
+            ("opencode-go/kimi-k2.6", ""),
+            ("gpt-6.1-terra", "openrouter"),
+            ("ollama/gpt-oss", ""),
+        ] {
+            assert_eq!(
+                resolve_models(model, unset(), provider, "").1,
+                "",
+                "{model}"
+            );
+        }
+        assert_eq!(
+            resolve_models("gpt-6.1-terra", unset(), "", "http://localhost:8080/v1").1,
+            ""
+        );
+        for (model, provider) in [("gpt-5.5", ""), ("openai/gpt-6-sol", ""), ("o3", "openai")] {
+            assert_eq!(
+                resolve_models(model, unset(), provider, "").1,
+                "openai/gpt-6.1-sol",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_deep_model_wins_and_empty_disables_escalation() {
+        assert_eq!(
+            resolve_models("", Ok(" gpt-6-astra-high ".to_string()), "", "").1,
+            "gpt-6-astra-high"
+        );
+        assert_eq!(resolve_models("", Ok("  ".to_string()), "", "").1, "");
+        assert_eq!(
+            resolve_models(
+                "claude-sonnet-5",
+                Ok("openai/gpt-6.1-sol".to_string()),
+                "anthropic",
+                ""
+            ),
+            (
+                "claude-sonnet-5".to_string(),
+                "openai/gpt-6.1-sol".to_string()
+            )
+        );
     }
 
     #[test]

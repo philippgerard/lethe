@@ -3,8 +3,10 @@
 ## Unreleased
 
 - Add GPT-6.1 Terra and Sol to the model catalog and Responses API routing.
-  Default everyday conversations to Terra and deep thinking to Sol; explicit
-  environment settings continue to override these defaults.
+  Default everyday conversations to Terra and deep thinking to Sol when the
+  main model talks to OpenAI directly; explicit environment settings continue
+  to override these defaults. Bare GPT-6 ids use the Responses API without
+  `LLM_PROVIDER`.
 
 - Preserve explicit HTML formatting when notifications and chat tool messages
   are routed to iMessage. Render emphasis as native styles instead of visible
