@@ -41,3 +41,9 @@ tempfile = "3"
 # are unaffected.
 [profile.release]
 strip = true
+
+# Keep the legacy Lance/Arrow readers while using the fixed compression stack.
+# Provenance and the two manifest-only patches: vendor/README.md.
+[patch.crates-io]
+arrow-ipc = { path = "vendor/arrow-ipc" }
+lance-encoding = { path = "vendor/lance-encoding" }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Upgrade the standalone legacy migrator to fixed Zstandard compression
+  dependencies through manifest-only Arrow IPC and Lance encoding patches.
+  Keep the existing storage readers and all release dependency audit gates.
+
 - Preserve provider-specific defaults during non-interactive initialization.
 - Update P-256 and its arithmetic dependencies, Tokio, and certificate
   verification/root packages to clear newly reported release audit advisories.
