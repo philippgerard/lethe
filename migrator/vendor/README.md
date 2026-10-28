@@ -1,7 +1,8 @@
 # Migrator compression dependency patches
 
 These are the published crates.io sources for arrow-ipc 58.4.0 and
-lance-encoding 6.0.0, including their upstream license files.
+lance-encoding 6.0.0, including their upstream licenses. Lance encoding's license is copied from
+the repository root at archive commit `24d578702d5a1dd3cb0ee1e249b4eeacc1e3dc5c`.
 Only each normalized Cargo.toml dependency on zstd changes: 0.13 to 0.14.3.
 Cargo.lock and Cargo cache markers are omitted; the migrator owns resolution.
 
