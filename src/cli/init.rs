@@ -232,12 +232,12 @@ async fn run_noninteractive(args: InitArgs) -> Result<()> {
     };
 
     // Models: flag → existing env → catalog default.
-    let main_model = args
-        .model
-        .clone()
-        .or_else(|| non_empty(&settings.llm.llm_model))
-        .or_else(|| default_model_for(provider, "main"))
-        .ok_or_else(|| anyhow!("no main model resolved; pass --model"))?;
+    let main_model = resolve_init_model(
+        args.model.as_deref(),
+        std::env::var("LLM_MODEL").ok().as_deref(),
+        provider,
+    )
+    .ok_or_else(|| anyhow!("no main model resolved; pass --model"))?;
     let aux_model = args
         .aux_model
         .clone()
@@ -764,6 +764,18 @@ fn read_existing_env(path: &Path) -> EnvMap {
         .collect()
 }
 
+// Runtime settings may contain a synthesized OpenAI default. Initialization
+// must instead resolve explicit input against the provider selected by the CLI.
+fn resolve_init_model(
+    flag: Option<&str>,
+    configured: Option<&str>,
+    provider: Provider,
+) -> Option<String> {
+    flag.map(str::to_string)
+        .or_else(|| configured.and_then(non_empty))
+        .or_else(|| default_model_for(provider, "main"))
+}
+
 fn non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -848,6 +860,34 @@ fn warn(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_model_uses_selected_provider_unless_explicitly_configured() {
+        for provider in [
+            Provider::OpenAI,
+            Provider::Anthropic,
+            Provider::OpenRouter,
+            Provider::OpenCodeGo,
+        ] {
+            assert_eq!(
+                resolve_init_model(None, None, provider),
+                default_model_for(provider, "main")
+            );
+            assert_eq!(
+                resolve_init_model(None, Some("  "), provider),
+                default_model_for(provider, "main")
+            );
+            assert_eq!(
+                resolve_init_model(None, Some(" configured-model "), provider).as_deref(),
+                Some("configured-model")
+            );
+            assert_eq!(
+                resolve_init_model(Some("flag-model"), Some("configured-model"), provider)
+                    .as_deref(),
+                Some("flag-model")
+            );
+        }
+    }
 
     #[test]
     fn provider_from_id_roundtrip() {
