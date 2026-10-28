@@ -26,7 +26,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use hkdf::Hkdf;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::{PublicKey, SecretKey};
 use rand::RngCore;
 use sha2::Sha256;
@@ -55,11 +55,7 @@ impl ServerEphemeral {
             rand::rng().fill_bytes(&mut bytes);
             if let Ok(secret) = SecretKey::from_slice(&bytes) {
                 bytes.zeroize();
-                let public_point = secret
-                    .public_key()
-                    .to_encoded_point(false)
-                    .as_bytes()
-                    .to_vec();
+                let public_point = secret.public_key().to_sec1_point(false).as_bytes().to_vec();
                 return Self {
                     secret,
                     public_point,
@@ -200,7 +196,7 @@ pub(crate) fn seal_for_test(
     };
     let client_pub_point = client_secret
         .public_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .to_vec();
 

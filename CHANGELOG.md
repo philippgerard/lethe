@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve provider-specific defaults during non-interactive initialization.
+- Update P-256 and its arithmetic dependencies, Tokio, and certificate
+  verification/root packages to clear newly reported release audit advisories.
+
 - Add GPT-6.1 Terra and Sol to the model catalog and Responses API routing.
   Default everyday conversations to Terra and deep thinking to Sol when the
   main model talks to OpenAI directly; explicit environment settings continue
