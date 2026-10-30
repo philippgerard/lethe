@@ -22,6 +22,7 @@ pub const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
 pub const LINQ_WEBHOOK_VERSION: &str = "2026-02-03";
 pub const LINQ_TEXT_LIMIT: usize = 10_000;
 pub const LINQ_WEBHOOK_BODY_LIMIT: usize = 1024 * 1024;
+pub const LINQ_AUDIO_LIMIT: usize = 25 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const WEBHOOK_TOLERANCE_SECONDS: i64 = 300;
 
@@ -53,6 +54,8 @@ pub struct LinqClient {
     http: reqwest::Client,
     #[cfg(test)]
     test_api_base: Option<String>,
+    #[cfg(test)]
+    test_audio_base: Option<reqwest::Url>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +97,76 @@ impl LinqClient {
             http,
             #[cfg(test)]
             test_api_base: None,
+            #[cfg(test)]
+            test_audio_base: None,
         })
+    }
+
+    /// Download signed inbound media without sending the Linq API credential.
+    pub async fn download_audio(&self, audio: &IncomingAudio) -> LinqResult<Vec<u8>> {
+        let url = authorized_audio_url(&audio.url)?;
+        if audio
+            .size_bytes
+            .is_some_and(|size| size > LINQ_AUDIO_LIMIT as u64)
+        {
+            return Err(LinqError::InvalidRequest(
+                "audio exceeds the download limit",
+            ));
+        }
+        #[cfg(test)]
+        let url = if let Some(base) = &self.test_audio_base {
+            let mut rewritten = base.clone();
+            rewritten.set_path(url.path());
+            rewritten.set_query(url.query());
+            rewritten
+        } else {
+            url
+        };
+        let mut response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| LinqError::Http(error.without_url()))?;
+        if !response.status().is_success() {
+            return Err(LinqError::ApiStatus(response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > LINQ_AUDIO_LIMIT as u64)
+        {
+            return Err(LinqError::InvalidResponse);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| LinqError::Http(error.without_url()))?
+        {
+            if chunk.len() > LINQ_AUDIO_LIMIT - bytes.len() {
+                return Err(LinqError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err(LinqError::InvalidResponse);
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_audio_base(&mut self, base: String) {
+        let url = reqwest::Url::parse(&base).expect("valid test audio base");
+        assert_eq!(url.scheme(), "http");
+        let address: std::net::IpAddr = url
+            .host_str()
+            .expect("test audio host")
+            .trim_matches(['[', ']'])
+            .parse()
+            .expect("test audio host must be a loopback IP");
+        assert!(address.is_loopback());
+        assert!(url.username().is_empty() && url.password().is_none());
+        self.test_audio_base = Some(url);
     }
 
     /// The result means accepted for delivery, not a delivery receipt.
@@ -279,6 +351,34 @@ fn validate_idempotency_key(value: &str) -> LinqResult<()> {
     Ok(())
 }
 
+fn authorized_audio_url(value: &str) -> LinqResult<reqwest::Url> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| LinqError::InvalidRequest("invalid audio download URL"))?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("cdn.linqapp.com")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || value.split_once("://").is_some_and(|(_, rest)| {
+            rest.split(['/', '?', '#'])
+                .next()
+                .is_some_and(|authority| authority.contains('@'))
+        })
+        || url.port().is_some_and(|port| port != 443)
+        || url.fragment().is_some()
+    {
+        return Err(LinqError::InvalidRequest("invalid audio download URL"));
+    }
+    Ok(url)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IncomingAudio {
+    pub url: String,
+    pub filename: String,
+    pub mime_type: Option<String>,
+    pub size_bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum WebhookEvent {
     Message(IncomingMessage),
@@ -309,6 +409,8 @@ pub struct IncomingMessage {
     pub is_group: bool,
     pub reply_to: Option<String>,
     pub attachment_count: usize,
+    #[serde(default)]
+    pub audio: Vec<IncomingAudio>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -440,6 +542,75 @@ struct MessagePart {
     kind: String,
     #[serde(default)]
     value: Option<String>,
+    #[serde(default)]
+    url: Value,
+    #[serde(default)]
+    filename: Value,
+    #[serde(default)]
+    mime_type: Value,
+    #[serde(default)]
+    size_bytes: Value,
+}
+
+impl MessagePart {
+    fn into_audio(self) -> LinqResult<Option<IncomingAudio>> {
+        let mime = self.mime_type.as_str();
+        let media_type = mime.map(|mime| mime.split(';').next().unwrap_or(mime).trim());
+        let is_audio = media_type.is_some_and(|mime| {
+            mime.get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("audio/"))
+                && mime.len() > 6
+        });
+        let infer_from_extension = self.mime_type.is_null()
+            || media_type.is_some_and(|mime| mime.eq_ignore_ascii_case("application/octet-stream"));
+        if !is_audio && !infer_from_extension {
+            return Ok(None);
+        }
+        let url = self.url.as_str();
+        let filename = self
+            .filename
+            .as_str()
+            .filter(|name| !name.trim().is_empty());
+        let filename_is_audio = filename.is_some_and(has_audio_extension);
+        let parsed_url = if filename.is_none() || (!is_audio && !filename_is_audio) {
+            url.and_then(|url| reqwest::Url::parse(url).ok())
+        } else {
+            None
+        };
+        let url_filename = parsed_url
+            .as_ref()
+            .and_then(|url| url.path_segments()?.next_back());
+        if !is_audio && !(filename_is_audio || url_filename.is_some_and(has_audio_extension)) {
+            return Ok(None);
+        }
+        let url = url
+            .filter(|url| !url.trim().is_empty())
+            .ok_or(LinqError::InvalidWebhook)?;
+        let size_bytes = if self.size_bytes.is_null() {
+            None
+        } else {
+            Some(self.size_bytes.as_u64().ok_or(LinqError::InvalidWebhook)?)
+        };
+        Ok(Some(IncomingAudio {
+            url: url.to_owned(),
+            filename: filename
+                .or(url_filename.filter(|name| !name.is_empty()))
+                .unwrap_or("audio")
+                .to_owned(),
+            mime_type: mime.map(str::to_owned),
+            size_bytes,
+        }))
+    }
+}
+
+fn has_audio_extension(filename: &str) -> bool {
+    filename.rsplit_once('.').is_some_and(|(_, extension)| {
+        [
+            "m4a", "mp3", "aac", "caf", "wav", "aiff", "aif", "amr", "ogg", "oga", "opus", "flac",
+        ]
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+    })
 }
 
 #[derive(Deserialize)]
@@ -517,10 +688,16 @@ fn parse_webhook(body: &[u8]) -> LinqResult<WebhookEvent> {
         }
         let mut text = Vec::new();
         let mut attachment_count = 0;
+        let mut audio = Vec::new();
         for part in message.parts {
             match part.kind.as_str() {
                 "text" => text.push(part.value.ok_or(LinqError::InvalidWebhook)?),
-                "media" => attachment_count += 1,
+                "media" => {
+                    attachment_count += 1;
+                    if let Some(attachment) = part.into_audio()? {
+                        audio.push(attachment);
+                    }
+                }
                 _ => (),
             }
         }
@@ -534,6 +711,7 @@ fn parse_webhook(body: &[u8]) -> LinqResult<WebhookEvent> {
             is_group: message.inbound.chat.is_group,
             reply_to: message.reply_to.map(|reply| reply.message_id),
             attachment_count,
+            audio,
         }))
     } else {
         let vote: VoteData =
@@ -583,7 +761,11 @@ fn valid_identifier(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::OriginalUri, routing::post};
+    use axum::{
+        Json, Router,
+        extract::OriginalUri,
+        routing::{get, post},
+    };
     use std::sync::{Arc, Mutex};
 
     const CHAT: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -929,5 +1111,332 @@ mod tests {
             .unwrap_err();
         server.abort();
         assert!(matches!(error, LinqError::InvalidResponse));
+    }
+
+    fn verified_message(value: &Value) -> IncomingMessage {
+        let body = serde_json::to_vec(value).unwrap();
+        let WebhookEvent::Message(message) =
+            verify_webhook(SECRET, &signed_headers(&body, NOW), &body, NOW).unwrap()
+        else {
+            panic!("expected an inbound message");
+        };
+        message
+    }
+
+    #[test]
+    fn signed_voice_memo_and_audio_preserve_metadata_caption_and_order() {
+        // The official SDK's MessageEventV2 uses SchemasMediaPartResponse
+        // (type "media") for attachments, with no separate voice discriminator:
+        // https://github.com/linq-team/linq-node/blob/dd5f49ce1e6d8122d453666da00e1277c83cabc0/src/resources/webhooks.ts#L715-L745
+        let mut value = payload("message.received");
+        value["data"]["chat"]["is_group"] = json!(true);
+        value["data"]["reply_to"] = json!({"message_id": MESSAGE});
+        value["data"]["parts"] = json!([
+            {"type": "text", "value": "Caption"},
+            {
+                "type": "media", "filename": "voice-memo.m4a",
+                "mime_type": "audio/x-m4a", "size_bytes": 524288,
+                "url": "https://cdn.linqapp.com/voice-memos/abc123.m4a?signature=private"
+            },
+            {"type": "media", "mime_type": "image/png", "url": "https://cdn.linqapp.com/photo.png"},
+            {"type": "text", "value": "More text"},
+            {
+                "type": "media", "filename": "recording.wav",
+                "mime_type": "audio/wav", "size_bytes": 42,
+                "url": "https://cdn.linqapp.com/attachments/recording.wav"
+            },
+            {"type": "unknown", "url": "https://cdn.linqapp.com/ignored.mp3"},
+        ]);
+        let message = verified_message(&value);
+        assert_eq!(message.text, "Caption\nMore text");
+        assert_eq!(message.sender, "+491234567890");
+        assert!(message.is_group);
+        assert_eq!(message.reply_to.as_deref(), Some(MESSAGE));
+        assert_eq!(message.attachment_count, 3);
+        assert_eq!(message.audio.len(), 2);
+        assert_eq!(
+            message.audio[0],
+            IncomingAudio {
+                url: "https://cdn.linqapp.com/voice-memos/abc123.m4a?signature=private".into(),
+                filename: "voice-memo.m4a".into(),
+                mime_type: Some("audio/x-m4a".into()),
+                size_bytes: Some(524288),
+            }
+        );
+        assert_eq!(message.audio[1].filename, "recording.wav");
+        let restored: IncomingMessage =
+            serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+        assert_eq!(restored, message);
+        let mut old_message = serde_json::to_value(&message).unwrap();
+        old_message.as_object_mut().unwrap().remove("audio");
+        let restored: IncomingMessage = serde_json::from_value(old_message).unwrap();
+        assert!(restored.audio.is_empty());
+        let body = serde_json::to_vec(&value).unwrap();
+        value["data"]["parts"][1]["url"] = json!("https://cdn.linqapp.com/altered.m4a");
+        assert!(matches!(
+            verify_webhook(
+                SECRET,
+                &signed_headers(&body, NOW),
+                &serde_json::to_vec(&value).unwrap(),
+                NOW
+            ),
+            Err(LinqError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn recognizes_audio_mime_and_only_safe_extension_fallbacks() {
+        for (part, expected) in [
+            (
+                json!({"mime_type": "Audio/MP4; codecs=mp4a", "filename": "recording.mp4"}),
+                true,
+            ),
+            (
+                json!({"mime_type": "audio/opus", "filename": "download"}),
+                true,
+            ),
+            (json!({"filename": "recording.M4A"}), true),
+            (
+                json!({"filename": "recording.AIFF", "mime_type": "application/octet-stream"}),
+                true,
+            ),
+            (
+                json!({"url": "https://cdn.linqapp.com/audio.CAF?signature=private"}),
+                true,
+            ),
+            (json!({"filename": "recording.mp4"}), false),
+            (
+                json!({"mime_type": "video/mp4", "filename": "recording.m4a"}),
+                false,
+            ),
+            (
+                json!({"mime_type": "image/png", "filename": "recording.mp3"}),
+                false,
+            ),
+            (json!({"filename": "recording.mp3.exe"}), false),
+            (
+                json!({"url": "https://cdn.linqapp.com/download?filename=recording.mp3"}),
+                false,
+            ),
+            (
+                json!({"filename": 7, "mime_type": 12, "size_bytes": -1, "url": {}}),
+                false,
+            ),
+        ] {
+            let mut part = part;
+            part["type"] = json!("media");
+            if part.get("url").is_none() {
+                part["url"] = json!("https://cdn.linqapp.com/download");
+            }
+            let mut value = payload("message.received");
+            value["data"]["parts"] = json!([part]);
+            let message = verified_message(&value);
+            assert_eq!(!message.audio.is_empty(), expected, "part: {part}");
+            assert_eq!(message.attachment_count, 1);
+        }
+    }
+
+    #[test]
+    fn rejects_missing_audio_url_but_preserves_malformed_non_audio_behavior() {
+        for url in [Value::Null, json!(""), json!("   "), json!(17)] {
+            let mut value = payload("message.received");
+            value["data"]["parts"] = json!([{
+                "type": "media", "mime_type": "audio/x-m4a",
+                "filename": "voice-memo.m4a", "url": url,
+            }]);
+            let body = serde_json::to_vec(&value).unwrap();
+            assert!(matches!(
+                verify_webhook(SECRET, &signed_headers(&body, NOW), &body, NOW),
+                Err(LinqError::InvalidWebhook)
+            ));
+        }
+        let mut value = payload("message.received");
+        value["data"]["parts"] = json!([
+            {"type": "media"},
+            {"type": "media", "mime_type": "image/png", "url": 42, "size_bytes": "bad"},
+            {"type": "unknown", "mime_type": "audio/mpeg"},
+        ]);
+        let message = verified_message(&value);
+        assert_eq!(message.attachment_count, 2);
+        assert!(message.audio.is_empty());
+    }
+
+    fn downloadable_audio(path: &str) -> IncomingAudio {
+        IncomingAudio {
+            url: format!("https://cdn.linqapp.com/{path}?signature=private-signed-url"),
+            filename: "voice.m4a".into(),
+            mime_type: Some("audio/x-m4a".into()),
+            size_bytes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_download_authorizes_original_cdn_url_before_test_rewrite() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = LinqClient::new("private-linq-token".into()).unwrap();
+        client.set_test_audio_base(format!("http://{}", listener.local_addr().unwrap()));
+        assert!(authorized_audio_url("https://cdn.linqapp.com:443/voice.m4a").is_ok());
+        for url in [
+            "http://cdn.linqapp.com/voice.m4a",
+            "https://cdn.linqapp.com.evil.example/voice.m4a",
+            "https://evil.example/cdn.linqapp.com/voice.m4a",
+            "https://127.0.0.1/voice.m4a",
+            "https://cdn.linqapp.com:444/voice.m4a",
+            "https://user:password@cdn.linqapp.com/voice.m4a",
+            "https://user@cdn.linqapp.com/voice.m4a",
+            "https://@cdn.linqapp.com/voice.m4a",
+            "https://cdn.linqapp.com/voice.m4a#fragment",
+            "not-a-url",
+        ] {
+            let mut audio = downloadable_audio("voice.m4a");
+            audio.url = url.into();
+            assert!(matches!(
+                client.download_audio(&audio).await,
+                Err(LinqError::InvalidRequest(_))
+            ));
+        }
+        let mut audio = downloadable_audio("voice.m4a");
+        audio.size_bytes = Some(LINQ_AUDIO_LIMIT as u64 + 1);
+        assert!(matches!(
+            client.download_audio(&audio).await,
+            Err(LinqError::InvalidRequest(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_download_is_bounded_without_auth_and_refuses_redirects() {
+        use axum::{
+            body::Body,
+            http::{Response, StatusCode, header},
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/{*path}",
+            get(move |OriginalUri(uri): OriginalUri, headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    captured.lock().unwrap().push((uri.clone(), headers));
+                    match uri.path() {
+                        "/redirect" => Response::builder()
+                            .status(StatusCode::TEMPORARY_REDIRECT)
+                            .header(header::LOCATION, "/redirect-target")
+                            .body(Body::from("private-provider-body"))
+                            .unwrap(),
+                        "/provider-error" => Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Body::from("private-provider-body"))
+                            .unwrap(),
+                        "/advertised-too-large" => Response::builder()
+                            .header(header::CONTENT_LENGTH, (LINQ_AUDIO_LIMIT + 1).to_string())
+                            .body(Body::from_stream(futures_util::stream::pending::<
+                                Result<Vec<u8>, std::io::Error>,
+                            >()))
+                            .unwrap(),
+                        path => {
+                            let size: usize = match path {
+                                "/exact-limit" => LINQ_AUDIO_LIMIT,
+                                "/chunked-too-large" => LINQ_AUDIO_LIMIT + 1,
+                                "/empty" => 0,
+                                _ => 3,
+                            };
+                            const CHUNK: usize = 64 * 1024;
+                            let chunks = (0..size.div_ceil(CHUNK)).map(move |index| {
+                                Ok::<_, std::io::Error>(vec![b'x'; CHUNK.min(size - index * CHUNK)])
+                            });
+                            Response::new(Body::from_stream(futures_util::stream::iter(chunks)))
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = LinqClient::new("private-linq-token".into()).unwrap();
+        client.set_test_audio_base(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            client
+                .download_audio(&downloadable_audio("voice.m4a"))
+                .await
+                .unwrap(),
+            b"xxx"
+        );
+        let mut exact = downloadable_audio("exact-limit");
+        exact.size_bytes = Some(LINQ_AUDIO_LIMIT as u64);
+        assert_eq!(
+            client.download_audio(&exact).await.unwrap().len(),
+            LINQ_AUDIO_LIMIT
+        );
+        for path in ["advertised-too-large", "chunked-too-large", "empty"] {
+            assert!(matches!(
+                client.download_audio(&downloadable_audio(path)).await,
+                Err(LinqError::InvalidResponse)
+            ));
+        }
+        for (path, status) in [("redirect", 307), ("provider-error", 403)] {
+            let error = client
+                .download_audio(&downloadable_audio(path))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, LinqError::ApiStatus(code) if code == status));
+            let rendered = format!("{error:?} {error}");
+            for private in [
+                "private-provider-body",
+                "private-signed-url",
+                "private-linq-token",
+            ] {
+                assert!(!rendered.contains(private));
+            }
+        }
+        server.abort();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().all(|(uri, headers)| {
+            uri.query() == Some("signature=private-signed-url")
+                && !headers.contains_key("authorization")
+        }));
+        assert!(
+            !requests
+                .iter()
+                .any(|(uri, _)| uri.path() == "/redirect-target")
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_transport_errors_do_not_expose_signed_urls_or_tokens() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = LinqClient::new("private-linq-token".into()).unwrap();
+        client.set_test_audio_base(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let error = client
+            .download_audio(&downloadable_audio("voice.m4a"))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, LinqError::Http(_)));
+        let rendered = format!("{error:?} {error}");
+        for private in [
+            "private-signed-url",
+            "private-linq-token",
+            "signature=",
+            "voice.m4a",
+        ] {
+            assert!(!rendered.contains(private));
+        }
     }
 }

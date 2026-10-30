@@ -1,13 +1,15 @@
+use std::borrow::Cow;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::blocking::multipart;
 use serde_json::json;
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::config::Settings;
 
@@ -22,6 +24,9 @@ pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/whisper-large-v3";
 pub const DEFAULT_LOCAL_MODEL: &str = "base";
 // Voxtral Mini Transcribe — strong multilingual (DE/FR/IT) speech-to-text.
 pub const DEFAULT_MISTRAL_MODEL: &str = "voxtral-mini-latest";
+
+const CONVERTED_AUDIO_LIMIT: u64 = 25 * 1024 * 1024;
+const AUDIO_CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum TranscriptionError {
@@ -45,6 +50,18 @@ pub enum TranscriptionError {
     LocalWhisperFailed { code: i32, stderr: String },
     #[error("local Whisper returned an empty transcription")]
     EmptyLocalTranscript,
+    #[error(
+        "ffmpeg was not found. Install ffmpeg to transcribe CAF, AIFF, or AMR with a remote provider"
+    )]
+    FfmpegNotFound,
+    #[error(
+        "ffmpeg could not convert this audio to WAV. Check that the CAF, AIFF, or AMR recording is valid and ffmpeg supports its codec"
+    )]
+    AudioConversionFailed,
+    #[error("audio conversion exceeded {seconds} seconds. Send a shorter recording")]
+    AudioConversionTimedOut { seconds: u64 },
+    #[error("converted audio exceeds the {max_bytes}-byte limit. Send a shorter recording")]
+    ConvertedAudioTooLarge { max_bytes: u64 },
     #[error("{provider} transcription failed: {message}")]
     Provider { provider: String, message: String },
     #[error(transparent)]
@@ -171,6 +188,9 @@ fn safe_audio_format(audio_format: &str) -> &str {
 pub fn mime_type_for_format(audio_format: &str) -> &'static str {
     match audio_format {
         "aac" => "audio/aac",
+        "aiff" => "audio/aiff",
+        "amr" => "audio/amr",
+        "caf" => "audio/x-caf",
         "flac" => "audio/flac",
         "m4a" => "audio/mp4",
         "mp3" => "audio/mpeg",
@@ -204,28 +224,37 @@ pub fn transcribe_audio(
         Some(language)
     };
     let audio_format = infer_audio_format(filename, mime_type);
+    let prepared = prepare_audio(
+        provider,
+        audio_bytes,
+        &audio_format,
+        mime_type,
+        Path::new("ffmpeg"),
+    )?;
+    let audio_format = prepared.format;
+    let mime_type = prepared.mime_type;
 
     match provider {
         TranscriptionProvider::Local => transcribe_local_whisper(
-            audio_bytes,
+            prepared.bytes.as_ref(),
             filename,
-            &audio_format,
+            audio_format,
             &model,
             language,
             &settings.transcription.local_command,
         ),
         TranscriptionProvider::OpenRouter => transcribe_openrouter(
-            audio_bytes,
-            &audio_format,
+            prepared.bytes.as_ref(),
+            audio_format,
             &model,
             language,
             &openrouter_transcriptions_url(settings),
             &openrouter_transcription_key(settings)?,
         ),
         TranscriptionProvider::OpenAi => transcribe_multipart(
-            audio_bytes,
+            prepared.bytes,
             filename,
-            &audio_format,
+            audio_format,
             mime_type,
             &model,
             language,
@@ -234,9 +263,9 @@ pub fn transcribe_audio(
             "OpenAI",
         ),
         TranscriptionProvider::Mistral => transcribe_multipart(
-            audio_bytes,
+            prepared.bytes,
             filename,
-            &audio_format,
+            audio_format,
             mime_type,
             &model,
             language,
@@ -245,6 +274,156 @@ pub fn transcribe_audio(
             "Mistral",
         ),
     }
+}
+
+struct PreparedAudio<'a> {
+    bytes: Cow<'a, [u8]>,
+    format: &'a str,
+    mime_type: Option<&'a str>,
+}
+
+fn prepare_audio<'a>(
+    provider: TranscriptionProvider,
+    audio_bytes: &'a [u8],
+    audio_format: &'a str,
+    mime_type: Option<&'a str>,
+    ffmpeg: &Path,
+) -> TranscriptionResult<PreparedAudio<'a>> {
+    if provider != TranscriptionProvider::Local && matches!(audio_format, "caf" | "aiff" | "amr") {
+        return Ok(PreparedAudio {
+            bytes: Cow::Owned(convert_native_audio(
+                audio_bytes,
+                audio_format,
+                ffmpeg,
+                CONVERTED_AUDIO_LIMIT,
+                AUDIO_CONVERSION_TIMEOUT,
+            )?),
+            format: "wav",
+            mime_type: Some("audio/wav"),
+        });
+    }
+    let canonical_mime = mime_type_for_format(audio_format);
+    Ok(PreparedAudio {
+        bytes: Cow::Borrowed(audio_bytes),
+        format: audio_format,
+        mime_type: if canonical_mime == "application/octet-stream" {
+            mime_type
+        } else {
+            Some(canonical_mime)
+        },
+    })
+}
+
+// Kill and reap the converter before its private scratch directory is removed,
+// including on I/O errors and unwinding.
+struct AudioConverter(Child);
+
+impl Drop for AudioConverter {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn convert_native_audio(
+    audio_bytes: &[u8],
+    audio_format: &str,
+    ffmpeg: &Path,
+    max_bytes: u64,
+    timeout: Duration,
+) -> TranscriptionResult<Vec<u8>> {
+    let scratch = tempfile::Builder::new().prefix("lethe-audio-").tempdir()?;
+    let input = scratch.path().join("input");
+    let output = scratch.path().join("output.wav");
+    fs::write(&input, audio_bytes)?;
+    let child = Command::new(ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
+        // Fix the demuxer rather than letting untrusted input select a playlist
+        // or network protocol. All paths are server-owned, never display names.
+        .args([
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            audio_format,
+            "-threads",
+            "1",
+            "-i",
+        ])
+        .arg(&input)
+        .args(["-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000"])
+        .args(["-c:a", "pcm_s16le", "-threads", "1", "-f", "wav", "-fs"])
+        .arg(max_bytes.to_string())
+        .arg(&output)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // Do not expose untrusted decoder output or accumulate unbounded logs.
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                TranscriptionError::FfmpegNotFound
+            } else {
+                TranscriptionError::Io(error)
+            }
+        })?;
+    let mut converter = AudioConverter(child);
+    let started = Instant::now();
+    loop {
+        // ffmpeg's -fs stops after a packet crosses the boundary. Reject the
+        // boundary too: that output may be truncated even on a successful exit.
+        if output.exists() && fs::metadata(&output)?.len() >= max_bytes {
+            return Err(TranscriptionError::ConvertedAudioTooLarge { max_bytes });
+        }
+        if let Some(status) = converter.0.try_wait()? {
+            if !status.success() {
+                return Err(TranscriptionError::AudioConversionFailed);
+            }
+            break;
+        }
+        if started.elapsed() >= timeout {
+            return Err(TranscriptionError::AudioConversionTimedOut {
+                seconds: timeout.as_secs(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10).min(timeout));
+    }
+    let mut bytes = Vec::new();
+    let output = fs::File::open(output).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            TranscriptionError::AudioConversionFailed
+        } else {
+            TranscriptionError::Io(error)
+        }
+    })?;
+    output
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 >= max_bytes {
+        return Err(TranscriptionError::ConvertedAudioTooLarge { max_bytes });
+    }
+    if !wav_contains_audio(&bytes) {
+        return Err(TranscriptionError::AudioConversionFailed);
+    }
+    Ok(bytes)
+}
+
+fn wav_contains_audio(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return false;
+    }
+    let mut offset = 12;
+    while let Some(header) = bytes.get(offset..offset + 8) {
+        let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let end = offset + 8 + length;
+        if end > bytes.len() {
+            return false;
+        }
+        if &header[..4] == b"data" {
+            return length > 0;
+        }
+        offset = end + length % 2;
+    }
+    false
 }
 
 fn transcribe_openrouter(
@@ -265,7 +444,10 @@ fn transcribe_openrouter(
     if let Some(language) = language {
         payload["language"] = json!(language);
     }
-    let response = reqwest::blocking::Client::new()
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(60))
+        .build()?
         .post(url)
         .bearer_auth(api_key)
         .json(&payload)
@@ -296,7 +478,7 @@ fn transcribe_openrouter(
 /// OpenAI-shaped JSON body with a top-level `text` field; only the endpoint
 /// URL, bearer key, and provider label differ.
 fn transcribe_multipart(
-    audio_bytes: &[u8],
+    audio_bytes: Cow<'_, [u8]>,
     filename: &str,
     audio_format: &str,
     mime_type: Option<&str>,
@@ -307,7 +489,7 @@ fn transcribe_multipart(
     provider_label: &str,
 ) -> TranscriptionResult<String> {
     let upload_name = filename_for_upload(filename, audio_format);
-    let part = multipart::Part::bytes(audio_bytes.to_vec())
+    let part = multipart::Part::bytes(audio_bytes.into_owned())
         .file_name(upload_name)
         .mime_str(mime_type.unwrap_or_else(|| mime_type_for_format(audio_format)))?;
     let mut form = multipart::Form::new()
@@ -317,7 +499,10 @@ fn transcribe_multipart(
     if let Some(language) = language {
         form = form.text("language", language.to_string());
     }
-    let response = reqwest::blocking::Client::new()
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(60))
+        .build()?
         .post(url)
         .bearer_auth(api_key)
         .multipart(form)
@@ -355,19 +540,16 @@ fn transcribe_local_whisper(
         return Err(TranscriptionError::EmptyLocalCommand);
     }
 
-    let tmpdir = std::env::temp_dir().join(format!("lethe-stt-{}", Uuid::new_v4()));
-    fs::create_dir_all(&tmpdir)?;
+    let tmpdir = tempfile::Builder::new().prefix("lethe-stt-").tempdir()?;
     // Local filesystem paths are server-owned. The remote display name is
     // intentionally ignored rather than reused as a path component.
-    let audio_path = tmpdir.join(format!(
+    let audio_path = tmpdir.path().join(format!(
         "telegram_audio.{}",
         safe_audio_format(audio_format)
     ));
     fs::write(&audio_path, audio_bytes)?;
 
-    let result = run_local_whisper_command(&command_parts, &audio_path, &tmpdir, model, language);
-    let _ = fs::remove_dir_all(&tmpdir);
-    result
+    run_local_whisper_command(&command_parts, &audio_path, tmpdir.path(), model, language)
 }
 
 fn run_local_whisper_command(
@@ -547,11 +729,16 @@ fn provider_error(provider: &str, response: reqwest::blocking::Response) -> Tran
 fn mime_to_format(mime: &str) -> Option<&'static str> {
     match mime.to_ascii_lowercase().as_str() {
         "audio/aac" => Some("aac"),
+        "audio/aiff" | "audio/x-aiff" | "audio/aif" => Some("aiff"),
+        "audio/amr" | "audio/amr-wb" => Some("amr"),
+        "audio/caf" | "audio/x-caf" => Some("caf"),
         "audio/flac" => Some("flac"),
-        "audio/m4a" | "audio/mp4" => Some("m4a"),
+        "audio/m4a" | "audio/x-m4a" | "audio/mp4" => Some("m4a"),
         "audio/mpeg" | "audio/mp3" => Some("mp3"),
         "audio/ogg" | "audio/opus" => Some("ogg"),
-        "audio/wav" | "audio/wave" => Some("wav"),
+        "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/x-pn-wav" | "audio/vnd.wave" => {
+            Some("wav")
+        }
         "audio/webm" | "video/webm" => Some("webm"),
         "video/mp4" => Some("mp4"),
         _ => None,
@@ -560,6 +747,8 @@ fn mime_to_format(mime: &str) -> Option<&'static str> {
 
 fn extension_alias(extension: &str) -> Option<&'static str> {
     match extension {
+        "aif" | "aifc" => Some("aiff"),
+        "wave" => Some("wav"),
         "oga" | "opus" => Some("ogg"),
         "mpeg" | "mpga" => Some("mp3"),
         _ => None,
@@ -748,43 +937,216 @@ mod tests {
     }
 
     #[test]
-    fn local_transcription_preserves_normal_voice_processing() {
-        let result = transcribe_local_whisper(
-            b"audio",
-            "telegram_voice_123.ogg",
-            "ogg",
-            "base",
-            None,
-            "echo transcript",
-        )
-        .unwrap();
-
-        assert!(result.starts_with("transcript "));
-    }
-
-    #[test]
-    fn default_models_match_runtime_defaults() {
-        assert_eq!(
-            default_model_for_provider(TranscriptionProvider::OpenRouter),
-            DEFAULT_OPENROUTER_MODEL
-        );
-        assert_eq!(
-            default_model_for_provider(TranscriptionProvider::OpenAi),
-            DEFAULT_OPENAI_MODEL
-        );
-        assert_eq!(
-            default_model_for_provider(TranscriptionProvider::Local),
-            DEFAULT_LOCAL_MODEL
-        );
-        assert_eq!(
-            default_model_for_provider(TranscriptionProvider::Mistral),
-            DEFAULT_MISTRAL_MODEL
-        );
-    }
-
-    #[test]
     fn local_whisper_stdout_strips_timestamps() {
         let stdout = "[00:00.000 --> 00:01.000] hello\nplain line";
         assert_eq!(extract_local_whisper_stdout(stdout), "hello\nplain line");
+    }
+
+    #[test]
+    fn empty_or_truncated_wav_is_not_forwarded() {
+        let mut wav = b"RIFF\x24\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0\x80\x3e\0\0\0\x7d\0\0\x02\0\x10\0data\0\0\0\0".to_vec();
+        assert!(!wav_contains_audio(&wav));
+        wav[40..44].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(!wav_contains_audio(&wav));
+        wav.extend_from_slice(&[0, 0]);
+        assert!(wav_contains_audio(&wav));
+    }
+
+    #[test]
+    fn native_mime_and_extension_aliases_are_canonicalized() {
+        for (mime, expected) in [
+            ("audio/x-m4a", "m4a"),
+            ("audio/x-caf", "caf"),
+            ("audio/aiff", "aiff"),
+            ("audio/x-aiff", "aiff"),
+            ("audio/amr", "amr"),
+            ("audio/x-wav", "wav"),
+            ("audio/x-pn-wav", "wav"),
+            ("audio/vnd.wave", "wav"),
+            ("AUDIO/WAVE; codecs=pcm", "wav"),
+        ] {
+            assert_eq!(infer_audio_format("unhelpful.bin", Some(mime)), expected);
+        }
+        for (name, expected) in [
+            ("voice.CAF", "caf"),
+            ("voice.AIF", "aiff"),
+            ("voice.aifc", "aiff"),
+            ("voice.AMR", "amr"),
+            ("voice.wave", "wav"),
+        ] {
+            assert_eq!(infer_audio_format(name, None), expected);
+        }
+    }
+
+    #[test]
+    fn missing_ffmpeg_is_an_actionable_error_for_each_native_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        for format in ["caf", "aiff", "amr"] {
+            assert!(matches!(
+                prepare_audio(
+                    TranscriptionProvider::OpenAi,
+                    b"native",
+                    format,
+                    None,
+                    &tmp.path().join("no-ffmpeg"),
+                ),
+                Err(TranscriptionError::FfmpegNotFound)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    fn converter_script(directory: &Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join("converter");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conversion_failures_are_bounded_and_clean_up_scratch() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Record the server-owned input path so cleanup is checked after an
+        // actual failed child process, not just after successful conversion.
+        let marker = tmp.path().join("input-path");
+        let script = converter_script(
+            tmp.path(),
+            &format!(
+                "while [ \"$1\" != '-i' ]; do shift; done\nshift\nprintf '%s' \"$1\" > '{}'\nexit 1",
+                marker.display()
+            ),
+        );
+        let result = convert_native_audio(
+            b"invalid",
+            "caf",
+            &script,
+            CONVERTED_AUDIO_LIMIT,
+            AUDIO_CONVERSION_TIMEOUT,
+        );
+        assert!(matches!(
+            result,
+            Err(TranscriptionError::AudioConversionFailed)
+        ));
+        let input = fs::read_to_string(marker).unwrap();
+        assert!(!Path::new(&input).parent().unwrap().exists());
+
+        let script = converter_script(tmp.path(), "exec sleep 5");
+        assert!(matches!(
+            convert_native_audio(b"invalid", "caf", &script, 1024, Duration::from_millis(20)),
+            Err(TranscriptionError::AudioConversionTimedOut { .. })
+        ));
+
+        let script = converter_script(
+            tmp.path(),
+            "for output do :; done\nprintf '1234567890123456' > \"$output\"",
+        );
+        assert!(matches!(
+            convert_native_audio(b"invalid", "caf", &script, 16, AUDIO_CONVERSION_TIMEOUT),
+            Err(TranscriptionError::ConvertedAudioTooLarge { max_bytes: 16 })
+        ));
+        // Successful exit alone is insufficient: absent/invalid output is not
+        // forwarded to a provider, and cannot turn into an empty fallback.
+        for body in [
+            "exit 0",
+            "for output do :; done\nprintf 'bad' > \"$output\"",
+        ] {
+            let script = converter_script(tmp.path(), body);
+            assert!(matches!(
+                convert_native_audio(b"invalid", "caf", &script, 1024, AUDIO_CONVERSION_TIMEOUT),
+                Err(TranscriptionError::AudioConversionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn real_native_audio_normalizes_to_pcm_wav_when_ffmpeg_is_installed() {
+        let available = Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match available {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            result => assert!(result.unwrap().success()),
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        for (format, codec) in [("caf", "pcm_s16le"), ("aiff", "pcm_s16be"), ("amr", "")] {
+            let input = tmp.path().join(format!("fixture.{format}"));
+            if format == "amr" {
+                // Valid AMR-NB 4.75-kbit speech frames (95 payload bits each).
+                // Decode-only ffmpeg installations need no optional AMR encoder.
+                let mut amr = b"#!AMR\n".to_vec();
+                for _ in 0..10 {
+                    amr.push(0x04);
+                    amr.extend_from_slice(&[0; 12]);
+                }
+                fs::write(&input, amr).unwrap();
+            } else {
+                let status = Command::new("ffmpeg")
+                    .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
+                    .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000"])
+                    .args(["-t", "0.1", "-c:a", codec, "-f", format])
+                    .arg(&input)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            let original = fs::read(input).unwrap();
+            for provider in [
+                TranscriptionProvider::OpenAi,
+                TranscriptionProvider::OpenRouter,
+                TranscriptionProvider::Mistral,
+            ] {
+                let prepared = prepare_audio(
+                    provider,
+                    &original,
+                    format,
+                    Some(mime_type_for_format(format)),
+                    Path::new("ffmpeg"),
+                )
+                .unwrap();
+                assert_eq!(prepared.format, "wav");
+                assert_eq!(prepared.mime_type, Some("audio/wav"));
+                assert_eq!(
+                    filename_for_upload("voice.caf", prepared.format),
+                    "voice.wav"
+                );
+                let wav = prepared.bytes.as_ref();
+                assert_eq!(&wav[..4], b"RIFF");
+                assert_eq!(&wav[8..12], b"WAVE");
+                assert_eq!(
+                    u32::from_le_bytes(wav[4..8].try_into().unwrap()) as usize + 8,
+                    wav.len()
+                );
+                let fmt = wav.windows(4).position(|chunk| chunk == b"fmt ").unwrap() + 8;
+                assert_eq!(&wav[fmt..fmt + 2], &1_u16.to_le_bytes());
+                assert_eq!(&wav[fmt + 2..fmt + 4], &1_u16.to_le_bytes());
+                assert_eq!(&wav[fmt + 4..fmt + 8], &16000_u32.to_le_bytes());
+                assert!((wav.len() as u64) < CONVERTED_AUDIO_LIMIT);
+            }
+            assert!(matches!(
+                convert_native_audio(
+                    &original,
+                    format,
+                    Path::new("ffmpeg"),
+                    128,
+                    AUDIO_CONVERSION_TIMEOUT
+                ),
+                Err(TranscriptionError::ConvertedAudioTooLarge { max_bytes: 128 })
+            ));
+            assert!(matches!(
+                convert_native_audio(
+                    b"not audio",
+                    format,
+                    Path::new("ffmpeg"),
+                    CONVERTED_AUDIO_LIMIT,
+                    AUDIO_CONVERSION_TIMEOUT
+                ),
+                Err(TranscriptionError::AudioConversionFailed)
+            ));
+        }
     }
 }

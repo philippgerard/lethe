@@ -18,12 +18,16 @@ use uuid::Uuid;
 
 use super::notifications::{Channel, NotificationCommand, NotificationPreferences};
 use crate::agent::{Agent, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
-use crate::config::ImessageConfig;
+use crate::config::{ImessageConfig, Settings};
+use crate::conversation::transcription::transcribe_audio;
 use crate::interfaces::actions::{ActionStore, ApprovalRequest, ApprovalScope, ApprovalStatus};
 use crate::interfaces::imessage_formatting::{
     RenderedText, render_imessage_html, render_imessage_markdown,
 };
-use crate::interfaces::linq::{DeliveryUpdate, LinqClient, LinqError, PollEnvelope, WebhookEvent};
+use crate::interfaces::linq::{
+    DeliveryUpdate, IncomingAudio, LINQ_AUDIO_LIMIT, LinqClient, LinqError, PollEnvelope,
+    WebhookEvent,
+};
 use crate::scheduler::brainstem::BrainstemHandle;
 use crate::tools::actions::ActionToolContext;
 use crate::tools::registry::{ClientToolContext, ClientToolEvent, ToolRuntime};
@@ -35,11 +39,20 @@ struct Inbound {
     sender: String,
     message_id: String,
     text: String,
+    #[serde(default)]
+    audio: Vec<IncomingAudio>,
     vote: Option<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("iMessage audio transcription failed")]
+struct AudioTranscriptionFailure;
+
 fn imessage_failure_notice(error: &anyhow::Error) -> &'static str {
     // Only fixed, safe notices reach the user; full diagnostics stay in logs.
+    if error.is::<AudioTranscriptionFailure>() {
+        return "I couldn't transcribe this audio. Try a shorter recording (up to 25 MiB total) or send the text instead. If this keeps happening, check the transcription provider settings.";
+    }
     if let Some(message) = crate::interfaces::telegram::llm_auth_reply(error) {
         if message == crate::interfaces::telegram::OPENAI_STATIC_TOKEN_MESSAGE {
             "My model connection uses a static OPENAI_AUTH_TOKEN override that cannot renew itself. Remove that override from the deployment configuration, restart Lethe, use /login openai in our private Telegram chat, then ask me to continue from the current state."
@@ -507,11 +520,15 @@ impl ImessageTransport {
                     chat: message.chat_id,
                     sender: message.sender,
                     message_id: message.message_id,
-                    text: if message.text.is_empty() && message.attachment_count > 0 {
+                    text: if message.text.is_empty()
+                        && message.attachment_count > 0
+                        && message.audio.is_empty()
+                    {
                         "/unsupported_attachment".to_string()
                     } else {
                         message.text
                     },
+                    audio: message.audio,
                     vote: None,
                 }
             }
@@ -528,6 +545,7 @@ impl ImessageTransport {
                     sender: vote.sender,
                     message_id: vote.message_id,
                     text: String::new(),
+                    audio: Vec::new(),
                     vote: Some(vote.option_id),
                 }
             }
@@ -537,27 +555,31 @@ impl ImessageTransport {
                 return Ok(false);
             }
         };
+        let command = if inbound.audio.is_empty() {
+            inbound.text.as_str()
+        } else {
+            ""
+        };
         // Hold registration's lock before publishing control commands to the
         // inbox, so the worker cannot claim a command while its handler runs.
-        let control = if NotificationCommand::parse(&inbound.text).is_some()
-            || inbound.text.trim() == "/cancel"
-        {
-            Some(
-                self.active
-                    .lock()
-                    .map_err(|_| anyhow!("iMessage turn lock unavailable"))?,
-            )
-        } else {
-            None
-        };
+        let control =
+            if NotificationCommand::parse(command).is_some() || command.trim() == "/cancel" {
+                Some(
+                    self.active
+                        .lock()
+                        .map_err(|_| anyhow!("iMessage turn lock unavailable"))?,
+                )
+            } else {
+                None
+            };
         let accepted = self.store.enqueue(&inbound)?;
         if accepted {
-            if let Some(enabled) = NotificationCommand::parse(&inbound.text) {
+            if let Some(enabled) = NotificationCommand::parse(command) {
                 self.set_notifications(&inbound, enabled)?;
                 self.store.finish(&inbound.event_id, "done")?;
                 return Ok(true);
             }
-            if inbound.text.trim() == "/cancel" {
+            if command.trim() == "/cancel" {
                 // The same lock surrounds inbox claim + turn registration. A
                 // cancellation cannot slip between those two operations.
                 self.store.connection()?.execute(
@@ -622,6 +644,7 @@ impl ImessageTransport {
     pub fn start(
         self: &Arc<Self>,
         agent: Arc<Agent>,
+        settings: Settings,
         secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
         brainstem: Option<BrainstemHandle>,
     ) -> Result<ImessageTasks> {
@@ -629,7 +652,11 @@ impl ImessageTransport {
         let input = self.clone();
         let output = self.clone();
         let mut tasks = vec![
-            tokio::spawn(async move { input.run_inbox(agent, secure_prompt).await }),
+            tokio::spawn(async move {
+                input
+                    .run_inbox(agent, Arc::new(settings), secure_prompt)
+                    .await
+            }),
             tokio::spawn(async move { output.run_outbox().await }),
         ];
         if let Some(brainstem) = brainstem {
@@ -686,6 +713,7 @@ impl ImessageTransport {
     async fn run_inbox(
         self: Arc<Self>,
         agent: Arc<Agent>,
+        settings: Arc<Settings>,
         secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
     ) {
         loop {
@@ -710,7 +738,7 @@ impl ImessageTransport {
                     let result = tokio::select! {
                         biased;
                         _ = cancelled.changed() => None,
-                        result = self.process(&agent, &inbound, secure_prompt.clone()) => Some(result),
+                        result = self.process(&agent, &settings, &inbound, secure_prompt.clone()) => Some(result),
                     };
                     if let Ok(mut active) = self.active.lock() {
                         if active
@@ -757,9 +785,56 @@ impl ImessageTransport {
         }
     }
 
+    async fn transcribe_message(
+        &self,
+        inbound: &Inbound,
+        settings: &Arc<Settings>,
+    ) -> Result<String> {
+        if inbound.audio.is_empty() {
+            return Ok(inbound.text.clone());
+        }
+        let mut message = String::new();
+        let mut total_bytes = 0;
+        for audio in &inbound.audio {
+            if audio
+                .size_bytes
+                .is_some_and(|size| size > (LINQ_AUDIO_LIMIT - total_bytes) as u64)
+            {
+                bail!("iMessage audio exceeds 25 MiB total");
+            }
+            let bytes = self.client.download_audio(audio).await?;
+            total_bytes += bytes.len();
+            if total_bytes > LINQ_AUDIO_LIMIT {
+                bail!("iMessage audio exceeds 25 MiB total");
+            }
+            let filename = audio.filename.clone();
+            let mime_type = audio.mime_type.clone();
+            let settings = Arc::clone(settings);
+            let transcript = tokio::time::timeout(
+                Duration::from_secs(120),
+                tokio::task::spawn_blocking(move || {
+                    transcribe_audio(&bytes, &filename, mime_type.as_deref(), &settings)
+                }),
+            )
+            .await???;
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str("[Transcribed audio message: ");
+            message.push_str(transcript.trim());
+            message.push(']');
+        }
+        if !inbound.text.trim().is_empty() {
+            message.push_str("\nCaption: ");
+            message.push_str(inbound.text.trim());
+        }
+        Ok(message)
+    }
+
     async fn process(
         self: &Arc<Self>,
         agent: &Agent,
+        settings: &Arc<Settings>,
         inbound: &Inbound,
         secure_prompt: Option<crate::agent_id::secure_prompt::SecurePromptHub>,
     ) -> Result<ProcessOutcome> {
@@ -768,13 +843,16 @@ impl ImessageTransport {
         }
         let scope = inbound.scope();
         let now = chrono::Utc::now().timestamp();
-        let mut message = inbound.text.clone();
+        let mut message = self
+            .transcribe_message(inbound, settings)
+            .await
+            .map_err(|error| error.context(AudioTranscriptionFailure))?;
         if let Some(enabled) = NotificationCommand::parse(&message) {
             self.set_notifications(inbound, enabled)?;
             return Ok(ProcessOutcome::Complete);
         }
         if message == "/unsupported_attachment" {
-            self.queue(inbound, json!({"kind": "text", "content": "This iMessage integration currently accepts text. Please describe the attachment in a message."}));
+            self.queue(inbound, json!({"kind": "text", "content": "This iMessage integration accepts text and audio. Please describe other attachments in a message."}));
             return Ok(ProcessOutcome::Complete);
         }
         if message == "/approvals" {
@@ -906,6 +984,7 @@ impl ImessageTransport {
                 sender,
                 message_id: String::new(),
                 text: String::new(),
+                audio: Vec::new(),
                 vote: None,
             }))
     }
@@ -1256,6 +1335,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn audio_captions_do_not_cancel_turns_and_survive_deduplicated_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = transport(directory.path());
+        let pending = inbound();
+        original.store.enqueue(&pending).unwrap();
+        let (cancel, receiver) = watch::channel(false);
+        *original.active.lock().unwrap() = Some(ActiveTurn {
+            event_id: pending.event_id.clone(),
+            scope: pending.scope(),
+            cancel,
+        });
+        let mut event = command_event("audio-event", &pending.sender, "/cancel");
+        let WebhookEvent::Message(message) = &mut event else {
+            unreachable!();
+        };
+        let audio = IncomingAudio {
+            url: "https://cdn.linqapp.com/attachments/voice.caf?signature=test".into(),
+            filename: "voice.caf".into(),
+            mime_type: Some("audio/x-caf".into()),
+            size_bytes: Some(1024),
+        };
+        message.attachment_count = 1;
+        message.audio.push(audio.clone());
+        assert!(original.accept(event.clone()).unwrap());
+        assert!(!*receiver.borrow());
+        assert_eq!(original.status().unwrap()["queued_outputs"], 0);
+        drop(original);
+
+        let restored = transport(directory.path());
+        assert!(!restored.accept(event).unwrap());
+        let first = restored.next_authorized_input().unwrap().unwrap();
+        assert_eq!(first.event_id, pending.event_id);
+        let received = restored.next_authorized_input().unwrap().unwrap();
+        assert_eq!(received.event_id, "audio-event");
+        assert_eq!(received.text, "/cancel");
+        assert_eq!(received.audio, vec![audio]);
+        assert!(restored.next_authorized_input().unwrap().is_none());
+    }
+
+    #[test]
+    fn pre_audio_inbox_payloads_remain_readable_after_upgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = transport(directory.path());
+        let payload = json!({
+            "event_id": "old-event",
+            "chat": "chat-1",
+            "sender": "+49123456789",
+            "message_id": "message-1",
+            "text": "Existing queued request",
+            "vote": null,
+        });
+        current
+            .store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO linq_inbox(event_id,payload) VALUES(?1,?2)",
+                params!["old-event", payload.to_string()],
+            )
+            .unwrap();
+        let received = current.next_authorized_input().unwrap().unwrap();
+        assert_eq!(received.text, "Existing queued request");
+        assert_eq!(received.audio, Vec::<IncomingAudio>::new());
+    }
+
+    #[test]
     fn scheduled_delivery_requires_consent_and_is_durable() {
         let directory = tempfile::tempdir().unwrap();
         let current = transport(directory.path());
@@ -1373,6 +1518,7 @@ mod tests {
             is_group: false,
             reply_to: None,
             attachment_count: 0,
+            audio: Vec::new(),
         })
     }
 
@@ -1740,6 +1886,7 @@ mod tests {
             sender: "+49123456789".to_string(),
             message_id: "message-1".to_string(),
             text: "hello".to_string(),
+            audio: Vec::new(),
             vote: None,
         }
     }

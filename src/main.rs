@@ -933,7 +933,12 @@ async fn main() -> Result<()> {
         Command::Transcribe {
             file_path,
             mime_type,
-        } => h::transcribe_command(&file_path, mime_type.as_deref()),
+        } => {
+            tokio::task::spawn_blocking(move || {
+                h::transcribe_command(&file_path, mime_type.as_deref())
+            })
+            .await?
+        }
         Command::Todo { command } => h::todo_command(command),
         Command::Note { command } => h::note_command(command),
         Command::Archive { command } => h::archive_command(command),

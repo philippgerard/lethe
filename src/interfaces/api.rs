@@ -656,6 +656,7 @@ pub async fn serve_with_agent(
         )?);
         let tasks = transport.start(
             state.agent.clone(),
+            settings.clone(),
             state.secure_prompt.clone(),
             state.brainstem.clone(),
         )?;

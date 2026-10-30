@@ -1451,12 +1451,18 @@ async fn process_telegram_once(
                 };
                 let file = client.get_file(&incoming.file_id).await?;
                 let audio_bytes = client.download_file(&file.file_path).await?;
-                let transcript = transcribe_audio(
-                    &audio_bytes,
-                    &incoming.file_name,
-                    incoming.mime_type.as_deref(),
-                    settings,
-                )?;
+                let filename = incoming.file_name.clone();
+                let mime_type = incoming.mime_type.clone();
+                let transcription_settings = settings.clone();
+                let transcript = tokio::task::spawn_blocking(move || {
+                    transcribe_audio(
+                        &audio_bytes,
+                        &filename,
+                        mime_type.as_deref(),
+                        &transcription_settings,
+                    )
+                })
+                .await??;
                 Ok::<(String, String, String), anyhow::Error>((
                     transcript,
                     provider.as_str().to_string(),
