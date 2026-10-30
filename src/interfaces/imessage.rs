@@ -810,13 +810,10 @@ impl ImessageTransport {
             let filename = audio.filename.clone();
             let mime_type = audio.mime_type.clone();
             let settings = Arc::clone(settings);
-            let transcript = tokio::time::timeout(
-                Duration::from_secs(120),
-                tokio::task::spawn_blocking(move || {
-                    transcribe_audio(&bytes, &filename, Some(&mime_type), &settings)
-                }),
-            )
-            .await???;
+            let transcript = tokio::task::spawn_blocking(move || {
+                transcribe_audio(&bytes, &filename, Some(&mime_type), &settings)
+            })
+            .await??;
             if !message.is_empty() {
                 message.push('\n');
             }
