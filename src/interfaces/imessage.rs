@@ -813,7 +813,7 @@ impl ImessageTransport {
             let transcript = tokio::time::timeout(
                 Duration::from_secs(120),
                 tokio::task::spawn_blocking(move || {
-                    transcribe_audio(&bytes, &filename, mime_type.as_deref(), &settings)
+                    transcribe_audio(&bytes, &filename, Some(&mime_type), &settings)
                 }),
             )
             .await???;
@@ -1353,7 +1353,7 @@ mod tests {
         let audio = IncomingAudio {
             url: "https://cdn.linqapp.com/attachments/voice.caf?signature=test".into(),
             filename: "voice.caf".into(),
-            mime_type: Some("audio/x-caf".into()),
+            mime_type: "audio/x-caf".into(),
             size_bytes: Some(1024),
         };
         message.attachment_count = 1;

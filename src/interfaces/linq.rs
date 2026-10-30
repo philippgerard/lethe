@@ -375,7 +375,7 @@ fn authorized_audio_url(value: &str) -> LinqResult<reqwest::Url> {
 pub struct IncomingAudio {
     pub url: String,
     pub filename: String,
-    pub mime_type: Option<String>,
+    pub mime_type: String,
     pub size_bytes: Option<u64>,
 }
 
@@ -554,63 +554,38 @@ struct MessagePart {
 
 impl MessagePart {
     fn into_audio(self) -> LinqResult<Option<IncomingAudio>> {
-        let mime = self.mime_type.as_str();
-        let media_type = mime.map(|mime| mime.split(';').next().unwrap_or(mime).trim());
-        let is_audio = media_type.is_some_and(|mime| {
-            mime.get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("audio/"))
-                && mime.len() > 6
-        });
-        let infer_from_extension = self.mime_type.is_null()
-            || media_type.is_some_and(|mime| mime.eq_ignore_ascii_case("application/octet-stream"));
-        if !is_audio && !infer_from_extension {
+        let Some(mime) = self.mime_type.as_str() else {
             return Ok(None);
-        }
-        let url = self.url.as_str();
-        let filename = self
-            .filename
-            .as_str()
-            .filter(|name| !name.trim().is_empty());
-        let filename_is_audio = filename.is_some_and(has_audio_extension);
-        let parsed_url = if filename.is_none() || (!is_audio && !filename_is_audio) {
-            url.and_then(|url| reqwest::Url::parse(url).ok())
-        } else {
-            None
         };
-        let url_filename = parsed_url
-            .as_ref()
-            .and_then(|url| url.path_segments()?.next_back());
-        if !is_audio && !(filename_is_audio || url_filename.is_some_and(has_audio_extension)) {
+        let media_type = mime.split(';').next().unwrap_or(mime).trim();
+        if media_type.len() <= 6
+            || !media_type
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("audio/"))
+        {
             return Ok(None);
         }
-        let url = url
-            .filter(|url| !url.trim().is_empty())
-            .ok_or(LinqError::InvalidWebhook)?;
+        let usable = |value: &Value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let (Some(url), Some(filename)) = (usable(&self.url), usable(&self.filename)) else {
+            return Err(LinqError::InvalidWebhook);
+        };
         let size_bytes = if self.size_bytes.is_null() {
             None
         } else {
             Some(self.size_bytes.as_u64().ok_or(LinqError::InvalidWebhook)?)
         };
         Ok(Some(IncomingAudio {
-            url: url.to_owned(),
-            filename: filename
-                .or(url_filename.filter(|name| !name.is_empty()))
-                .unwrap_or("audio")
-                .to_owned(),
-            mime_type: mime.map(str::to_owned),
+            url,
+            filename,
+            mime_type: mime.to_owned(),
             size_bytes,
         }))
     }
-}
-
-fn has_audio_extension(filename: &str) -> bool {
-    filename.rsplit_once('.').is_some_and(|(_, extension)| {
-        [
-            "m4a", "mp3", "aac", "caf", "wav", "aiff", "aif", "amr", "ogg", "oga", "opus", "flac",
-        ]
-        .iter()
-        .any(|known| extension.eq_ignore_ascii_case(known))
-    })
 }
 
 #[derive(Deserialize)]
@@ -1159,7 +1134,7 @@ mod tests {
             IncomingAudio {
                 url: "https://cdn.linqapp.com/voice-memos/abc123.m4a?signature=private".into(),
                 filename: "voice-memo.m4a".into(),
-                mime_type: Some("audio/x-m4a".into()),
+                mime_type: "audio/x-m4a".into(),
                 size_bytes: Some(524288),
             }
         );
@@ -1185,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_audio_mime_and_only_safe_extension_fallbacks() {
+    fn recognizes_only_audio_mime_media_parts() {
         for (part, expected) in [
             (
                 json!({"mime_type": "Audio/MP4; codecs=mp4a", "filename": "recording.mp4"}),
@@ -1195,27 +1170,25 @@ mod tests {
                 json!({"mime_type": "audio/opus", "filename": "download"}),
                 true,
             ),
-            (json!({"filename": "recording.M4A"}), true),
+            (json!({"filename": "recording.M4A"}), false),
             (
                 json!({"filename": "recording.AIFF", "mime_type": "application/octet-stream"}),
-                true,
+                false,
             ),
             (
-                json!({"url": "https://cdn.linqapp.com/audio.CAF?signature=private"}),
-                true,
+                json!({"mime_type": null, "url": "https://cdn.linqapp.com/audio.CAF"}),
+                false,
             ),
-            (json!({"filename": "recording.mp4"}), false),
+            (
+                json!({"mime_type": "audio/", "filename": "recording.m4a"}),
+                false,
+            ),
             (
                 json!({"mime_type": "video/mp4", "filename": "recording.m4a"}),
                 false,
             ),
             (
                 json!({"mime_type": "image/png", "filename": "recording.mp3"}),
-                false,
-            ),
-            (json!({"filename": "recording.mp3.exe"}), false),
-            (
-                json!({"url": "https://cdn.linqapp.com/download?filename=recording.mp3"}),
                 false,
             ),
             (
@@ -1237,18 +1210,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_audio_url_but_preserves_malformed_non_audio_behavior() {
-        for url in [Value::Null, json!(""), json!("   "), json!(17)] {
-            let mut value = payload("message.received");
-            value["data"]["parts"] = json!([{
-                "type": "media", "mime_type": "audio/x-m4a",
-                "filename": "voice-memo.m4a", "url": url,
-            }]);
-            let body = serde_json::to_vec(&value).unwrap();
-            assert!(matches!(
-                verify_webhook(SECRET, &signed_headers(&body, NOW), &body, NOW),
-                Err(LinqError::InvalidWebhook)
-            ));
+    fn rejects_audio_without_url_or_filename_but_preserves_malformed_non_audio_behavior() {
+        for missing in [Value::Null, json!(""), json!("   "), json!(17)] {
+            for field in ["url", "filename"] {
+                let mut part = json!({
+                    "type": "media", "mime_type": "audio/x-m4a",
+                    "filename": "voice-memo.m4a", "url": "https://cdn.linqapp.com/voice.m4a",
+                });
+                part[field] = missing.clone();
+                let mut value = payload("message.received");
+                value["data"]["parts"] = json!([part]);
+                let body = serde_json::to_vec(&value).unwrap();
+                assert!(
+                    matches!(
+                        verify_webhook(SECRET, &signed_headers(&body, NOW), &body, NOW),
+                        Err(LinqError::InvalidWebhook)
+                    ),
+                    "{field}: {missing}"
+                );
+            }
         }
         let mut value = payload("message.received");
         value["data"]["parts"] = json!([
@@ -1265,7 +1245,7 @@ mod tests {
         IncomingAudio {
             url: format!("https://cdn.linqapp.com/{path}?signature=private-signed-url"),
             filename: "voice.m4a".into(),
-            mime_type: Some("audio/x-m4a".into()),
+            mime_type: "audio/x-m4a".into(),
             size_bytes: None,
         }
     }

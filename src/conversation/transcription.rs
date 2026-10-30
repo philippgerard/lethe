@@ -736,9 +736,7 @@ fn mime_to_format(mime: &str) -> Option<&'static str> {
         "audio/m4a" | "audio/x-m4a" | "audio/mp4" => Some("m4a"),
         "audio/mpeg" | "audio/mp3" => Some("mp3"),
         "audio/ogg" | "audio/opus" => Some("ogg"),
-        "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/x-pn-wav" | "audio/vnd.wave" => {
-            Some("wav")
-        }
+        "audio/wav" | "audio/wave" | "audio/x-wav" => Some("wav"),
         "audio/webm" | "video/webm" => Some("webm"),
         "video/mp4" => Some("mp4"),
         _ => None,
@@ -748,7 +746,6 @@ fn mime_to_format(mime: &str) -> Option<&'static str> {
 fn extension_alias(extension: &str) -> Option<&'static str> {
     match extension {
         "aif" | "aifc" => Some("aiff"),
-        "wave" => Some("wav"),
         "oga" | "opus" => Some("ogg"),
         "mpeg" | "mpga" => Some("mp3"),
         _ => None,
@@ -936,6 +933,34 @@ mod tests {
         assert!(!outside.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_transcript_file_wins_over_verbose_stdout_and_scratch_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("audio-path");
+        let script = test_script(
+            tmp.path(),
+            &format!(
+                "printf '%s' \"$1\" > '{}'\nprintf ' file transcript \\n' > \"${{1%.*}}.txt\"\necho '[00:00.000 --> 00:01.000] verbose stdout'",
+                marker.display()
+            ),
+        );
+
+        let result = transcribe_local_whisper(
+            b"audio",
+            "voice.ogg",
+            "ogg",
+            "base",
+            None,
+            script.to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(result, "file transcript");
+        let audio_path = fs::read_to_string(marker).unwrap();
+        assert!(!Path::new(&audio_path).parent().unwrap().exists());
+    }
+
     #[test]
     fn local_whisper_stdout_strips_timestamps() {
         let stdout = "[00:00.000 --> 00:01.000] hello\nplain line";
@@ -961,8 +986,6 @@ mod tests {
             ("audio/x-aiff", "aiff"),
             ("audio/amr", "amr"),
             ("audio/x-wav", "wav"),
-            ("audio/x-pn-wav", "wav"),
-            ("audio/vnd.wave", "wav"),
             ("AUDIO/WAVE; codecs=pcm", "wav"),
         ] {
             assert_eq!(infer_audio_format("unhelpful.bin", Some(mime)), expected);
@@ -972,7 +995,6 @@ mod tests {
             ("voice.AIF", "aiff"),
             ("voice.aifc", "aiff"),
             ("voice.AMR", "amr"),
-            ("voice.wave", "wav"),
         ] {
             assert_eq!(infer_audio_format(name, None), expected);
         }
@@ -996,10 +1018,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn converter_script(directory: &Path, body: &str) -> std::path::PathBuf {
+    fn test_script(directory: &Path, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = directory.join("converter");
+        let path = directory.join("script");
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
@@ -1012,7 +1034,7 @@ mod tests {
         // Record the server-owned input path so cleanup is checked after an
         // actual failed child process, not just after successful conversion.
         let marker = tmp.path().join("input-path");
-        let script = converter_script(
+        let script = test_script(
             tmp.path(),
             &format!(
                 "while [ \"$1\" != '-i' ]; do shift; done\nshift\nprintf '%s' \"$1\" > '{}'\nexit 1",
@@ -1033,13 +1055,13 @@ mod tests {
         let input = fs::read_to_string(marker).unwrap();
         assert!(!Path::new(&input).parent().unwrap().exists());
 
-        let script = converter_script(tmp.path(), "exec sleep 5");
+        let script = test_script(tmp.path(), "exec sleep 5");
         assert!(matches!(
             convert_native_audio(b"invalid", "caf", &script, 1024, Duration::from_millis(20)),
             Err(TranscriptionError::AudioConversionTimedOut { .. })
         ));
 
-        let script = converter_script(
+        let script = test_script(
             tmp.path(),
             "for output do :; done\nprintf '1234567890123456' > \"$output\"",
         );
@@ -1053,7 +1075,7 @@ mod tests {
             "exit 0",
             "for output do :; done\nprintf 'bad' > \"$output\"",
         ] {
-            let script = converter_script(tmp.path(), body);
+            let script = test_script(tmp.path(), body);
             assert!(matches!(
                 convert_native_audio(b"invalid", "caf", &script, 1024, AUDIO_CONVERSION_TIMEOUT),
                 Err(TranscriptionError::AudioConversionFailed)
