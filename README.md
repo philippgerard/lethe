@@ -37,9 +37,10 @@ current product surface emphasizes:
 - **Reliable delivery.** Telegram, HTTP/SSE, and the scheduler-oriented
   `POST /wake` path share one agent and one Brainstem, with safeguards against
   duplicate or silently discarded replies.
-- **Voice as first-class input.** Telegram voice notes and the transcription
-  command share OpenAI, OpenRouter, multilingual Mistral Voxtral, and local
-  Whisper backends.
+- **Voice as first-class input.** Telegram and iMessage voice notes, audio
+  attachments, and the transcription command share OpenAI, OpenRouter,
+  multilingual Mistral Voxtral, and local Whisper backends. Native Apple audio
+  formats are converted with FFmpeg when a cloud provider needs it.
 - **Tiered model use.** Main, auxiliary, tool-chain, and deep-thinking model
   slots let inexpensive work stay inexpensive while difficult turns and
   subagents can escalate deliberately.

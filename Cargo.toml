@@ -60,6 +60,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 sqlite-vec = "0.1"
 tar = "0.4"
+tempfile = "3.23"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 # WS client for the in-container browser viewport relay (/browser/stream →
@@ -72,9 +73,6 @@ tui-textarea = { package = "tui-textarea-2", version = "0.12.1", default-feature
 uuid = { version = "1.18", features = ["serde", "v4"] }
 walkdir = "2.5"
 zeroize = "1"
-
-[dev-dependencies]
-tempfile = "3.23"
 
 # Strip symbols from release binaries — roughly halves the ~56 MB binary
 # (mostly the statically-linked ONNX runtime + bundled sqlite). `strip` is

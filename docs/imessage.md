@@ -1,8 +1,8 @@
 # iMessage through Linq
 
-Lethe can receive text from an allowlisted direct conversation and reply through
-Linq's V3 API. The transport runs in the existing HTTP API process and uses the
-same Agent and Brainstem as the other transports. It is disabled by default.
+Lethe can receive text and audio from an allowlisted direct conversation and reply
+through Linq's V3 API. The transport runs in the existing HTTP API process and uses
+the same Agent and Brainstem as the other transports. It is disabled by default.
 It does not connect to your personal Apple ID or read your local Messages app.
 
 Linq documents a permanent free Hobby shared line with up to 20 contacts through
@@ -59,8 +59,8 @@ An enabled transport requires all three of `LINQ_API_TOKEN`,
 use the complete E.164 handle that Linq supplies, such as the synthetic example
 `+15555550123`. Matches are exact; Lethe does not enroll the first person who
 texts the line. Group conversations are rejected even when a participant is
-allowlisted. Incoming iMessage, RCS, and SMS text are accepted; attachments and
-voice transcription are not implemented by this transport.
+allowlisted. Incoming iMessage, RCS, and SMS text and audio are accepted. Images,
+videos, and documents are not processed by this transport.
 
 Expose only `POST /webhooks/linq` through an HTTPS reverse proxy or a provider
 webhook forwarder. Keep the rest of the API private or behind its normal Lethe
@@ -68,7 +68,7 @@ authentication. Preserve the raw request body and the `webhook-id`,
 `webhook-timestamp`, and `webhook-signature` headers. Configure the subscription
 for API `v3`, webhook version **`2026-02-03`**, and these events:
 
-- `message.received` for inbound text.
+- `message.received` for inbound text and audio.
 - `message.sent`, `message.delivered`, `message.read`, and `message.failed` for
   delivery observations.
 - `poll.vote.added` if native polls are explicitly enabled. Removed votes do not
@@ -100,6 +100,39 @@ webhook returns 401; an incompatible payload or version returns 400; a disabled
 transport returns 404. A newly persisted input returns 202 with
 `accepted: true`. Duplicates and ignored events return 200 with
 `accepted: false`. These responses acknowledge ingestion, not task completion.
+
+## Audio input
+
+Voice notes and audio attachments are transcribed automatically in allowed direct
+conversations. They use the same `TRANSCRIPTION_PROVIDER`, `TRANSCRIPTION_MODEL`,
+`TRANSCRIPTION_LANGUAGE`, provider API keys, and `TRANSCRIPTION_LOCAL_COMMAND` as
+Telegram and `lethe transcribe`. If Telegram transcription works in the same
+deployment, no additional transcription credentials or iMessage switch is needed.
+`TELEGRAM_TRANSCRIPTION_ENABLED` controls Telegram only.
+
+The verified webhook is persisted before any audio is fetched. The inbox worker
+downloads audio from HTTPS `cdn.linqapp.com` URLs without forwarding the Linq API
+token, transcribes it, and passes the transcript and any caption into the normal
+conversation. Spoken text and audio captions are not parsed as transport commands
+such as `/approve` or `/cancel`; type those commands in a separate text message.
+The existing allowlist, group rejection, deduplication, and cancellation rules
+continue to apply.
+
+Audio is limited to **25 MiB total per message**, with bounded downloads and no
+redirects. OpenAI, OpenRouter, and Mistral receive CAF, AIFF, and AMR recordings as
+mono 16-kHz WAV; install `ffmpeg` in the API process's runtime for that conversion.
+Converted WAV is also limited to 25 MiB, so a compressed recording can exceed the
+limit after decoding. Other common formats, including M4A, MP3, AAC, and WAV, go
+directly to the configured provider. Local Whisper decodes native formats itself.
+
+Conversion uses private temporary files that are cleaned up after the operation.
+Cloud transcription sends the recording to the configured provider. Linq's own
+attachment storage and URL expiry remain subject to its
+[attachment policy](https://docs.linqapp.com/channel/imessage/guides/messaging/attachments/).
+Expired URLs and transcription failures produce an audio-specific notice, not a
+model turn based on incomplete audio. Resend the recording or send its text.
+Recordings rejected by older Lethe versions cannot be recovered from the old
+attachment-only inbox entry; send a fresh voice note after upgrading.
 
 ## Decisions in Messages
 

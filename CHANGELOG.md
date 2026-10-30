@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Transcribe iMessage voice notes and audio attachments through the existing
+  shared speech-to-text backend, preserving captions and durable input
+  deduplication. Restrict audio downloads to Linq's HTTPS CDN, cap message audio
+  at 25 MiB, and keep spoken text out of approval and transport command parsing.
+  Convert native CAF/AIFF/AMR audio to WAV with FFmpeg for cloud providers.
+  Run blocking transcription work outside the async transport and CLI runtime.
+
 - Upgrade the standalone legacy migrator to fixed Zstandard compression
   dependencies through manifest-only Arrow IPC and Lance encoding patches.
   Keep the existing storage readers and all release dependency audit gates.
