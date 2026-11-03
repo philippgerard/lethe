@@ -1892,7 +1892,7 @@ mod tests {
     fn rendered_outbox_payload_survives_restart_without_changing_source() {
         let directory = tempfile::tempdir().unwrap();
         let original = transport(directory.path());
-        let markdown = "😀 **Ready**\n\n---\n\n[Details](https://example.test/details)";
+        let markdown = "😀 **Ready**\n---\n[Details](https://example.test/details)";
         assert!(original.queue(&inbound(), json!({"kind": "text", "content": markdown})));
         drop(original);
         let restored = transport(directory.path());

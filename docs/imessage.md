@@ -81,6 +81,9 @@ The webhook has a 1 MiB body limit; accepted text has a 32 KiB limit.
 
 Outgoing Markdown is rendered as readable text with Linq's native bold and italic
 decorations, including correct UTF-16 ranges for emoji and long-message chunks.
+Standalone `---` bubble dividers become paragraph breaks, even when directly
+after prose. Underlined (Setext) headings do not add bold; explicit `#` headings
+and inline `**bold**` or `__bold__` markup retain their formatting.
 Messages explicitly sent with `parse_mode: "html"` use an HTML renderer, including
 scheduled notifications routed from Telegram tools. Supported emphasis becomes
 native formatting, entities are decoded, and links retain their destinations.
