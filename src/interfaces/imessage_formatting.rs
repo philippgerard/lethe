@@ -288,7 +288,8 @@ pub fn render_imessage_markdown(markdown: &str) -> RenderedText {
 }
 
 fn is_atx_heading(source: &str) -> bool {
-    let source = source.trim_start();
+    // Parser ranges already start at the ATX marker after container prefixes
+    // and indentation. Unicode whitespace can instead be literal Setext text.
     let hashes = source.bytes().take_while(|byte| *byte == b'#').count();
     (1..=6).contains(&hashes)
         && source
@@ -418,6 +419,7 @@ mod tests {
             "#hashtag prose",
             "####### seven hashes",
             "#\u{a0}nonbreaking space",
+            "\u{a0}# literal after nonbreaking space",
         ] {
             let rendered = render_imessage_markdown(&format!("{text}\n---\nAfter."));
             assert_eq!(rendered.text, format!("{text}\n\nAfter."));
