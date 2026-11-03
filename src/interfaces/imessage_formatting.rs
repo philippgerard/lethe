@@ -189,11 +189,18 @@ pub fn render_imessage_markdown(markdown: &str) -> RenderedText {
             }
             Event::Start(Tag::Heading { .. }) => {
                 writer.line_break(2);
-                writer.flush_break();
-                styles.push((DecorationStyle::Bold, writer.utf16_len));
+                // Lethe uses `---` as a bubble divider, often immediately
+                // after prose. CommonMark calls that a Setext heading; only
+                // an explicit ATX (`# ...`) heading should add bold here.
+                if is_atx_heading(&markdown[range]) {
+                    writer.flush_break();
+                    styles.push((DecorationStyle::Bold, writer.utf16_len));
+                }
             }
             Event::End(TagEnd::Heading(_)) => {
-                end_style(&writer, &mut styles, &mut decorations);
+                if is_atx_heading(&markdown[range]) {
+                    end_style(&writer, &mut styles, &mut decorations);
+                }
                 writer.line_break(2);
             }
             Event::End(TagEnd::Paragraph) | Event::Rule => writer.line_break(2),
@@ -278,6 +285,16 @@ pub fn render_imessage_markdown(markdown: &str) -> RenderedText {
         text: writer.text,
         text_decorations: decorations,
     }
+}
+
+fn is_atx_heading(source: &str) -> bool {
+    let source = source.trim_start();
+    let hashes = source.bytes().take_while(|byte| *byte == b'#').count();
+    (1..=6).contains(&hashes)
+        && source
+            .as_bytes()
+            .get(hashes)
+            .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
 fn end_style(
@@ -378,6 +395,71 @@ mod tests {
                 decoration([0, 10], DecorationStyle::Bold),
                 decoration([12, 17], DecorationStyle::Bold),
                 decoration([22, 29], DecorationStyle::Italic),
+            ]
+        );
+    }
+
+    #[test]
+    fn bubble_dividers_do_not_bold_preceding_paragraphs() {
+        for divider in ["---", "-----", "==="] {
+            let rendered = render_imessage_markdown(&format!(
+                "Ordinary introduction.\n{divider}\nA longer paragraph\nwith a second line.\n{divider}\nFinal paragraph."
+            ));
+            assert_eq!(
+                rendered.text,
+                "Ordinary introduction.\n\nA longer paragraph\nwith a second line.\n\nFinal paragraph."
+            );
+            assert!(
+                rendered.text_decorations.is_empty(),
+                "{divider}: {rendered:?}"
+            );
+        }
+        for text in [
+            "#hashtag prose",
+            "####### seven hashes",
+            "#\u{a0}nonbreaking space",
+        ] {
+            let rendered = render_imessage_markdown(&format!("{text}\n---\nAfter."));
+            assert_eq!(rendered.text, format!("{text}\n\nAfter."));
+            assert!(rendered.text_decorations.is_empty(), "{rendered:?}");
+        }
+    }
+
+    #[test]
+    fn bubble_dividers_preserve_only_explicit_inline_emphasis() {
+        let rendered = render_imessage_markdown(
+            "😀 **Good *sound***, ordinary explanation.\n---\n__Microphone:__ ordinary caveat.\n---\nFinal paragraph.",
+        );
+        assert_eq!(
+            rendered.text,
+            "😀 Good sound, ordinary explanation.\n\nMicrophone: ordinary caveat.\n\nFinal paragraph."
+        );
+        assert_eq!(
+            rendered.text_decorations,
+            vec![
+                decoration([3, 13], DecorationStyle::Bold),
+                decoration([8, 13], DecorationStyle::Italic),
+                decoration([38, 49], DecorationStyle::Bold),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_headings_and_literal_code_survive_bubble_dividers() {
+        let rendered = render_imessage_markdown(
+            "# **Title** and *subtitle*\n\n> ## Quoted heading\n\nOrdinary prose.\n---\n\n```text\nLiteral **text**\n---\n```\n\n`inline ---`",
+        );
+        assert_eq!(
+            rendered.text,
+            "Title and subtitle\n\n> \n\nQuoted heading\n\nOrdinary prose.\n\nLiteral **text**\n---\n\ninline ---"
+        );
+        assert_eq!(
+            rendered.text_decorations,
+            vec![
+                decoration([0, 5], DecorationStyle::Bold),
+                decoration([0, 18], DecorationStyle::Bold),
+                decoration([10, 18], DecorationStyle::Italic),
+                decoration([24, 38], DecorationStyle::Bold),
             ]
         );
     }
