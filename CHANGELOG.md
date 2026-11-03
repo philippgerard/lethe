@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Stop iMessage `---` bubble dividers from bolding the paragraph above them.
+  CommonMark reads a divider directly after prose as an underlined (Setext)
+  heading; those headings no longer add bold. Explicit `#` headings and inline
+  emphasis keep their native formatting.
+
 - Transcribe iMessage voice notes and audio attachments through the existing
   shared speech-to-text backend, preserving captions and durable input
   deduplication. Restrict audio downloads to Linq's HTTPS CDN, cap message audio
