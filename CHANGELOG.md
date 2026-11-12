@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Update bundled SQLite through rusqlite 0.41 to fix CVE-2026-119375,
+  Rustix to fix RUSTSEC-2026-0486, and the legacy migrator's Arrow data
+  validation to fix CVE-2026-111959. Preserve the existing SQLite-vec storage
+  format and legacy Lance readers; keep all release audit gates enabled.
+
 - Stop iMessage `---` bubble dividers from bolding the paragraph above them.
   CommonMark reads a divider directly after prose as an underlined (Setext)
   heading; those headings no longer add bold. Explicit `#` headings and inline
