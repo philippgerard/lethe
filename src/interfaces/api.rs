@@ -21,12 +21,16 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::actor::ActorEvent;
-use crate::agent::{Agent, TURN_CHECKPOINT_NOTICE, TurnRequest, TurnResult};
+use crate::agent::{
+    Agent, AgentError, AgentResult, CheckpointStatus, TURN_CHECKPOINT_NOTICE, TurnRequest,
+    TurnResult, TurnStopReason,
+};
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use crate::interfaces::telegram::{
-    PendingReaction, SharedTelegramTurnGuard, TelegramClient, TelegramToolContext,
-    TelegramTurnGuard, llm_auth_reply, llm_limit_reply, split_telegram_messages,
+    CONTEXT_OVERFLOW_MESSAGE, PendingReaction, SharedTelegramTurnGuard, TelegramClient,
+    TelegramToolContext, TelegramTurnGuard, llm_auth_reply, llm_limit_reply,
+    split_telegram_messages,
 };
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
@@ -949,7 +953,7 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
             // renders it live (reuses the UI's existing `message` handler).
             state.broadcast_events("message", json!({"role": "assistant", "content": message}));
         }
-        Ok(TurnResult::Checkpointed)
+        Ok(TurnResult::Checkpointed(_))
             if !request_metadata.is_internal()
                 && request_metadata.kind != Some(MessageKind::TelegramReaction) =>
         {
@@ -967,15 +971,19 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
                 .await;
             state.broadcast_events("message", json!({"role": "assistant", "content": message}));
         }
-        Ok(TurnResult::Checkpointed) => {}
+        Ok(TurnResult::Checkpointed(_)) => {}
         Ok(TurnResult::Complete(_)) => {}
         Err(error) if !context.interrupt.is_interrupted() => {
+            let content = match error {
+                AgentError::ContextOverflow { .. } => CONTEXT_OVERFLOW_MESSAGE.to_string(),
+                error => format!("Error: {error}"),
+            };
             let _ = state
                 .send_to_chat(
                     context.chat_id,
                     "text",
                     json!({
-                        "content": format!("Error: {error}"),
+                        "content": content,
                         "parse_mode": null,
                         "message_id": 0,
                     }),
@@ -1448,6 +1456,7 @@ async fn annotate_wake_response(
     failure_kind: &str,
     imessage_status: &str,
     delivery: Option<&NotificationDelivery>,
+    stop: Option<CheckpointStatus>,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
     let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
@@ -1465,6 +1474,11 @@ async fn annotate_wake_response(
     body["run_id"] = json!(run_id);
     body["task_name"] = json!(task_name);
     body["imessage_status"] = json!(imessage_status);
+    if let Some(stop) = stop {
+        body["stop_reason"] = json!(stop.stop_reason.as_str());
+        body["checkpoint_persisted"] = json!(stop.checkpoint_persisted);
+        body["resumable"] = json!(stop.checkpoint_persisted);
+    }
     if let Some(delivery) = delivery {
         body["telegram_delivered_messages"] = json!(delivery.telegram_messages());
         body["imessage_queued_messages"] = json!(delivery.imessage_messages());
@@ -1495,8 +1509,58 @@ async fn annotate_wake_response(
         body["error"] =
             json!("iMessage notification could not be queued; inspect the run before retrying");
     }
+    tracing::info!(
+        %run_id,
+        %task_name,
+        imessage_status,
+        success = body["success"].as_bool(),
+        turn_completed = body["turn_completed"].as_bool(),
+        stop_reason = stop.map(|stop| stop.stop_reason.as_str()),
+        checkpoint_persisted = stop.map(|stop| stop.checkpoint_persisted),
+        resumable = stop.map(|stop| stop.checkpoint_persisted),
+        "scheduled task finished"
+    );
     parts.headers.remove(header::CONTENT_LENGTH);
     Response::from_parts(parts, axum::body::Body::from(body.to_string()))
+}
+
+fn wake_stop_diagnostics(result: &AgentResult<TurnResult>) -> Option<CheckpointStatus> {
+    match result {
+        Ok(TurnResult::Checkpointed(status)) => Some(*status),
+        Err(AgentError::ContextOverflow { .. }) => Some(CheckpointStatus {
+            stop_reason: TurnStopReason::ContextOverflow,
+            checkpoint_persisted: false,
+        }),
+        _ => None,
+    }
+}
+
+fn wake_turn_failure(
+    error: &anyhow::Error,
+    diagnostic: &str,
+) -> (StatusCode, &'static str, &'static str, String) {
+    if let Some(message) = llm_auth_reply(error) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication",
+            message,
+            message.to_string(),
+        )
+    } else if let Some(message) = llm_limit_reply(error) {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "limit",
+            message,
+            message.to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "turn_failed",
+            WAKE_TURN_FAILURE_MESSAGE,
+            format!("turn failed: {diagnostic}"),
+        )
+    }
 }
 
 fn resolve_wake_chat_id(settings: &Settings, requested: Option<i64>) -> Option<i64> {
@@ -1745,7 +1809,7 @@ where
     let reactions = deliver_wake_reactions(pending_reactions, send_reaction).await;
     let reply = match result {
         TurnResult::Complete(reply) => reply,
-        TurnResult::Checkpointed => {
+        TurnResult::Checkpointed(_) => {
             let delivered = tool_messages_sent > 0 || reactions.delivered > 0;
             let delivery_status = if reactions.has_failures() {
                 reaction_failure_status("checkpoint_suppressed", &reactions)
@@ -1761,7 +1825,7 @@ where
                 delivered,
                 tool_messages_sent,
                 None,
-                "turn ended with an internal checkpoint; fallback delivery was suppressed",
+                "turn stopped before completion; fallback delivery was suppressed; inspect completed actions before retrying",
                 &reactions,
             );
         }
@@ -2192,6 +2256,7 @@ async fn wake(
 
     let turn_result =
         run_wake_turn_with_timeout(WAKE_TURN_TIMEOUT, state.agent.chat_once_result(req)).await;
+    let stop_diagnostics = turn_result.as_ref().ok().and_then(wake_stop_diagnostics);
     let WakeGuardDelivery {
         tool_messages_sent,
         silent_completion_requested,
@@ -2277,29 +2342,7 @@ async fn wake(
             let diagnostic = crate::diagnostics::error_summary(&error);
             tracing::error!(%run_id, %task_name, error = %diagnostic, "scheduled task failed");
             let (status, failure_kind, user_message, error_message) =
-                if let Some(message) = llm_auth_reply(&error) {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "authentication",
-                        message,
-                        message.to_string(),
-                    )
-                } else {
-                    match llm_limit_reply(&error) {
-                        Some(message) => (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "limit",
-                            message,
-                            message.to_string(),
-                        ),
-                        None => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "turn_failed",
-                            WAKE_TURN_FAILURE_MESSAGE,
-                            format!("turn failed: {diagnostic}"),
-                        ),
-                    }
-                };
+                wake_turn_failure(&error, &diagnostic);
             let user_message = wake_failure_notice(&task_name, &run_id, user_message);
             let progress = Arc::new(WakeDeliveryProgress::new(
                 tool_messages_sent,
@@ -2393,7 +2436,6 @@ async fn wake(
     }
     let imessage_status = notification_delivery.imessage_status();
     persist_wake_visible_history(state.agent.as_ref(), visible_texts);
-    tracing::info!(%run_id, %task_name, imessage_status, "scheduled task finished");
     annotate_wake_response(
         response,
         &run_id,
@@ -2401,6 +2443,7 @@ async fn wake(
         failure_kind,
         imessage_status,
         Some(&notification_delivery),
+        stop_diagnostics,
     )
     .await
 }
@@ -2463,6 +2506,13 @@ mod tests {
         settings.llm.llm_model = "openai/gpt-5".to_string();
         settings.llm.llm_model_aux = "openai/gpt-5-mini".to_string();
         settings
+    }
+
+    fn wake_checkpoint(stop_reason: TurnStopReason) -> TurnResult {
+        TurnResult::Checkpointed(CheckpointStatus {
+            stop_reason,
+            checkpoint_persisted: false,
+        })
     }
 
     fn authenticated_headers() -> HeaderMap {
@@ -3092,6 +3142,7 @@ mod tests {
                 "delivery_failed",
                 routing.imessage_status(),
                 Some(&routing),
+                None,
             )
             .await,
         )
@@ -3266,7 +3317,7 @@ mod tests {
     async fn wake_silent_completion_preserves_checkpoint_failure() {
         let response = finish_wake_delivery(
             42,
-            TurnResult::Checkpointed,
+            wake_checkpoint(TurnStopReason::NoProgress),
             0,
             true,
             Vec::new(),
@@ -3332,7 +3383,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            TurnResult::Checkpointed,
+            wake_checkpoint(TurnStopReason::NoProgress),
             0,
             false,
             Vec::new(),
@@ -3362,7 +3413,7 @@ mod tests {
 
         let response = finish_wake_delivery(
             42,
-            TurnResult::Checkpointed,
+            wake_checkpoint(TurnStopReason::NoProgress),
             2,
             false,
             vec![pending_reaction(70, "👍")],
@@ -3629,9 +3680,16 @@ mod tests {
                 })),
             )
                 .into_response();
-            let response =
-                annotate_wake_response(response, "run-123", "morning-brief", kind, "queued", None)
-                    .await;
+            let response = annotate_wake_response(
+                response,
+                "run-123",
+                "morning-brief",
+                kind,
+                "queued",
+                None,
+                None,
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::OK);
             let body = response_json(response).await;
             assert_eq!(body["run_id"], "run-123");
@@ -3645,10 +3703,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wake_stop_diagnostics_are_bounded_and_do_not_claim_saved_progress() {
+        for (reason, expected) in [
+            (TurnStopReason::NoProgress, "no_progress_cap"),
+            (TurnStopReason::ToolIterations, "tool_iteration_cap"),
+            (TurnStopReason::RepeatedToolCalls, "repeated_tool_call_cap"),
+            (TurnStopReason::ToolErrors, "tool_error_cap"),
+            (TurnStopReason::EmptyResponses, "empty_response_stall"),
+            (TurnStopReason::Unknown, "unknown"),
+        ] {
+            let result = Ok(wake_checkpoint(reason));
+            let stop = wake_stop_diagnostics(&result);
+            let response = finish_wake_delivery(
+                42,
+                result.unwrap(),
+                1,
+                false,
+                Vec::new(),
+                |_| async { panic!("no reactions expected") },
+                |_| async { panic!("stopped task must not send a fallback") },
+            )
+            .await;
+            let response = annotate_wake_response(
+                response,
+                "run-1",
+                "crm-sync",
+                "checkpoint",
+                "no_notification",
+                None,
+                stop,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["run_id"], "run-1");
+            assert_eq!(body["task_name"], "crm-sync");
+            assert_eq!(body["failure_kind"], "checkpoint");
+            assert_eq!(body["stop_reason"], expected);
+            assert_eq!(body["checkpoint_persisted"], false);
+            assert_eq!(body["resumable"], false);
+            assert_eq!(body["success"], false);
+            assert_eq!(body["turn_completed"], false);
+            assert_eq!(body["delivered"], true);
+            assert_eq!(body["delivered_messages"], 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_context_overflow_diagnostics_require_a_typed_local_error() {
+        let overflow = || AgentError::ContextOverflow {
+            message_chars: 742_913,
+            message_budget: 429_000,
+        };
+        let stop = wake_stop_diagnostics(&Err(overflow()));
+        assert_eq!(
+            stop,
+            Some(CheckpointStatus {
+                stop_reason: TurnStopReason::ContextOverflow,
+                checkpoint_persisted: false,
+            })
+        );
+        let error = anyhow::Error::new(overflow()).context("scheduled task failed");
+        let (status, failure_kind, user_message, error_message) =
+            wake_turn_failure(&error, &crate::diagnostics::error_summary(&error));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failure_kind, "turn_failed");
+        let sent = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recorded = sent.clone();
+        let response = finish_wake_failure(
+            42,
+            0,
+            Vec::new(),
+            status,
+            failure_kind,
+            user_message,
+            error_message,
+            |_| async { Ok(()) },
+            move |text| {
+                recorded.lock().unwrap().push(text);
+                async { Ok(81) }
+            },
+        )
+        .await;
+        let body = response_json(
+            annotate_wake_response(
+                response,
+                "run-2",
+                "crm-sync",
+                failure_kind,
+                "no_notification",
+                None,
+                stop,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(sent.lock().unwrap().as_slice(), [WAKE_TURN_FAILURE_MESSAGE]);
+        assert_eq!(body["stop_reason"], "tool_context_overflow");
+        assert_eq!(body["failure_kind"], "turn_failed");
+        assert_eq!(body["delivery_status"], "turn_failed_notice_delivered");
+        assert_eq!(body["checkpoint_persisted"], false);
+        assert_eq!(body["resumable"], false);
+        assert!(
+            !body
+                .to_string()
+                .contains(crate::interfaces::telegram::USAGE_LIMIT_MESSAGE)
+        );
+        assert_eq!(
+            wake_stop_diagnostics(&Err(AgentError::Llm(anyhow::anyhow!(
+                "tool_context_overflow SECRET_PROVIDER_PAYLOAD"
+            )))),
+            None
+        );
+        assert_eq!(
+            wake_stop_diagnostics(&Ok(TurnResult::Complete("done".to_string()))),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn wake_checkpoint_is_reported_as_checkpoint_and_success_has_no_failure_kind() {
         let checkpoint = finish_wake_delivery(
             42,
-            TurnResult::Checkpointed,
+            wake_checkpoint(TurnStopReason::NoProgress),
             0,
             false,
             Vec::new(),
@@ -3664,6 +3841,10 @@ mod tests {
                 "checkpoint",
                 "no_notification",
                 None,
+                Some(CheckpointStatus {
+                    stop_reason: TurnStopReason::NoProgress,
+                    checkpoint_persisted: false,
+                }),
             )
             .await,
         )
@@ -3686,6 +3867,7 @@ mod tests {
                 "brief",
                 "delivery_failed",
                 "queued",
+                None,
                 None,
             )
             .await,
@@ -3711,6 +3893,7 @@ mod tests {
             "brief",
             "delivery_failed",
             "queue_failed",
+            None,
             None,
         )
         .await;

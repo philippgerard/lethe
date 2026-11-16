@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Update Quinn protocol and UDP dependencies to address RUSTSEC-2026-0523,
+  RUSTSEC-2026-0524, and RUSTSEC-2026-0538 in all three dependency lockfiles.
+
+- Keep every tool call and result of the active task when the tool loop trims
+  context; older conversation history is removed first. A task that still
+  cannot fit fails with `tool_context_overflow` and a fixed notice to inspect
+  completed actions, never a provider usage-limit reply. Non-persistent
+  subagents that overflow terminate as failed without automatic continuation.
+  `/wake` responses and logs add an allowlisted `stop_reason` plus
+  `checkpoint_persisted` and `resumable` (always `false` for scheduled wakes).
+
 - Update bundled SQLite through rusqlite 0.41 to fix CVE-2026-119375,
   Rustix to fix RUSTSEC-2026-0486, and the legacy migrator's Arrow data
   validation to fix CVE-2026-111959. Preserve the existing SQLite-vec storage

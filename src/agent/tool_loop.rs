@@ -233,9 +233,10 @@ fn is_error_result(result: &str) -> bool {
 
 /// Re-apply a hard context ceiling on every tool iteration. The initial turn
 /// clamp cannot account for schemas loaded later via `request_tool`, nor for a
-/// long chain of assistant/tool-result pairs appended after assembly. Prefer
-/// dropping the oldest completed tool exchanges; if needed, then drop oldest
-/// pre-turn history while preserving system messages and the current user ask.
+/// long chain of assistant/tool-result pairs appended after assembly. Drop
+/// pre-turn history while preserving system messages, saved checkpoints, and
+/// every current-task exchange. Dependent reads and completed writes are task
+/// state: silently forgetting them causes repeated work and unsafe retries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContextOverflow {
     message_chars: usize,
@@ -248,12 +249,11 @@ struct ContextClampResult {
     overflow: Option<ContextOverflow>,
 }
 
-fn context_overflow_error(model_id: &str, overflow: ContextOverflow) -> AgentError {
-    AgentError::Llm(anyhow!(
-        "tool_context_overflow for model {model_id}: {} message chars exceed {} budget chars while preserving required current-turn tool results",
-        overflow.message_chars,
-        overflow.message_budget
-    ))
+fn context_overflow_error(overflow: ContextOverflow) -> AgentError {
+    AgentError::ContextOverflow {
+        message_chars: overflow.message_chars,
+        message_budget: overflow.message_budget,
+    }
 }
 
 fn is_resumable_checkpoint_chat_message(message: &ChatMessage) -> bool {
@@ -281,40 +281,19 @@ fn clamp_chat_request_to_budget(
     let total = |messages: &[ChatMessage]| messages.iter().map(ChatMessage::size).sum::<usize>();
     let mut dropped = 0;
 
-    // Drop completed current-turn rounds oldest-first, but always retain the
-    // newest assistant + all of its tool responses. Those results are the only
-    // state from which the next model call can make progress; deleting them and
-    // asking again just recreates the same calls. A round ends immediately
-    // before the next assistant message, so parallel tool results stay paired
-    // with the assistant call that issued them.
-    while total(&request.messages) > message_budget {
-        let assistant_starts = request.messages[*current_user_index + 1..]
-            .iter()
-            .enumerate()
-            .filter_map(|(offset, message)| {
-                (message.role == ChatRole::Assistant).then_some(*current_user_index + 1 + offset)
-            })
-            .take(2)
-            .collect::<Vec<_>>();
-        let Some(next_round_start) = assistant_starts.get(1).copied() else {
-            break;
-        };
-        let exchange_start = *current_user_index + 1;
-        dropped += next_round_start - exchange_start;
-        request.messages.drain(exchange_start..next_round_start);
-    }
-
-    // If schemas themselves grew enough to squeeze the initial prompt, prune
-    // oldest non-system history but never the current user message.
+    // Free old conversation space before the active task loses any evidence.
+    // If the task itself still cannot fit, return an explicit overflow below
+    // rather than making the model repeat reads or effects it can no longer see.
     let history_start = request
         .messages
         .iter()
         .position(|message| message.role != ChatRole::System)
         .unwrap_or(request.messages.len());
     while total(&request.messages) > message_budget {
-        let Some(remove_index) = (history_start..*current_user_index)
-            .find(|index| !is_resumable_checkpoint_chat_message(&request.messages[*index]))
-        else {
+        let Some(remove_index) = (history_start..*current_user_index).find(|index| {
+            request.messages[*index].role != ChatRole::System
+                && !is_resumable_checkpoint_chat_message(&request.messages[*index])
+        }) else {
             break;
         };
         request.messages.remove(remove_index);
@@ -817,7 +796,10 @@ pub(super) fn actor_turn_executor(
                 Some(_) => ActorTurnResult::Checkpointed(output.text),
                 None => ActorTurnResult::Complete(output.text),
             })
-            .map_err(|error| ActorError::Runtime(error.to_string()))
+            .map_err(|error| match error {
+                AgentError::ContextOverflow { .. } => ActorError::ContextOverflow,
+                error => ActorError::Runtime(error.to_string()),
+            })
         })
     })
 }
@@ -970,7 +952,7 @@ pub(super) async fn complete_turn_with_tools_config_shared(
                 message_budget = overflow.message_budget,
                 "tool-loop context cannot fit without dropping required current-turn context"
             );
-            return Err(context_overflow_error(&model_id, overflow));
+            return Err(context_overflow_error(overflow));
         }
         let buffered_assistant_deltas = BufferedAssistantDeltas::default();
         let buffered_reasoning_deltas = BufferedAssistantDeltas::default();
@@ -2196,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_loop_budget_counts_schemas_and_drops_old_exchanges() {
+    fn tool_loop_budget_counts_schemas_without_discarding_current_task_evidence() {
         let mut request = genai::chat::ChatRequest::new(vec![
             ChatMessage::system("system"),
             ChatMessage::user("current request"),
@@ -2228,12 +2210,81 @@ mod tests {
         let mut current_user_index = 1;
         let clamp =
             clamp_chat_request_to_budget(&mut request, &mut current_user_index, max_total_chars);
-        assert_eq!(clamp.dropped, 2, "old assistant/tool pair removed");
-        assert_eq!(clamp.overflow, None);
+        assert_eq!(clamp.dropped, 0, "both current-task rounds are required");
+        assert!(clamp.overflow.is_some());
+        assert_eq!(request.messages.len(), 6);
         assert_eq!(request.messages[0].role, ChatRole::System);
         assert_eq!(request.messages[current_user_index].role, ChatRole::User);
         assert_eq!(request.messages[2].role, ChatRole::Assistant);
         assert_eq!(request.messages[3].role, ChatRole::Tool);
+    }
+
+    #[test]
+    fn tool_loop_budget_keeps_dependent_batches_while_removing_old_conversation() {
+        let mut request = genai::chat::ChatRequest::new(vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("old unrelated conversation".repeat(100)),
+            assistant_calls("old reads", &[("old-a", "read"), ("old-b", "read")]),
+            ChatMessage::from(ToolResponse::new("old-a", "old result A")),
+            ChatMessage::from(ToolResponse::new("old-b", "old result B")),
+            ChatMessage::user("compare CRM facts with current address-book notes"),
+            assistant_calls(
+                "load CRM profiles",
+                &[("profile-a", "mcp_call"), ("profile-b", "mcp_call")],
+            ),
+            ChatMessage::from(ToolResponse::new("profile-a", "profile A")),
+            ChatMessage::from(ToolResponse::new("profile-b", "profile B")),
+            assistant_calls(
+                "read address-book notes",
+                &[("contact-a", "mcp_call"), ("contact-b", "mcp_call")],
+            ),
+            ChatMessage::from(ToolResponse::new("contact-a", "manual note A")),
+            ChatMessage::from(ToolResponse::new("contact-b", "manual note B")),
+        ]);
+        request.tools = Some(vec![
+            genai::chat::Tool::new("mcp_call").with_description("MCP schema".repeat(10)),
+        ]);
+        let original_task = request.messages[5..].to_vec();
+        let schema_chars = request
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(genai::chat::Tool::size)
+            .sum::<usize>();
+        let budget = request.messages[0].size()
+            + original_task.iter().map(ChatMessage::size).sum::<usize>()
+            + schema_chars;
+        let mut current_user_index = 5;
+
+        let clamp = clamp_chat_request_to_budget(&mut request, &mut current_user_index, budget);
+
+        assert_eq!(clamp.overflow, None);
+        assert_eq!(clamp.dropped, 4);
+        assert_eq!(current_user_index, 1);
+        assert_eq!(
+            serde_json::to_value(&request.messages[1..]).unwrap(),
+            serde_json::to_value(&original_task).unwrap()
+        );
+
+        // Adding another dependent round must retain every earlier result,
+        // even when old conversation has already been exhausted.
+        request.messages.push(assistant_calls(
+            "check one more profile",
+            &[("profile-c", "mcp_call")],
+        ));
+        request.messages.push(ChatMessage::from(ToolResponse::new(
+            "profile-c",
+            "profile C",
+        )));
+        let task_with_next_round = request.messages[1..].to_vec();
+        let clamp = clamp_chat_request_to_budget(&mut request, &mut current_user_index, budget);
+        assert!(clamp.overflow.is_some());
+        assert_eq!(clamp.dropped, 0);
+        assert_eq!(
+            serde_json::to_value(&request.messages[1..]).unwrap(),
+            serde_json::to_value(&task_with_next_round).unwrap()
+        );
     }
 
     #[test]
@@ -2278,10 +2329,10 @@ mod tests {
                 .all(|message| { message.role == ChatRole::Tool })
         );
 
-        let error = context_overflow_error("test-model", clamp.overflow.unwrap());
-        assert!(matches!(error, AgentError::Llm(_)));
+        let error = context_overflow_error(clamp.overflow.unwrap());
+        assert!(matches!(error, AgentError::ContextOverflow { .. }));
         let message = error.to_string();
-        assert!(message.contains("tool_context_overflow for model test-model"));
+        assert!(message.contains("tool_context_overflow"));
         assert!(message.contains("required current-turn tool results"));
     }
 

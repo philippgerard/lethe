@@ -54,6 +54,13 @@ pub enum AgentError {
     Hippocampus(#[from] HippocampusError),
     #[error(transparent)]
     Llm(#[from] anyhow::Error),
+    #[error(
+        "tool_context_overflow: {message_chars} message chars exceed {message_budget} budget chars while preserving required current-turn tool results"
+    )]
+    ContextOverflow {
+        message_chars: usize,
+        message_budget: usize,
+    },
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -148,26 +155,70 @@ impl TurnRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TurnResult {
     Complete(String),
-    Checkpointed,
+    Checkpointed(CheckpointStatus),
+}
+
+/// Bounded execution diagnostics. These values never carry model output,
+/// tool arguments/results, or the private text of a resumable checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnStopReason {
+    NoProgress,
+    RepeatedToolCalls,
+    ToolErrors,
+    ToolIterations,
+    EmptyResponses,
+    ContextOverflow,
+    Unknown,
+}
+
+impl TurnStopReason {
+    fn from_internal_reason(reason: &str) -> Self {
+        match reason.split_whitespace().next() {
+            Some("no_progress_cap") => Self::NoProgress,
+            Some("repeated_tool_call_cap") => Self::RepeatedToolCalls,
+            Some("tool_error_cap") => Self::ToolErrors,
+            Some("tool_iteration_cap") => Self::ToolIterations,
+            Some("empty_response_stall") => Self::EmptyResponses,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProgress => "no_progress_cap",
+            Self::RepeatedToolCalls => "repeated_tool_call_cap",
+            Self::ToolErrors => "tool_error_cap",
+            Self::ToolIterations => "tool_iteration_cap",
+            Self::EmptyResponses => "empty_response_stall",
+            Self::ContextOverflow => "tool_context_overflow",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CheckpointStatus {
+    pub stop_reason: TurnStopReason,
+    pub checkpoint_persisted: bool,
 }
 
 impl TurnResult {
     pub fn complete_text(&self) -> Option<&str> {
         match self {
             Self::Complete(text) => Some(text),
-            Self::Checkpointed => None,
+            Self::Checkpointed(_) => None,
         }
     }
 
     pub fn into_complete_text(self) -> Option<String> {
         match self {
             Self::Complete(text) => Some(text),
-            Self::Checkpointed => None,
+            Self::Checkpointed(_) => None,
         }
     }
 
     pub fn is_checkpointed(&self) -> bool {
-        matches!(self, Self::Checkpointed)
+        matches!(self, Self::Checkpointed(_))
     }
 }
 
@@ -571,14 +622,14 @@ impl Agent {
                 Ok(String::new())
             }
             TurnResult::Complete(response) => Ok(response),
-            TurnResult::Checkpointed
+            TurnResult::Checkpointed(_)
                 if !metadata.is_internal()
                     && metadata.kind != Some(MessageKind::TelegramReaction)
                     && final_response_should_be_persisted(telegram_guard.as_ref())? =>
             {
                 Ok(TURN_CHECKPOINT_NOTICE.to_string())
             }
-            TurnResult::Checkpointed => Ok(String::new()),
+            TurnResult::Checkpointed(_) => Ok(String::new()),
         }
     }
 
@@ -633,19 +684,13 @@ impl Agent {
             .await?;
 
         let result = if let Some(stop_reason) = output.stop_reason.as_deref() {
-            tracing::warn!(reason = %stop_reason, "turn cut short — preserving an internal resumable checkpoint");
-            if !turn.synthetic && request_metadata.kind != Some(MessageKind::TelegramReaction) {
-                // The raw resumable state is the durability boundary. Store it
-                // before reading any transport guard so a poisoned guard can
-                // suppress a notice but can never lose the checkpoint itself.
-                persist_resumable_checkpoint(self.memory.as_ref(), &output.text, stop_reason)?;
-                let should_show_notice =
-                    final_response_should_be_persisted(telegram_guard.as_ref())?;
-                if should_show_notice {
-                    persist_checkpoint_notice(self.memory.as_ref())?;
-                }
-            }
-            TurnResult::Checkpointed
+            finish_checkpointed_turn(
+                self.memory.as_ref(),
+                &output.text,
+                stop_reason,
+                ordinary_turn,
+                telegram_guard.as_ref(),
+            )?
         } else {
             let response = output.text;
             if ordinary_turn {
@@ -1552,6 +1597,34 @@ fn persist_completed_ordinary_turn(
         }
     }
     Ok(())
+}
+
+fn finish_checkpointed_turn(
+    memory: &MemoryStore,
+    checkpoint: &str,
+    stop_reason: &str,
+    ordinary_turn: bool,
+    telegram_guard: Option<&crate::interfaces::telegram::SharedTelegramTurnGuard>,
+) -> AgentResult<TurnResult> {
+    if ordinary_turn {
+        // Persist before inspecting the delivery guard: a poisoned guard may
+        // suppress a notice, but must never lose resumable ordinary-turn state.
+        persist_resumable_checkpoint(memory, checkpoint, stop_reason)?;
+        if final_response_should_be_persisted(telegram_guard)? {
+            persist_checkpoint_notice(memory)?;
+        }
+    }
+    let status = CheckpointStatus {
+        stop_reason: TurnStopReason::from_internal_reason(stop_reason),
+        checkpoint_persisted: ordinary_turn,
+    };
+    tracing::warn!(
+        stop_reason = status.stop_reason.as_str(),
+        checkpoint_persisted = status.checkpoint_persisted,
+        resumable = status.checkpoint_persisted,
+        "turn stopped before completion"
+    );
+    Ok(TurnResult::Checkpointed(status))
 }
 
 fn persist_resumable_checkpoint(
@@ -2802,6 +2875,102 @@ mod tests {
                 .any(|c| c.contains("internal heartbeat answer"))
         );
         assert!(contents.iter().any(|c| c.ends_with("visible question")));
+    }
+
+    #[test]
+    fn checkpoint_outcomes_report_only_allowlisted_reasons_and_actual_persistence() {
+        const CANARY: &str = "SECRET_CHECKPOINT_CONTENT";
+        for (reason, expected) in [
+            (
+                "no_progress_cap hit (4 turns >= 4)",
+                TurnStopReason::NoProgress,
+            ),
+            (
+                "tool_iteration_cap (40 iterations)",
+                TurnStopReason::ToolIterations,
+            ),
+            (
+                "repeated_tool_call_cap hit (4 identical rounds)",
+                TurnStopReason::RepeatedToolCalls,
+            ),
+            ("tool_error_cap hit (8 errors)", TurnStopReason::ToolErrors),
+            (
+                "empty_response_stall (2 empty responses)",
+                TurnStopReason::EmptyResponses,
+            ),
+            ("SECRET_UNRECOGNIZED_STOP_REASON", TurnStopReason::Unknown),
+        ] {
+            for ordinary_turn in [false, true] {
+                let tmp = tempdir().unwrap();
+                let memory = MemoryStore::from_settings(&settings(tmp.path())).unwrap();
+                let result =
+                    finish_checkpointed_turn(&memory, CANARY, reason, ordinary_turn, None).unwrap();
+                assert_eq!(
+                    result,
+                    TurnResult::Checkpointed(CheckpointStatus {
+                        stop_reason: expected,
+                        checkpoint_persisted: ordinary_turn,
+                    })
+                );
+                assert!(result.is_checkpointed());
+                assert_eq!(result.complete_text(), None);
+                assert!(!format!("{result:?}").contains("SECRET"));
+                assert_eq!(result.into_complete_text(), None);
+
+                let messages = memory.messages.get_recent(10).unwrap();
+                if ordinary_turn {
+                    assert_eq!(messages.len(), 2);
+                    assert!(messages[0].content.contains(CANARY));
+                    assert_eq!(
+                        raw_message_kind(Some(&messages[0].metadata)),
+                        Some(RawMessageKind::Checkpoint)
+                    );
+                    assert_eq!(messages[1].content, TURN_CHECKPOINT_NOTICE);
+                } else {
+                    assert!(
+                        messages.is_empty(),
+                        "scheduled stops must not claim or create a resumable checkpoint"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_is_saved_before_delivery_guard_failure_and_without_duplicate_notice() {
+        for poison_guard in [false, true] {
+            let tmp = tempdir().unwrap();
+            let memory = MemoryStore::from_settings(&settings(tmp.path())).unwrap();
+            let guard = Arc::new(Mutex::new(
+                crate::interfaces::telegram::TelegramTurnGuard::new(),
+            ));
+            if poison_guard {
+                let poison = guard.clone();
+                let _ = std::panic::catch_unwind(move || {
+                    let _guard = poison.lock().unwrap();
+                    panic!("poison guard for checkpoint test");
+                });
+            } else {
+                guard
+                    .lock()
+                    .unwrap()
+                    .record_visible_text("already delivered");
+            }
+            let result = finish_checkpointed_turn(
+                &memory,
+                "SECRET_CHECKPOINT",
+                "no_progress_cap hit (4 turns >= 4)",
+                true,
+                Some(&guard),
+            );
+            assert_eq!(result.is_err(), poison_guard);
+            let messages = memory.messages.get_recent(10).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                raw_message_kind(Some(&messages[0].metadata)),
+                Some(RawMessageKind::Checkpoint)
+            );
+        }
     }
 
     #[test]

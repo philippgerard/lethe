@@ -437,12 +437,22 @@ impl Message<CompleteActorTurn> for ActorSupervisor {
         message: CompleteActorTurn,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let response = match message.outcome {
-            Ok(response) => response,
-            Err(error) => ActorTurnResult::Complete(format!("Runner error: {error}")),
-        };
-        self.registry
-            .record_actor_turn_response(&message.actor_id, response)?;
+        match message.outcome {
+            Err(error @ ActorError::ContextOverflow) => {
+                self.registry.finish_turn_or_terminate(
+                    &message.actor_id,
+                    Outcome::Failure,
+                    error.to_string(),
+                )?;
+            }
+            outcome => {
+                let response = outcome.unwrap_or_else(|error| {
+                    ActorTurnResult::Complete(format!("Runner error: {error}"))
+                });
+                self.registry
+                    .record_actor_turn_response(&message.actor_id, response)?;
+            }
+        }
         self.sync_resident_actors(ctx.actor_ref().clone());
         let continue_after = self
             .registry

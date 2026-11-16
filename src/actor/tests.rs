@@ -937,6 +937,61 @@ async fn runtime_executor_wakes_resident_actor_without_external_round() {
     assert_eq!(info.state, ActorState::Waiting);
 }
 
+fn runtime_with_failing_worker(
+    error: fn() -> ActorError,
+) -> (ActorRuntime, String, String, Arc<AtomicUsize>) {
+    let (mut registry, principal, worker) = registry_with_principal_and_worker();
+    registry.get_mut(&worker).unwrap().config.max_turns = 2;
+    let runtime = ActorRuntime::new(registry);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_executor = calls.clone();
+    runtime
+        .install_typed_turn_executor(Arc::new(move |_spec, _runtime| {
+            let calls = calls_for_executor.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(error())
+            })
+        }))
+        .unwrap();
+    (runtime, principal, worker, calls)
+}
+
+#[tokio::test]
+async fn typed_context_overflow_fails_subagent_without_another_turn() {
+    let (overflow, principal, worker, overflow_calls) =
+        runtime_with_failing_worker(|| ActorError::ContextOverflow);
+    let (ordinary, _, ordinary_worker, ordinary_calls) =
+        runtime_with_failing_worker(|| ActorError::Runtime("provider disconnected".to_string()));
+
+    for _ in 0..160 {
+        if ordinary_calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        sleep(TokioDuration::from_millis(25)).await;
+    }
+    sleep(TokioDuration::from_millis(200)).await;
+
+    assert_eq!(ordinary_calls.load(Ordering::SeqCst), 2);
+    let ordinary_info = ordinary.actor_info(&ordinary_worker).await.unwrap();
+    assert_eq!(ordinary_info.state, ActorState::Waiting);
+    assert_eq!(ordinary_info.outcome, None);
+
+    assert_eq!(overflow_calls.load(Ordering::SeqCst), 1);
+    let info = overflow.actor_info(&worker).await.unwrap();
+    assert_eq!(info.state, ActorState::Terminated);
+    assert_eq!(info.outcome, Some(Outcome::Failure));
+    let notice = overflow.pop_inbox(&principal).await.unwrap();
+    assert_eq!(notice.sender, worker);
+    assert_eq!(notice.intent, MessageIntent::Failed);
+    assert_eq!(
+        notice.content,
+        format!("researcher: {}", ActorError::ContextOverflow)
+    );
+    assert!(notice.content.contains("may already have taken effect"));
+    assert!(!notice.content.contains("Runner error"));
+}
+
 #[tokio::test]
 async fn runtime_returns_principal_task_update_events() {
     let (mut registry, principal, worker) = registry_with_principal_and_worker();
