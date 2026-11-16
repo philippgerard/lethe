@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Update Quinn protocol and UDP dependencies to address RUSTSEC-2026-0523,
+  RUSTSEC-2026-0524, and RUSTSEC-2026-0538 in all three dependency lockfiles.
+
 - Keep every tool call and result of the active task when the tool loop trims
   context; older conversation history is removed first. A task that still
   cannot fit fails with `tool_context_overflow` and a fixed notice to inspect
