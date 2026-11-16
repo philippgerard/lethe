@@ -575,8 +575,9 @@ The response also includes `run_id`, `task_name`, `failure_kind` on failure, and
 `checkpoint`. This category means the tool loop stopped before completion, not
 that checkpoint storage failed. Stopped loops also report an allowlisted
 `stop_reason`: `no_progress_cap`, `repeated_tool_call_cap`, `tool_error_cap`,
-`tool_iteration_cap`, `empty_response_stall`, or `unknown`. A local context-budget refusal reports
-`stop_reason: "tool_context_overflow"` with `failure_kind: "turn_failed"`.
+`tool_iteration_cap`, `empty_response_stall`, or `unknown`. A local
+context-budget refusal reports `stop_reason: "tool_context_overflow"` with
+`failure_kind: "turn_failed"`.
 The same bounded diagnostics are logged with the task and run IDs.
 `checkpoint_persisted` and `resumable` are both `false` for scheduled wakes:
 their tool transcript and private wrap-up are not saved as a resumable
@@ -584,9 +585,9 @@ conversation checkpoint. Ordinary interactive turns retain their existing
 checkpoint/resume behavior. A stopped wake does not automatically resume or
 retry; inspect completed external actions before rerunning it.
 The scheduler companion must allowlist `checkpoint` to record an incomplete
-run separately from other failures. Scheduled messages for
-the configured principal follow the Telegram/iMessage preferences selected in
-chat. `telegram_delivered_messages` counts confirmed Telegram sends and
+run separately from other failures. Scheduled messages for the configured
+principal follow the Telegram/iMessage preferences selected in chat.
+`telegram_delivered_messages` counts confirmed Telegram sends and
 `imessage_queued_messages` counts durable queue entries. iMessage-only acceptance
 returns `delivery_status: "notification_queued"` and `delivered: false` with
 `success: true` when the task completed. `imessage_status: "queued"` confirms
