@@ -560,7 +560,10 @@ still cannot fit, the turn fails explicitly with `tool_context_overflow` rather
 than discarding results and repeating completed work. Telegram, iMessage, and
 web chat turns then show a fixed notice that completed actions may already have
 taken effect and should be checked before continuing. No checkpoint is saved for
-that turn, and the overflow is never reported as a provider usage limit.
+that turn, and the overflow is never reported as a provider usage limit. A
+non-persistent subagent that overflows terminates as failed without automatic
+continuation. Its parent receives a fixed notice to inspect completed actions
+before continuing.
 
 `/wake` reports turn completion and Telegram delivery separately. A confirmed
 Telegram tool side effect can coexist with `success: false` when the turn later
@@ -572,7 +575,7 @@ The response also includes `run_id`, `task_name`, `failure_kind` on failure, and
 `checkpoint`. This category means the tool loop stopped before completion, not
 that checkpoint storage failed. Stopped loops also report an allowlisted
 `stop_reason`: `no_progress_cap`, `repeated_tool_call_cap`, `tool_error_cap`,
-`tool_iteration_cap`, or `unknown`. A local context-budget refusal reports
+`tool_iteration_cap`, `empty_response_stall`, or `unknown`. A local context-budget refusal reports
 `stop_reason: "tool_context_overflow"` with `failure_kind: "turn_failed"`.
 The same bounded diagnostics are logged with the task and run IDs.
 `checkpoint_persisted` and `resumable` are both `false` for scheduled wakes:

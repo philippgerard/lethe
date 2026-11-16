@@ -632,6 +632,10 @@ pub enum ActorError {
     InvalidActorConfig(String),
     #[error("actor runtime error: {0}")]
     Runtime(String),
+    #[error(
+        "tool_context_overflow: the task's results no longer fit in the local working context. Completed actions may already have taken effect; inspect them before continuing this work."
+    )]
+    ContextOverflow,
 }
 
 pub type ActorResult<T> = Result<T, ActorError>;

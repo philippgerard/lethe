@@ -3709,6 +3709,7 @@ mod tests {
             (TurnStopReason::ToolIterations, "tool_iteration_cap"),
             (TurnStopReason::RepeatedToolCalls, "repeated_tool_call_cap"),
             (TurnStopReason::ToolErrors, "tool_error_cap"),
+            (TurnStopReason::EmptyResponses, "empty_response_stall"),
             (TurnStopReason::Unknown, "unknown"),
         ] {
             let result = Ok(wake_checkpoint(reason));

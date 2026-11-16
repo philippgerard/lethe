@@ -796,7 +796,10 @@ pub(super) fn actor_turn_executor(
                 Some(_) => ActorTurnResult::Checkpointed(output.text),
                 None => ActorTurnResult::Complete(output.text),
             })
-            .map_err(|error| ActorError::Runtime(error.to_string()))
+            .map_err(|error| match error {
+                AgentError::ContextOverflow { .. } => ActorError::ContextOverflow,
+                error => ActorError::Runtime(error.to_string()),
+            })
         })
     })
 }

@@ -166,6 +166,7 @@ pub enum TurnStopReason {
     RepeatedToolCalls,
     ToolErrors,
     ToolIterations,
+    EmptyResponses,
     ContextOverflow,
     Unknown,
 }
@@ -177,6 +178,7 @@ impl TurnStopReason {
             Some("repeated_tool_call_cap") => Self::RepeatedToolCalls,
             Some("tool_error_cap") => Self::ToolErrors,
             Some("tool_iteration_cap") => Self::ToolIterations,
+            Some("empty_response_stall") => Self::EmptyResponses,
             _ => Self::Unknown,
         }
     }
@@ -187,6 +189,7 @@ impl TurnStopReason {
             Self::RepeatedToolCalls => "repeated_tool_call_cap",
             Self::ToolErrors => "tool_error_cap",
             Self::ToolIterations => "tool_iteration_cap",
+            Self::EmptyResponses => "empty_response_stall",
             Self::ContextOverflow => "tool_context_overflow",
             Self::Unknown => "unknown",
         }
@@ -2891,6 +2894,10 @@ mod tests {
                 TurnStopReason::RepeatedToolCalls,
             ),
             ("tool_error_cap hit (8 errors)", TurnStopReason::ToolErrors),
+            (
+                "empty_response_stall (2 empty responses)",
+                TurnStopReason::EmptyResponses,
+            ),
             ("SECRET_UNRECOGNIZED_STOP_REASON", TurnStopReason::Unknown),
         ] {
             for ordinary_turn in [false, true] {
