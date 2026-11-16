@@ -553,6 +553,12 @@ Checkpoints, turn failures, and failed reactions retain their failure status.
 Empty final responses and punctuation are not silence signals, and ordinary
 final replies still use the existing fallback delivery.
 
+During tool execution, context-budget trimming removes older conversation
+history before the current task. All current-task tool calls and results remain
+available across dependent batches. If required task evidence and system context
+still cannot fit, the turn fails explicitly with `tool_context_overflow` rather
+than discarding results and repeating completed work.
+
 `/wake` reports turn completion and Telegram delivery separately. A confirmed
 Telegram tool side effect can coexist with `success: false` when the turn later
 checkpoints; callers must inspect `delivered` and `delivery_status` and must not
@@ -560,8 +566,19 @@ blindly retry an HTTP 200 response.
 The response also includes `run_id`, `task_name`, `failure_kind` on failure, and
 `imessage_status`. `failure_kind` is one of `authentication`, `limit`,
 `turn_timeout`, `turn_failed`, `delivery_failed`, `imessage_queue_failed`, or
-`checkpoint`. The scheduler companion must allowlist `checkpoint` to record an
-internally checkpointed run separately from a failed one. Scheduled messages for
+`checkpoint`. This category means the tool loop stopped before completion, not
+that checkpoint storage failed. Stopped loops also report an allowlisted
+`stop_reason`: `no_progress_cap`, `repeated_tool_call_cap`, `tool_error_cap`,
+`tool_iteration_cap`, or `unknown`. A local context-budget refusal reports
+`stop_reason: "tool_context_overflow"` with `failure_kind: "turn_failed"`.
+The same bounded diagnostics are logged with the task and run IDs.
+`checkpoint_persisted` and `resumable` are both `false` for scheduled wakes:
+their tool transcript and private wrap-up are not saved as a resumable
+conversation checkpoint. Ordinary interactive turns retain their existing
+checkpoint/resume behavior. A stopped wake does not automatically resume or
+retry; inspect completed external actions before rerunning it.
+The scheduler companion must allowlist `checkpoint` to record an incomplete
+run separately from other failures. Scheduled messages for
 the configured principal follow the Telegram/iMessage preferences selected in
 chat. `telegram_delivered_messages` counts confirmed Telegram sends and
 `imessage_queued_messages` counts durable queue entries. iMessage-only acceptance

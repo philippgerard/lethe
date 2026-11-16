@@ -948,7 +948,7 @@ impl ImessageTransport {
         .await??;
         let text = match result {
             TurnResult::Complete(text) => text,
-            TurnResult::Checkpointed => TURN_CHECKPOINT_NOTICE.to_string(),
+            TurnResult::Checkpointed(_) => TURN_CHECKPOINT_NOTICE.to_string(),
         };
         if !text.trim().is_empty() && !self.queue(inbound, json!({"kind": "text", "content": text}))
         {

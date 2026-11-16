@@ -1711,7 +1711,7 @@ fn telegram_turn_public_text(result: TurnResult, metadata: Option<&serde_json::V
     }
     match result {
         TurnResult::Complete(response) => response,
-        TurnResult::Checkpointed => TURN_CHECKPOINT_NOTICE.to_string(),
+        TurnResult::Checkpointed(_) => TURN_CHECKPOINT_NOTICE.to_string(),
     }
 }
 
@@ -1916,7 +1916,13 @@ mod tests {
             natural_goal
         );
         assert_eq!(
-            telegram_turn_public_text(TurnResult::Checkpointed, None),
+            telegram_turn_public_text(
+                TurnResult::Checkpointed(lethe::agent::CheckpointStatus {
+                    stop_reason: lethe::agent::TurnStopReason::NoProgress,
+                    checkpoint_persisted: true,
+                }),
+                None
+            ),
             TURN_CHECKPOINT_NOTICE
         );
     }
@@ -1929,7 +1935,16 @@ mod tests {
             "telegram",
         );
 
-        assert!(telegram_turn_public_text(TurnResult::Checkpointed, Some(&metadata)).is_empty());
+        assert!(
+            telegram_turn_public_text(
+                TurnResult::Checkpointed(lethe::agent::CheckpointStatus {
+                    stop_reason: lethe::agent::TurnStopReason::NoProgress,
+                    checkpoint_persisted: true,
+                }),
+                Some(&metadata)
+            )
+            .is_empty()
+        );
         assert!(
             telegram_turn_public_text(
                 TurnResult::Complete("SECRET_COMPLETE_CANARY".to_string()),

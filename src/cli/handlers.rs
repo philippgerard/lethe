@@ -540,7 +540,7 @@ pub(crate) async fn agent_command(command: AgentCommand) -> Result<()> {
                 .await?;
             match result {
                 TurnResult::Complete(response) => println!("{response}"),
-                TurnResult::Checkpointed => println!("{TURN_CHECKPOINT_NOTICE}"),
+                TurnResult::Checkpointed(_) => println!("{TURN_CHECKPOINT_NOTICE}"),
             }
         }
         AgentCommand::Prepare { message, .. } => {
