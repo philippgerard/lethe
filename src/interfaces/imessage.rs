@@ -53,7 +53,9 @@ fn imessage_failure_notice(error: &anyhow::Error) -> &'static str {
     if error.is::<AudioTranscriptionFailure>() {
         return "I couldn't transcribe this audio. Try a shorter recording (up to 25 MiB total) or send the text instead. If this keeps happening, check the transcription provider settings.";
     }
-    if let Some(message) = crate::interfaces::telegram::llm_auth_reply(error) {
+    if let Some(message) = crate::interfaces::telegram::context_overflow_reply(error) {
+        message
+    } else if let Some(message) = crate::interfaces::telegram::llm_auth_reply(error) {
         if message == crate::interfaces::telegram::OPENAI_STATIC_TOKEN_MESSAGE {
             "My model connection uses a static OPENAI_AUTH_TOKEN override that cannot renew itself. Remove that override from the deployment configuration, restart Lethe, use /login openai in our private Telegram chat, then ask me to continue from the current state."
         } else {
@@ -1468,6 +1470,16 @@ mod tests {
         assert!(notice.contains("model request"));
         assert!(!notice.contains("private provider body"));
         assert!(!notice.contains("Ask me to check its state"));
+
+        let overflow = anyhow::Error::new(crate::agent::AgentError::ContextOverflow {
+            message_chars: 742_913,
+            message_budget: 429_000,
+        })
+        .context("iMessage turn failed");
+        assert_eq!(
+            imessage_failure_notice(&overflow),
+            crate::interfaces::telegram::CONTEXT_OVERFLOW_MESSAGE
+        );
     }
 
     #[test]

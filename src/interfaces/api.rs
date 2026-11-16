@@ -28,8 +28,9 @@ use crate::agent::{
 use crate::config::Settings;
 use crate::conversation::{ConversationManager, ProcessCallback, ProcessContext};
 use crate::interfaces::telegram::{
-    PendingReaction, SharedTelegramTurnGuard, TelegramClient, TelegramToolContext,
-    TelegramTurnGuard, llm_auth_reply, llm_limit_reply, split_telegram_messages,
+    CONTEXT_OVERFLOW_MESSAGE, PendingReaction, SharedTelegramTurnGuard, TelegramClient,
+    TelegramToolContext, TelegramTurnGuard, llm_auth_reply, llm_limit_reply,
+    split_telegram_messages,
 };
 use crate::llm::models::{available_providers, normalize_model_id, provider_for_model};
 use crate::memory::StoredMessage;
@@ -973,12 +974,16 @@ async fn process_chat_context(state: ApiState, context: ProcessContext) {
         Ok(TurnResult::Checkpointed(_)) => {}
         Ok(TurnResult::Complete(_)) => {}
         Err(error) if !context.interrupt.is_interrupted() => {
+            let content = match error {
+                AgentError::ContextOverflow { .. } => CONTEXT_OVERFLOW_MESSAGE.to_string(),
+                error => format!("Error: {error}"),
+            };
             let _ = state
                 .send_to_chat(
                     context.chat_id,
                     "text",
                     json!({
-                        "content": format!("Error: {error}"),
+                        "content": content,
                         "parse_mode": null,
                         "message_id": 0,
                     }),
@@ -1527,6 +1532,34 @@ fn wake_stop_diagnostics(result: &AgentResult<TurnResult>) -> Option<CheckpointS
             checkpoint_persisted: false,
         }),
         _ => None,
+    }
+}
+
+fn wake_turn_failure(
+    error: &anyhow::Error,
+    diagnostic: &str,
+) -> (StatusCode, &'static str, &'static str, String) {
+    if let Some(message) = llm_auth_reply(error) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication",
+            message,
+            message.to_string(),
+        )
+    } else if let Some(message) = llm_limit_reply(error) {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "limit",
+            message,
+            message.to_string(),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "turn_failed",
+            WAKE_TURN_FAILURE_MESSAGE,
+            format!("turn failed: {diagnostic}"),
+        )
     }
 }
 
@@ -2309,29 +2342,7 @@ async fn wake(
             let diagnostic = crate::diagnostics::error_summary(&error);
             tracing::error!(%run_id, %task_name, error = %diagnostic, "scheduled task failed");
             let (status, failure_kind, user_message, error_message) =
-                if let Some(message) = llm_auth_reply(&error) {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "authentication",
-                        message,
-                        message.to_string(),
-                    )
-                } else {
-                    match llm_limit_reply(&error) {
-                        Some(message) => (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "limit",
-                            message,
-                            message.to_string(),
-                        ),
-                        None => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "turn_failed",
-                            WAKE_TURN_FAILURE_MESSAGE,
-                            format!("turn failed: {diagnostic}"),
-                        ),
-                    }
-                };
+                wake_turn_failure(&error, &diagnostic);
             let user_message = wake_failure_notice(&task_name, &run_id, user_message);
             let progress = Arc::new(WakeDeliveryProgress::new(
                 tool_messages_sent,
@@ -3739,11 +3750,11 @@ mod tests {
 
     #[tokio::test]
     async fn wake_context_overflow_diagnostics_require_a_typed_local_error() {
-        let result = Err(AgentError::ContextOverflow {
-            message_chars: 501,
-            message_budget: 500,
-        });
-        let stop = wake_stop_diagnostics(&result);
+        let overflow = || AgentError::ContextOverflow {
+            message_chars: 742_913,
+            message_budget: 429_000,
+        };
+        let stop = wake_stop_diagnostics(&Err(overflow()));
         assert_eq!(
             stop,
             Some(CheckpointStatus {
@@ -3751,24 +3762,34 @@ mod tests {
                 checkpoint_persisted: false,
             })
         );
-        let response = wake_delivery_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+        let error = anyhow::Error::new(overflow()).context("scheduled task failed");
+        let (status, failure_kind, user_message, error_message) =
+            wake_turn_failure(&error, &crate::diagnostics::error_summary(&error));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(failure_kind, "turn_failed");
+        let sent = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recorded = sent.clone();
+        let response = finish_wake_failure(
             42,
             0,
-            "turn_failed_notice_failed",
-            false,
-            false,
-            0,
-            None,
-            WAKE_TURN_FAILURE_MESSAGE,
-            &WakeReactionDelivery::default(),
-        );
+            Vec::new(),
+            status,
+            failure_kind,
+            user_message,
+            error_message,
+            |_| async { Ok(()) },
+            move |text| {
+                recorded.lock().unwrap().push(text);
+                async { Ok(81) }
+            },
+        )
+        .await;
         let body = response_json(
             annotate_wake_response(
                 response,
                 "run-2",
                 "crm-sync",
-                "turn_failed",
+                failure_kind,
                 "no_notification",
                 None,
                 stop,
@@ -3776,11 +3797,17 @@ mod tests {
             .await,
         )
         .await;
+        assert_eq!(sent.lock().unwrap().as_slice(), [WAKE_TURN_FAILURE_MESSAGE]);
         assert_eq!(body["stop_reason"], "tool_context_overflow");
         assert_eq!(body["failure_kind"], "turn_failed");
+        assert_eq!(body["delivery_status"], "turn_failed_notice_delivered");
         assert_eq!(body["checkpoint_persisted"], false);
         assert_eq!(body["resumable"], false);
-        assert!(!body.to_string().contains("501"));
+        assert!(
+            !body
+                .to_string()
+                .contains(crate::interfaces::telegram::USAGE_LIMIT_MESSAGE)
+        );
         assert_eq!(
             wake_stop_diagnostics(&Err(AgentError::Llm(anyhow::anyhow!(
                 "tool_context_overflow SECRET_PROVIDER_PAYLOAD"

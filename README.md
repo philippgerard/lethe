@@ -557,7 +557,10 @@ During tool execution, context-budget trimming removes older conversation
 history before the current task. All current-task tool calls and results remain
 available across dependent batches. If required task evidence and system context
 still cannot fit, the turn fails explicitly with `tool_context_overflow` rather
-than discarding results and repeating completed work.
+than discarding results and repeating completed work. Telegram, iMessage, and
+web chat turns then show a fixed notice that completed actions may already have
+taken effect and should be checked before continuing. No checkpoint is saved for
+that turn, and the overflow is never reported as a provider usage limit.
 
 `/wake` reports turn completion and Telegram delivery separately. A confirmed
 Telegram tool side effect can coexist with `success: false` when the turn later

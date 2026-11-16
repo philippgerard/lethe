@@ -28,6 +28,19 @@ pub const USAGE_LIMIT_MESSAGE: &str =
 pub const OPENAI_LOGIN_MESSAGE: &str = "My OpenAI connection needs you to sign in again. Use /login openai in our private chat to reconnect.";
 pub const OPENAI_STATIC_TOKEN_MESSAGE: &str = "OPENAI_AUTH_TOKEN is configured as a static override and cannot renew itself. Remove that override from your deployment configuration, restart Lethe, then use /login openai in our private chat.";
 pub const LLM_FAILURE_MESSAGE: &str = "I couldn't complete that request because the AI service failed. Please try again. Use /status to check the connection.";
+pub const CONTEXT_OVERFLOW_MESSAGE: &str = "I stopped because this task's results no longer fit in my working context. Actions I already completed may have taken effect; check them before asking me to continue.";
+
+pub fn context_overflow_reply(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .any(|cause| {
+            matches!(
+                cause.downcast_ref::<crate::agent::AgentError>(),
+                Some(crate::agent::AgentError::ContextOverflow { .. })
+            )
+        })
+        .then_some(CONTEXT_OVERFLOW_MESSAGE)
+}
 
 pub fn llm_auth_reply(error: &anyhow::Error) -> Option<&'static str> {
     error
@@ -45,7 +58,8 @@ pub fn llm_auth_reply(error: &anyhow::Error) -> Option<&'static str> {
 /// Every failed interactive turn gets a safe reply; provider response bodies
 /// and credentials must never be forwarded to Telegram.
 pub fn llm_failure_reply(error: &anyhow::Error) -> &'static str {
-    llm_auth_reply(error)
+    context_overflow_reply(error)
+        .or_else(|| llm_auth_reply(error))
         .or_else(|| llm_limit_reply(error))
         .unwrap_or(LLM_FAILURE_MESSAGE)
 }
@@ -55,6 +69,9 @@ pub fn llm_failure_reply(error: &anyhow::Error) -> &'static str {
 /// updates). Formatting the full anyhow chain preserves status details added by
 /// lower layers.
 pub fn llm_limit_reply(error: &anyhow::Error) -> Option<&'static str> {
+    if context_overflow_reply(error).is_some() {
+        return None;
+    }
     let text = format!("{error:#}").to_ascii_lowercase();
     if text.contains("out of credits") || text.contains("402 payment required") {
         return Some(OUT_OF_CREDITS_MESSAGE);
@@ -2499,6 +2516,26 @@ mod tests {
     fn unknown_provider_failure_never_exposes_raw_error_to_chat() {
         let error = anyhow::anyhow!("connection reset; secret=DO_NOT_EXPOSE");
         assert_eq!(llm_failure_reply(&error), LLM_FAILURE_MESSAGE);
+    }
+
+    #[test]
+    fn local_context_overflow_is_never_a_provider_limit_or_retry_notice() {
+        let overflow = || {
+            anyhow::Error::new(crate::agent::AgentError::ContextOverflow {
+                message_chars: 742_913,
+                message_budget: 429_000,
+            })
+        };
+        for error in [overflow(), overflow().context("Telegram turn failed")] {
+            assert_eq!(llm_limit_reply(&error), None);
+            assert_eq!(llm_failure_reply(&error), CONTEXT_OVERFLOW_MESSAGE);
+        }
+        assert!(CONTEXT_OVERFLOW_MESSAGE.contains("may have taken effect"));
+        for forbidden in ["try again", "AI service", "provider", "saved", "429"] {
+            assert!(!CONTEXT_OVERFLOW_MESSAGE.contains(forbidden), "{forbidden}");
+        }
+        let provider_text = anyhow::anyhow!("tool_context_overflow: 429 Too Many Requests");
+        assert_eq!(llm_failure_reply(&provider_text), USAGE_LIMIT_MESSAGE);
     }
 
     #[test]
