@@ -17,15 +17,15 @@
 //! response is either `application/json` or a `text/event-stream` carrying
 //! the JSON-RPC response as SSE `data:` events; both are handled. A session
 //! (`Mcp-Session-Id` response header) is established via `initialize` +
-//! `notifications/initialized` and cached for the process; a 404 or
-//! session-shaped error drops the cache and retries once. The tool list is
-//! cached for five minutes.
+//! `notifications/initialized` and shared for the process. A session 404
+//! permits one retry for catalog discovery; tool calls are never replayed.
+//! The tool list is cached for five minutes.
 
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -75,7 +75,7 @@ struct McpSession {
     protocol_version: Option<String>,
 }
 
-static SESSION: Mutex<Option<McpSession>> = Mutex::new(None);
+static SESSION: tokio::sync::Mutex<Option<Arc<McpSession>>> = tokio::sync::Mutex::const_new(None);
 static TOOLS_CACHE: Mutex<Option<(Instant, Vec<Value>)>> = Mutex::new(None);
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -203,19 +203,25 @@ fn extract_rpc_result(content_type: &str, body: &str, id: u64) -> Result<Value, 
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
 
-fn cached_session() -> Option<McpSession> {
-    SESSION.lock().expect("mcp session lock").clone()
-}
-
-fn store_session(session: Option<McpSession>) {
-    *SESSION.lock().expect("mcp session lock") = session;
+async fn discard_expired_session(expired: &Arc<McpSession>) {
+    let mut cached = SESSION.lock().await;
+    // A delayed 404 can arrive after another caller has already reconnected.
+    if cached
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, expired))
+    {
+        *cached = None;
+    }
 }
 
 /// Handshake: `initialize` (capturing the session id + negotiated protocol
 /// version) then `notifications/initialized`. Cached for the process.
-async fn ensure_session(url: &str, token: &str) -> Result<McpSession, String> {
-    if let Some(session) = cached_session() {
-        return Ok(session);
+async fn ensure_session(url: &str, token: &str) -> Result<Arc<McpSession>, String> {
+    // Only the handshake holds this lock across network I/O. Established
+    // sessions are shared before dispatching any tool request.
+    let mut cached = SESSION.lock().await;
+    if let Some(session) = cached.as_ref() {
+        return Ok(Arc::clone(session));
     }
 
     let id = next_id();
@@ -240,7 +246,7 @@ async fn ensure_session(url: &str, token: &str) -> Result<McpSession, String> {
     }
     let result = extract_rpc_result(&content_type, &text, id)?;
 
-    let session = McpSession {
+    let session = Arc::new(McpSession {
         id: session_id,
         protocol_version: Some(
             result["protocolVersion"]
@@ -248,14 +254,14 @@ async fn ensure_session(url: &str, token: &str) -> Result<McpSession, String> {
                 .unwrap_or(PROTOCOL_VERSION)
                 .to_string(),
         ),
-    };
+    });
 
-    // Fire-and-forget: servers that track lifecycle expect it; stateless ones
+    // Best-effort: servers that track lifecycle expect it; stateless ones
     // answer 202 and move on. A failure here must not block the actual call.
     let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
     let _ = post_rpc(url, token, &session, &initialized, HANDSHAKE_TIMEOUT).await;
 
-    store_session(Some(session.clone()));
+    *cached = Some(Arc::clone(&session));
     Ok(session)
 }
 
@@ -332,17 +338,17 @@ async fn rpc_call_with_config(
         Ok(result) => Ok(result),
         Err(RpcCallError::Other(message)) => Err(message),
         Err(RpcCallError::SessionExpired(message)) => {
-            store_session(None);
+            discard_expired_session(&session).await;
             if !retry_after_session_expiry_is_safe(method) {
                 return Err(format!(
-                    "{message}; cleared the expired MCP session but did not retry {method} automatically because the remote operation may already have executed"
+                    "{message}; did not retry {method} automatically because the remote operation may already have executed"
                 ));
             }
             let session = ensure_session(url, token).await?;
             match do_rpc(url, token, &session, method, params, timeout).await {
                 Ok(result) => Ok(result),
                 Err(RpcCallError::SessionExpired(message)) => {
-                    store_session(None);
+                    discard_expired_session(&session).await;
                     Err(message)
                 }
                 Err(error) => Err(error.into_message()),
@@ -419,37 +425,77 @@ fn server_label() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Keep broad listings compact. For a targeted search, include everything
+/// needed to call the best matches directly, within the existing result budget.
+fn discovery_result(tools: &[Value], filter: &str, label: Option<String>) -> Value {
+    const SCHEMA_MATCH_LIMIT: usize = 3;
+    let filter = filter.trim().to_lowercase();
+    let mut matches = Vec::new();
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("").to_lowercase();
+        let rank = if filter.is_empty() || name == filter {
+            0
+        } else if name.starts_with(&filter) {
+            1
+        } else if name.contains(&filter) {
+            2
+        } else if tool["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(&filter)
+        {
+            3
+        } else {
+            continue;
+        };
+        matches.push((rank, tool));
+    }
+    matches.sort_by_key(|(rank, _)| *rank);
+
+    let mut result = json!({
+        "count": matches.len(),
+        "tools": [],
+        "note": "Use mcp_call directly with a known schema. For a summary-only match, use a narrower filter or mcp_describe_tool.",
+    });
+    if let Some(label) = label {
+        result["server"] = Value::String(label.chars().take(200).collect());
+    }
+    let mut remaining = RESULT_MAX_CHARS.saturating_sub(result.to_string().len());
+    let mut entries = Vec::new();
+    for (index, (_, tool)) in matches.into_iter().enumerate() {
+        let description = tool["description"].as_str().unwrap_or("");
+        let mut entry = json!({"name": tool["name"], "summary": first_sentence(description)});
+        let summary_bytes = entry.to_string().len();
+        let separator = usize::from(!entries.is_empty());
+        let mut bytes = summary_bytes + separator;
+        if bytes > remaining {
+            break;
+        }
+        if !filter.is_empty() && index < SCHEMA_MATCH_LIMIT && tool["inputSchema"].is_object() {
+            let detail = json!({
+                "name": tool["name"],
+                "summary": entry["summary"],
+                "description": description,
+                "inputSchema": tool["inputSchema"],
+            });
+            let detail_bytes = detail.to_string().len() + separator;
+            if detail_bytes <= remaining {
+                entry = detail;
+                bytes = detail_bytes;
+            }
+        }
+        remaining -= bytes;
+        entries.push(entry);
+    }
+    result["tools"] = Value::Array(entries);
+    result
+}
+
 async fn list_tools_impl(args: &Value) -> String {
-    let filter = string_arg(args, "filter").trim().to_lowercase();
     match remote_tools().await {
         Ok(tools) => {
-            let entries: Vec<Value> = tools
-                .iter()
-                .filter(|tool| {
-                    if filter.is_empty() {
-                        return true;
-                    }
-                    let name = tool["name"].as_str().unwrap_or("").to_lowercase();
-                    let description = tool["description"].as_str().unwrap_or("").to_lowercase();
-                    name.contains(&filter) || description.contains(&filter)
-                })
-                .map(|tool| {
-                    json!({
-                        "name": tool["name"],
-                        "summary": first_sentence(tool["description"].as_str().unwrap_or("")),
-                    })
-                })
-                .collect();
-
-            let mut result = json!({
-                "count": entries.len(),
-                "tools": entries,
-                "note": "mcp_describe_tool gives a tool's parameters; mcp_call executes it.",
-            });
-            if let Some(label) = server_label() {
-                result["server"] = Value::String(label);
-            }
-            truncated(result.to_string())
+            discovery_result(&tools, &string_arg(args, "filter"), server_label()).to_string()
         }
         Err(error) => error,
     }
@@ -550,7 +596,7 @@ fn exec_mcp_call<'a>(
 pub const TOOL_DEFS: &[ToolDef] = &[
     ToolDef {
         name: "mcp_list_tools",
-        description: "List the tools available on the configured remote MCP server. Returns compact {name, summary} entries — the visible set is whatever the server grants this agent's token, so listing is also how you discover what the server offers. Start here, then mcp_describe_tool for a tool's parameters and mcp_call to execute it. The catalog is cached for a few minutes.",
+        description: "Search the remote tools granted to this agent. Use a specific filter to get input schemas and full descriptions for the top matches, then execute with mcp_call. Omit the filter for a compact catalog.",
         params: &[p_str(
             "filter",
             "Case-insensitive substring to match against tool names and descriptions.",
@@ -560,7 +606,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "mcp_describe_tool",
-        description: "Full definition of ONE tool on the configured remote MCP server: complete description plus its JSON input schema (parameter names, types, required fields). Read this before the first mcp_call of an unfamiliar tool — the summaries from mcp_list_tools omit parameters.",
+        description: "Full definition of ONE tool on the configured remote MCP server: complete description plus its JSON input schema (parameter names, types, required fields). Use this when you need a definition omitted from a search result.",
         params: &[p_str_req(
             "tool",
             "Tool name exactly as listed by mcp_list_tools.",
@@ -570,7 +616,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "mcp_call",
-        description: "Execute a tool on the configured remote MCP server with JSON arguments matching its schema (mcp_describe_tool). Returns the tool's text result. Effects happen on the server under this agent's token. If the server stages an effect for out-of-band approval instead of executing it (e.g. the result reports a pending status with a request id), report that status honestly and follow the server's own instructions for checking the outcome — never claim the action completed.",
+        description: "Call a known remote tool directly with arguments matching its schema. A committed write receipt is sufficient confirmation. Effects happen on the server under this agent's token. If the server stages an effect for out-of-band approval instead of executing it (e.g. the result reports a pending status with a request id), report that status honestly and follow the server's own instructions for checking the outcome — never claim the action completed.",
         params: &[
             p_str_req("tool", "Tool name exactly as listed by mcp_list_tools."),
             p_object(
@@ -590,16 +636,12 @@ mod tests {
     use axum::body::Body;
     use axum::response::IntoResponse;
     use axum::routing::post;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn reset_state() {
-        store_session(None);
+        *SESSION.try_lock().unwrap() = None;
         *TOOLS_CACHE.lock().unwrap() = None;
     }
 
@@ -638,6 +680,51 @@ mod tests {
     }
 
     #[test]
+    fn discovery_prioritizes_named_tools_and_preserves_whole_schemas() {
+        let names = ["other", "find_logs", "logs_read", "logs", "logs_write"];
+        let mut tools: Vec<_> = names
+            .iter()
+            .map(|name| {
+                json!({
+                    "name": name, "description": "Reads logs.",
+                    "inputSchema": {"type": "object", "required": ["id"]},
+                })
+            })
+            .collect();
+        let result = discovery_result(&tools, " LOGS ", None);
+        let entries = result["tools"].as_array().unwrap();
+        assert_eq!(result["count"], names.len());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|row| row["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["logs", "logs_read", "logs_write", "find_logs", "other"]
+        );
+        for entry in &entries[..3] {
+            assert_eq!(entry["inputSchema"]["required"], json!(["id"]));
+        }
+        assert!(
+            entries[3..]
+                .iter()
+                .all(|row| row.get("inputSchema").is_none())
+        );
+        tools[3]["inputSchema"]["description"] = json!("📝".repeat(RESULT_MAX_CHARS));
+        let result = discovery_result(&tools, "logs", None);
+        assert!(result.to_string().len() <= RESULT_MAX_CHARS);
+        assert_eq!(result["count"], names.len());
+        assert!(result["tools"][0].get("inputSchema").is_none());
+        assert!(result["tools"][1]["inputSchema"].is_object());
+        assert!(
+            discovery_result(&tools, "", None)["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("inputSchema").is_none())
+        );
+    }
+
+    #[test]
     fn mcp_tool_contract_stays_static_and_deployment_agnostic() {
         assert_eq!(
             TOOL_DEFS.iter().map(|def| def.name).collect::<Vec<_>>(),
@@ -656,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn unconfigured_returns_structured_errors() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         clear_env();
         reset_state();
 
@@ -749,16 +836,20 @@ mod tests {
         ApplicationSessionError,
         ExpiredToolCall,
         ExpiredToolListOnce,
+        DelayedExpiredToolCall,
     }
 
     struct RetryProbe {
         mode: RetryProbeMode,
         initialize_requests: AtomicUsize,
         method_requests: AtomicUsize,
+        received_call: tokio::sync::Notify,
+        release_call: tokio::sync::Notify,
     }
 
     async fn retry_probe(
         axum::extract::State(probe): axum::extract::State<Arc<RetryProbe>>,
+        headers: axum::http::HeaderMap,
         body: String,
     ) -> axum::response::Response {
         let message: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
@@ -797,6 +888,11 @@ mod tests {
                         }
                     }))
                     .into_response(),
+                    RetryProbeMode::DelayedExpiredToolCall => {
+                        probe.received_call.notify_one();
+                        probe.release_call.notified().await;
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }
                     RetryProbeMode::ExpiredToolCall => {
                         (axum::http::StatusCode::NOT_FOUND, "expired Mcp-Session-Id")
                             .into_response()
@@ -813,7 +909,14 @@ mod tests {
                         (axum::http::StatusCode::NOT_FOUND, "expired Mcp-Session-Id")
                             .into_response()
                     }
-                    RetryProbeMode::ExpiredToolListOnce => axum::Json(json!({
+                    RetryProbeMode::DelayedExpiredToolCall
+                        if headers.get("mcp-session-id").and_then(|h| h.to_str().ok())
+                            == Some("probe-session-1") =>
+                    {
+                        axum::http::StatusCode::NOT_FOUND.into_response()
+                    }
+                    RetryProbeMode::ExpiredToolListOnce
+                    | RetryProbeMode::DelayedExpiredToolCall => axum::Json(json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": {"tools": []}
@@ -831,6 +934,8 @@ mod tests {
             mode,
             initialize_requests: AtomicUsize::new(0),
             method_requests: AtomicUsize::new(0),
+            received_call: tokio::sync::Notify::new(),
+            release_call: tokio::sync::Notify::new(),
         });
         let app = Router::new()
             .route("/mcp", post(retry_probe))
@@ -844,8 +949,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_cold_callers_share_one_handshake() {
+        let _guard = ENV_LOCK.lock().await;
+        reset_state();
+        let (url, probe) = start_retry_probe(RetryProbeMode::ApplicationSessionError).await;
+        let (a, b) = tokio::join!(
+            ensure_session(&url, "test-token"),
+            ensure_session(&url, "test-token"),
+        );
+        assert_eq!(a.unwrap().id, b.unwrap().id);
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
+        reset_state();
+    }
+
+    #[tokio::test]
+    async fn delayed_tool_call_404_preserves_the_replacement_session() {
+        let _guard = ENV_LOCK.lock().await;
+        reset_state();
+        let (url, probe) = start_retry_probe(RetryProbeMode::DelayedExpiredToolCall).await;
+        let pending_write = rpc_call_with_config(
+            &url,
+            "test-token",
+            "tools/call",
+            json!({"name": "write"}),
+            HANDSHAKE_TIMEOUT,
+        );
+        let renew = async {
+            probe.received_call.notified().await;
+            let result = rpc_call_with_config(
+                &url,
+                "test-token",
+                "tools/list",
+                json!({}),
+                HANDSHAKE_TIMEOUT,
+            )
+            .await;
+            probe.release_call.notify_one();
+            result
+        };
+        let (write, list) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            tokio::join!(pending_write, renew)
+        })
+        .await
+        .expect("the delayed response must not block session renewal");
+
+        assert_eq!(list.unwrap()["tools"], json!([]));
+        assert!(write.unwrap_err().contains("did not retry tools/call"));
+        let active = ensure_session(&url, "test-token").await.unwrap();
+        assert_eq!(active.id.as_deref(), Some("probe-session-2"));
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.method_requests.load(Ordering::SeqCst), 3);
+        reset_state();
+    }
+
+    #[tokio::test]
     async fn application_error_mentioning_session_is_not_retried_or_reclassified() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         reset_state();
         let (url, probe) = start_retry_probe(RetryProbeMode::ApplicationSessionError).await;
 
@@ -864,7 +1023,7 @@ mod tests {
         assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
         assert_eq!(probe.method_requests.load(Ordering::SeqCst), 1);
         assert!(
-            cached_session().is_some(),
+            SESSION.try_lock().unwrap().is_some(),
             "application errors keep the session"
         );
         reset_state();
@@ -872,7 +1031,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_never_automatically_replays_a_tool_call() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         reset_state();
         let (url, probe) = start_retry_probe(RetryProbeMode::ExpiredToolCall).await;
 
@@ -891,14 +1050,14 @@ mod tests {
         assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
         assert_eq!(probe.method_requests.load(Ordering::SeqCst), 1);
         assert!(
-            cached_session().is_none(),
+            SESSION.try_lock().unwrap().is_none(),
             "expired session cache is cleared"
         );
     }
 
     #[tokio::test]
     async fn expired_session_retries_a_side_effect_free_tool_list_once() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         reset_state();
         let (url, probe) = start_retry_probe(RetryProbeMode::ExpiredToolListOnce).await;
 
@@ -915,7 +1074,7 @@ mod tests {
         assert_eq!(result["tools"], json!([]));
         assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 2);
         assert_eq!(probe.method_requests.load(Ordering::SeqCst), 2);
-        assert!(cached_session().is_some());
+        assert!(SESSION.try_lock().unwrap().is_some());
         reset_state();
     }
 
@@ -987,9 +1146,21 @@ mod tests {
 
     #[tokio::test]
     async fn round_trips_against_an_in_process_server() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
 
-        let app = Router::new().route("/mcp", post(fake_mcp));
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = Arc::clone(&methods);
+        let app = Router::new().route(
+            "/mcp",
+            post(move |headers, body: String| {
+                let msg: Value = serde_json::from_str(&body).unwrap();
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(msg["method"].as_str().unwrap().to_owned());
+                fake_mcp(headers, body)
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1003,6 +1174,14 @@ mod tests {
         }
         reset_state();
 
+        // A known write goes straight through without discovering or reading it back.
+        let receipt = call_impl(&json!({"tool":"append", "arguments":{"text":"example"}})).await;
+        assert!(receipt.contains("called append"));
+        assert_eq!(
+            *methods.lock().unwrap(),
+            ["initialize", "notifications/initialized", "tools/call"]
+        );
+
         // list: both tools, compact one-sentence summaries, the optional label
         let listed = list_tools_impl(&json!({})).await;
         assert!(listed.contains("crm_get_overdue"));
@@ -1011,10 +1190,20 @@ mod tests {
         assert!(!listed.contains("Second sentence"));
         assert!(listed.contains("testhub"));
 
-        // filter narrows
+        // A filtered search supplies the complete input schema and usage guidance.
         let filtered = list_tools_impl(&json!({"filter": "crm"})).await;
         assert!(filtered.contains("crm_get_overdue"));
         assert!(!filtered.contains("time_get_current_time"));
+        let discovery: Value = serde_json::from_str(&filtered).unwrap();
+        let matched = &discovery["tools"][0];
+        assert_eq!(
+            matched["inputSchema"]["properties"]["limit"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            matched["description"],
+            "Keep-in-touch nudges. Second sentence with detail."
+        );
 
         // describe: the full schema comes through
         let described = describe_tool_impl(&json!({"tool": "crm_get_overdue"})).await;
@@ -1036,6 +1225,17 @@ mod tests {
         let failed = call_impl(&json!({"tool": "boom"})).await;
         assert!(failed.starts_with("Error:"));
         assert!(failed.contains("kaboom"));
+        assert_eq!(
+            *methods.lock().unwrap(),
+            [
+                "initialize",
+                "notifications/initialized",
+                "tools/call",
+                "tools/list",
+                "tools/call",
+                "tools/call"
+            ]
+        );
 
         clear_env();
         reset_state();

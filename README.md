@@ -309,7 +309,9 @@ This fork supports two deliberately separate extension paths:
   HTTP MCP hub. `MCP_SERVER_URL` and a narrowly scoped `MCP_SERVER_TOKEN`
   enable `mcp_list_tools`, `mcp_describe_tool`, and `mcp_call`; with either
   value missing, the whole family stays hidden. Tool visibility remains the
-  server's responsibility, based on the token's grants.
+  server's responsibility, based on the token's grants. A filtered search includes
+  the descriptions and input schemas of the top three matches when they fit.
+  Known tools can be called directly. Lethe reuses the session across calls.
 - **Hosted plugins** let a trusted embedding host provide a user-scoped tool
   catalog, prompt context, and execution bridge. Lethe loads tools on demand
   through `request_tool` and does not need one credential per plugin. A hosted
