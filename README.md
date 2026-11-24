@@ -311,7 +311,11 @@ This fork supports two deliberately separate extension paths:
   value missing, the whole family stays hidden. Tool visibility remains the
   server's responsibility, based on the token's grants. A filtered search includes
   the descriptions and input schemas of the top three matches when they fit.
-  Known tools can be called directly. Lethe reuses the session across calls.
+  For summary-only matches, describe the exact name to get its full definition
+  or just the complete input schema if the other metadata exceeds the output
+  budget. A schema that cannot fit produces an explicit error. Known tools can
+  be called directly. Lethe shares both the session and any in-flight
+  handshake across calls. A later call can retry after a failed handshake.
 - **Hosted plugins** let a trusted embedding host provide a user-scoped tool
   catalog, prompt context, and execution bridge. Lethe loads tools on demand
   through `request_tool` and does not need one credential per plugin. A hosted

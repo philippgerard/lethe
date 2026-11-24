@@ -75,7 +75,10 @@ struct McpSession {
     protocol_version: Option<String>,
 }
 
-static SESSION: tokio::sync::Mutex<Option<Arc<McpSession>>> = tokio::sync::Mutex::const_new(None);
+// Concurrent callers retain the same attempt, including its error. Clearing a
+// failed attempt permits a new caller to retry without replaying queued calls.
+type SessionAttempt = tokio::sync::OnceCell<Result<Arc<McpSession>, String>>;
+static SESSION: Mutex<Option<Arc<SessionAttempt>>> = Mutex::new(None);
 static TOOLS_CACHE: Mutex<Option<(Instant, Vec<Value>)>> = Mutex::new(None);
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -203,11 +206,13 @@ fn extract_rpc_result(content_type: &str, body: &str, id: u64) -> Result<Value, 
     Ok(message.get("result").cloned().unwrap_or(Value::Null))
 }
 
-async fn discard_expired_session(expired: &Arc<McpSession>) {
-    let mut cached = SESSION.lock().await;
+fn discard_expired_session(expired: &Arc<McpSession>) {
+    let mut cached = SESSION.lock().expect("mcp session lock");
     // A delayed 404 can arrive after another caller has already reconnected.
     if cached
         .as_ref()
+        .and_then(|attempt| attempt.get())
+        .and_then(|outcome| outcome.as_ref().ok())
         .is_some_and(|current| Arc::ptr_eq(current, expired))
     {
         *cached = None;
@@ -217,13 +222,25 @@ async fn discard_expired_session(expired: &Arc<McpSession>) {
 /// Handshake: `initialize` (capturing the session id + negotiated protocol
 /// version) then `notifications/initialized`. Cached for the process.
 async fn ensure_session(url: &str, token: &str) -> Result<Arc<McpSession>, String> {
-    // Only the handshake holds this lock across network I/O. Established
-    // sessions are shared before dispatching any tool request.
-    let mut cached = SESSION.lock().await;
-    if let Some(session) = cached.as_ref() {
-        return Ok(Arc::clone(session));
+    let attempt = SESSION
+        .lock()
+        .expect("mcp session lock")
+        .get_or_insert_with(|| Arc::new(SessionAttempt::new()))
+        .clone();
+    let result = attempt.get_or_init(|| handshake(url, token)).await;
+    if result.is_err() {
+        let mut cached = SESSION.lock().expect("mcp session lock");
+        if cached
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &attempt))
+        {
+            *cached = None;
+        }
     }
+    result.clone()
+}
 
+async fn handshake(url: &str, token: &str) -> Result<Arc<McpSession>, String> {
     let id = next_id();
     let body = json!({
         "jsonrpc": "2.0",
@@ -261,7 +278,6 @@ async fn ensure_session(url: &str, token: &str) -> Result<Arc<McpSession>, Strin
     let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
     let _ = post_rpc(url, token, &session, &initialized, HANDSHAKE_TIMEOUT).await;
 
-    *cached = Some(Arc::clone(&session));
     Ok(session)
 }
 
@@ -338,7 +354,7 @@ async fn rpc_call_with_config(
         Ok(result) => Ok(result),
         Err(RpcCallError::Other(message)) => Err(message),
         Err(RpcCallError::SessionExpired(message)) => {
-            discard_expired_session(&session).await;
+            discard_expired_session(&session);
             if !retry_after_session_expiry_is_safe(method) {
                 return Err(format!(
                     "{message}; did not retry {method} automatically because the remote operation may already have executed"
@@ -348,7 +364,7 @@ async fn rpc_call_with_config(
             match do_rpc(url, token, &session, method, params, timeout).await {
                 Ok(result) => Ok(result),
                 Err(RpcCallError::SessionExpired(message)) => {
-                    discard_expired_session(&session).await;
+                    discard_expired_session(&session);
                     Err(message)
                 }
                 Err(error) => Err(error.into_message()),
@@ -501,6 +517,27 @@ async fn list_tools_impl(args: &Value) -> String {
     }
 }
 
+fn describe_result(tool: &Value) -> String {
+    let full = tool.to_string();
+    if full.chars().count() <= RESULT_MAX_CHARS {
+        return full;
+    }
+
+    if tool["inputSchema"].is_object() {
+        let schema_only = json!({
+            "name": tool["name"],
+            "inputSchema": tool["inputSchema"],
+            "note": "The full definition exceeds the output limit. Only the complete input schema is shown.",
+        }).to_string();
+        if schema_only.chars().count() <= RESULT_MAX_CHARS {
+            return schema_only;
+        }
+    }
+    error_json(
+        "The full tool definition exceeds the output limit and a complete input schema cannot be shown.",
+    )
+}
+
 async fn describe_tool_impl(args: &Value) -> String {
     let name = string_arg(args, "tool");
     if name.trim().is_empty() {
@@ -511,7 +548,7 @@ async fn describe_tool_impl(args: &Value) -> String {
             .iter()
             .find(|t| t["name"].as_str() == Some(name.trim()))
         {
-            Some(tool) => truncated(tool.to_string()),
+            Some(tool) => describe_result(tool),
             None => format!(
                 "Error: no remote tool named '{}' — mcp_list_tools shows what is available.",
                 name.trim()
@@ -606,7 +643,7 @@ pub const TOOL_DEFS: &[ToolDef] = &[
     },
     ToolDef {
         name: "mcp_describe_tool",
-        description: "Full definition of ONE tool on the configured remote MCP server: complete description plus its JSON input schema (parameter names, types, required fields). Use this when you need a definition omitted from a search result.",
+        description: "Full definition of ONE tool on the configured remote MCP server: description and complete JSON input schema. Use this for summary-only search matches. Large definitions return just the complete schema if it fits or an explicit size error.",
         params: &[p_str_req(
             "tool",
             "Tool name exactly as listed by mcp_list_tools.",
@@ -724,6 +761,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn describe_preserves_the_schema_or_returns_a_bounded_error() {
+        let _guard = ENV_LOCK.lock().await;
+        reset_state();
+        unsafe {
+            env::set_var("MCP_SERVER_URL", "https://example.invalid/mcp");
+            env::set_var("MCP_SERVER_TOKEN", "test-token");
+        }
+        let schema = json!({"type":"object", "required":["status"]});
+        let big = "📝".repeat(RESULT_MAX_CHARS);
+        *TOOLS_CACHE.lock().unwrap() = Some((
+            Instant::now(),
+            vec![
+                json!({"name":"large_doc","description":big,"inputSchema":schema}),
+                json!({"name":"large_schema","inputSchema":{"description":big}}),
+            ],
+        ));
+        let doc = describe_tool_impl(&json!({"tool":"large_doc"})).await;
+        let oversized = describe_tool_impl(&json!({"tool":"large_schema"})).await;
+        clear_env();
+        reset_state();
+
+        let doc: Value = serde_json::from_str(&doc).unwrap();
+        assert_eq!(doc["inputSchema"], schema);
+        assert!(doc["note"].as_str().is_some());
+        let error: Value = serde_json::from_str(&oversized).unwrap();
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("schema"))
+        );
+        assert!(oversized.len() < RESULT_MAX_CHARS);
+    }
+
     #[test]
     fn mcp_tool_contract_stays_static_and_deployment_agnostic() {
         assert_eq!(
@@ -834,6 +905,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum RetryProbeMode {
         ApplicationSessionError,
+        FirstHandshakeFails,
         ExpiredToolCall,
         ExpiredToolListOnce,
         DelayedExpiredToolCall,
@@ -859,6 +931,9 @@ mod tests {
         match method {
             "initialize" => {
                 let attempt = probe.initialize_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                if matches!(probe.mode, RetryProbeMode::FirstHandshakeFails) && attempt == 1 {
+                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
                 let mut response = axum::Json(json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -897,7 +972,7 @@ mod tests {
                         (axum::http::StatusCode::NOT_FOUND, "expired Mcp-Session-Id")
                             .into_response()
                     }
-                    RetryProbeMode::ExpiredToolListOnce => {
+                    RetryProbeMode::FirstHandshakeFails | RetryProbeMode::ExpiredToolListOnce => {
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
                     }
                 }
@@ -959,6 +1034,32 @@ mod tests {
         );
         assert_eq!(a.unwrap().id, b.unwrap().id);
         assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
+        reset_state();
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_is_shared_and_a_later_caller_can_reconnect() {
+        let _guard = ENV_LOCK.lock().await;
+        reset_state();
+        let (url, probe) = start_retry_probe(RetryProbeMode::FirstHandshakeFails).await;
+        let (a, b) = tokio::join!(
+            ensure_session(&url, "test-token"),
+            ensure_session(&url, "test-token"),
+        );
+        let error = a.err().expect("first handshake fails");
+        assert!(error.contains("503"));
+        assert_eq!(b.err().as_deref(), Some(error.as_str()));
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            ensure_session(&url, "test-token")
+                .await
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("probe-session-2")
+        );
+        assert_eq!(probe.initialize_requests.load(Ordering::SeqCst), 2);
         reset_state();
     }
 
